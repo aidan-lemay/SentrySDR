@@ -8,13 +8,14 @@ import stat
 import textwrap
 import time
 import uuid
+from array import array
 
 import pytest
 import uvicorn
 
 from sentrysdr import pipelines
 from sentrysdr.context import Context
-from sentrysdr.engine import Supervisor
+from sentrysdr.engine import PcmFramer, Supervisor
 from sentrysdr.live import LiveHub, silence_needed
 from sentrysdr.models import Node, Recording
 from sentrysdr.slave import Slave, encode_live_frame, ws_url
@@ -202,6 +203,56 @@ async def test_adsb_pipeline_reads_written_json(tmp_path):
     assert await wait_for(lambda: tracks)
     await sup.shutdown()
     assert tracks[0][2]["aircraft"][0]["hex"] == "abc123"
+
+
+# --- PCM framing -----------------------------------------------------------
+def test_framer_never_splits_a_sample():
+    framer = PcmFramer()
+    assert framer(b"\x01\x02\x03") == b"\x01\x02"
+    assert framer(b"\x04") == b"\x03\x04"
+    assert framer(b"\x05") == b""
+
+
+def test_stereo_is_mixed_to_mono_across_split_reads():
+    framer = PcmFramer(2)
+    frames = array("h", [100, 0, 0, 200, 300, 400]).tobytes()
+    assert framer(frames[:5]) + framer(frames[5:]) == array("h", [100, 200, 700]).tobytes()
+
+
+def test_stereo_mix_clips_instead_of_wrapping():
+    framer = PcmFramer(2)
+    assert array("h", framer(array("h", [30000, 30000, -30000, -30000]).tobytes())).tolist() == [32767, -32768]
+
+
+@pytest.mark.parametrize("modulation,channels", [("dmr", 2), ("p25p2", 2), ("p25p1", 1), ("ysf", 1), ("nxdn48", 1), ("dstar", 1), ("nfm", 1)])
+def test_channel_count_matches_dsd_fme(modulation, channels):
+    assert pipelines.pcm_channels({"modulation": modulation}) == channels
+
+
+def test_flags_match_the_built_tools(tmp_path):
+    cfg = make_config(tmp_path)
+    assert pipelines.dsd_args(cfg, {"modulation": "dmr"})[-1] == "-fs"
+    args = pipelines.ais_args(cfg, 0, {"gain_db": 28.0, "ppm": 2})
+    assert "-q" not in args and args[args.index("-o") + 1] == "5"
+    assert args[args.index("-gr") + 1:args.index("-gr") + 3] == ["TUNER", "28"]
+
+
+def test_tool_env_finds_private_libraries(tmp_path):
+    env = make_config(tmp_path, bin_dirs=[tmp_path / "v" / "bin"]).tool_env()
+    assert env["LD_LIBRARY_PATH"].split(":")[0] == str((tmp_path / "v" / "lib").resolve())
+
+
+async def test_dmr_pipeline_records_stereo_as_mono(tmp_path):
+    bins = tmp_path / "bin"
+    install_tool(bins, "rtl_fm", "#!/usr/bin/env python3\nimport sys,time\nfor i in range(20):\n  sys.stdout.buffer.write(b'A'*640);sys.stdout.flush();time.sleep(0.02)\ntime.sleep(60)\n")
+    install_tool(bins, "dsd-fme", "#!/usr/bin/env python3\nimport sys\nwhile d:=sys.stdin.buffer.read1(4096):\n  sys.stdout.buffer.write(d);sys.stdout.flush()\n")
+    calls = []
+    sup = supervisor(make_config(tmp_path, bin_dirs=[bins]), calls)
+    await sup.apply({"SER1": spec(modulation="dmr")})
+    assert await wait_for(lambda: len(calls) == 1)
+    await sup.shutdown()
+    # 20 x 640 bytes of stereo is 3200 frames, or 0.4 s at 8 kHz. Mono handling would double it.
+    assert abs(calls[0][0]["duration"] - 0.4) < 0.01
 
 
 # --- live pacing -----------------------------------------------------------

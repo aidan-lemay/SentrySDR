@@ -12,9 +12,11 @@ import logging
 import os
 import shutil
 import signal
+import sys
 import tempfile
 import time
 import uuid
+from array import array
 from pathlib import Path
 from typing import Awaitable, Callable
 
@@ -55,6 +57,36 @@ async def _log_stderr(serial: str, stream, tail: list[str]) -> None:
             tail.append(text)
             del tail[:-5]
             log.debug("[%s] %s", serial, text)
+
+
+class PcmFramer:
+    """Turn arbitrary pipe reads into whole mono 16-bit samples.
+
+    A read can end partway through a sample, which would shift every later byte and
+    turn the audio into static. Two-slot modes carry one slot per channel, and usually
+    only one slot is active, so they're summed rather than averaged to keep the level.
+    """
+
+    def __init__(self, channels: int = 1):
+        self.frame_bytes = 2 * channels
+        self.channels = channels
+        self.leftover = b""
+
+    def __call__(self, chunk: bytes) -> bytes:
+        data = self.leftover + chunk
+        whole = len(data) - len(data) % self.frame_bytes
+        self.leftover = data[whole:]
+        data = data[:whole]
+        if self.channels == 1 or not data:
+            return data
+        samples = array("h")
+        samples.frombytes(data)
+        if sys.byteorder == "big":
+            samples.byteswap()
+        mixed = array("h", (max(-32768, min(32767, left + right)) for left, right in zip(samples[::2], samples[1::2])))
+        if sys.byteorder == "big":
+            mixed.byteswap()
+        return mixed.tobytes()
 
 
 class CallWriter:
@@ -202,6 +234,7 @@ class Worker:
     async def _run_audio(self, index: int, spec: dict) -> str:
         cfg = self.cfg
         rate = pipelines.pcm_rate(spec)
+        framer = PcmFramer(pipelines.pcm_channels(spec))
         digital = spec["modulation"] in pipelines.DIGITAL
         tail: list[str] = []
         procs: list[asyncio.subprocess.Process] = []
@@ -220,6 +253,7 @@ class Worker:
                     proc = await asyncio.create_subprocess_exec(
                         *pipelines.dsd_args(cfg, spec),
                         stdin=read_fd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                        env=cfg.tool_env(),
                     )
                 finally:
                     os.close(read_fd)
@@ -242,6 +276,9 @@ class Worker:
                     continue
                 if not chunk:
                     break
+                chunk = framer(chunk)
+                if not chunk:
+                    continue
                 if writer is None:
                     writer = CallWriter(cfg, self.spec or spec, self.serial, rate, self.sup.tmp_dir, self.sup.call_sink)
                     self.in_call, self.call_started = True, writer.started_at
@@ -277,7 +314,7 @@ class Worker:
         tail: list[str] = []
         proc = await asyncio.create_subprocess_exec(
             *pipelines.readsb_args(self.cfg, index, spec, json_dir),
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE, env=self.cfg.tool_env(),
         )
         reader = asyncio.create_task(_log_stderr(self.serial, proc.stderr, tail))
         path = Path(json_dir) / "aircraft.json"
@@ -302,7 +339,7 @@ class Worker:
         tail: list[str] = []
         proc = await asyncio.create_subprocess_exec(
             *pipelines.ais_args(self.cfg, index, spec),
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=self.cfg.tool_env(),
         )
         reader = asyncio.create_task(_log_stderr(self.serial, proc.stderr, tail))
         vessels: dict[str, dict] = {}

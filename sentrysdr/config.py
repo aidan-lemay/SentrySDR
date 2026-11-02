@@ -6,6 +6,7 @@ never opens a listening socket; it only dials out to ``master.url``.
 from __future__ import annotations
 
 import ipaddress
+import os
 import re
 import shutil
 import tomllib
@@ -69,6 +70,14 @@ class Config:
     @property
     def trusted_networks(self) -> list:
         return [ipaddress.ip_network(c, strict=False) for c in self.trusted_proxies]
+
+    def tool_env(self) -> dict[str, str]:
+        """Environment for radio tools: privately built libraries sit beside their binaries."""
+        env = dict(os.environ)
+        libraries = [str((directory.parent / "lib").resolve()) for directory in self.bin_dirs]
+        existing = env.get("LD_LIBRARY_PATH")
+        env["LD_LIBRARY_PATH"] = ":".join(libraries + ([existing] if existing else []))
+        return env
 
     def binary(self, name: str) -> str | None:
         for directory in self.bin_dirs:

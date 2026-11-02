@@ -11,7 +11,9 @@ from .config import Config
 
 ANALOG = {"nfm", "am", "wfm"}
 # Values are DSD-FME decode flags.
-DIGITAL = {"p25p1": "-f1", "p25p2": "-f2", "dmr": "-fr", "nxdn48": "-fi", "nxdn96": "-fn", "dstar": "-fd", "ysf": "-fy"}
+DIGITAL = {"p25p1": "-f1", "p25p2": "-f2", "dmr": "-fs", "nxdn48": "-fi", "nxdn96": "-fn", "dstar": "-fd", "ysf": "-fy"}
+# DSD-FME writes one channel per time slot for these modes, and mono for the rest.
+TWO_SLOT = {"p25p2", "dmr"}
 MODULATIONS = ANALOG | set(DIGITAL) | {"adsb", "ais"}
 PCM_RATE = 16000
 DIGITAL_INPUT_RATE = 48000
@@ -87,6 +89,10 @@ def pcm_rate(spec: dict) -> int:
     return DSD_OUTPUT_RATE if spec["modulation"] in DIGITAL else PCM_RATE
 
 
+def pcm_channels(spec: dict) -> int:
+    return 2 if spec["modulation"] in TWO_SLOT else 1
+
+
 def readsb_args(cfg: Config, index: int, spec: dict, json_dir: str) -> list[str]:
     # No --net options: readsb opens no listening ports.
     args = [
@@ -102,9 +108,11 @@ def readsb_args(cfg: Config, index: int, spec: dict, json_dir: str) -> list[str]
 
 def ais_args(cfg: Config, index: int, spec: dict) -> list[str]:
     # -o 5 prints one JSON object per message; no -N, so no web server or port.
-    args = [cfg.binary("AIS-catcher") or "AIS-catcher", f"-d:{index}", "-q", "-o", "5"]
+    args = [cfg.binary("AIS-catcher") or "AIS-catcher", f"-d:{index}", "-o", "5"]
     if spec.get("ppm"):
         args += ["-p", str(spec["ppm"])]
+    if spec.get("gain_db") is not None:
+        args += ["-gr", "TUNER", f"{spec['gain_db']:g}"]
     return args
 
 

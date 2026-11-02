@@ -37,7 +37,7 @@ def app_csp(tile_origin: str) -> str:
 # tar1090 is a third-party page built around inline scripts and external map tiles.
 TAR1090_CSP = (
     "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; "
-    "img-src 'self' data: https:; connect-src 'self'; object-src 'none'; base-uri 'self'; "
+    "img-src 'self' data: https:; connect-src 'self'; worker-src 'self' blob:; object-src 'none'; base-uri 'self'; "
     "form-action 'none'; frame-ancestors 'self'"
 )
 

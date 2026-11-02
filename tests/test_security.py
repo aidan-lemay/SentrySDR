@@ -89,6 +89,14 @@ def test_security_headers_present(app):
     assert "server" not in headers
 
 
+def test_looser_tar1090_policy_stays_on_its_own_path(app):
+    client = TestClient(app, base_url="https://sentry.example.com")
+    tar1090 = client.get("/api/tar1090/index.html").headers["content-security-policy"]
+    assert "worker-src 'self' blob:" in tar1090 and "'unsafe-inline' 'unsafe-eval'" in tar1090
+    main = client.get("/api/health").headers["content-security-policy"]
+    assert "blob:" not in main and "unsafe-eval" not in main and "script-src 'self';" in main
+
+
 def test_api_docs_not_exposed(app):
     client = TestClient(app, base_url="https://sentry.example.com")
     for path in ("/docs", "/redoc", "/openapi.json"):

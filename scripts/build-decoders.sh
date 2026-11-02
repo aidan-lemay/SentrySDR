@@ -42,8 +42,11 @@ build_ais() {
 build_tar1090() {
   # Static web UI only; served by SentrySDR behind its own authentication.
   fetch tar1090 https://github.com/wiedehopf/tar1090.git &&
+  # The aircraft database fills in registrations and types. It's data, not code.
+  fetch tar1090-db https://github.com/wiedehopf/tar1090-db.git &&
   rm -rf "$PREFIX/share/tar1090" &&
-  cp -r "$SRC/tar1090/html" "$PREFIX/share/tar1090"
+  cp -r "$SRC/tar1090/html" "$PREFIX/share/tar1090" &&
+  cp -r "$SRC/tar1090-db/db" "$PREFIX/share/tar1090/db2"
 }
 
 build_dsd() {

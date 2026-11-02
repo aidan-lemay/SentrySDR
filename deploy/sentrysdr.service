@@ -7,7 +7,6 @@ Wants=network-online.target
 Type=simple
 User=sentrysdr
 Group=sentrysdr
-Environment=LD_LIBRARY_PATH=/opt/sentrysdr/.vendor/lib
 ExecStart=/opt/sentrysdr/.venv/bin/python -m sentrysdr -c /etc/sentrysdr/sentrysdr.toml run
 Restart=always
 RestartSec=5

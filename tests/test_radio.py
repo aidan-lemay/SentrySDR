@@ -397,6 +397,16 @@ def test_ais_messages_merge_by_vessel():
     assert vessels["123"]["lat"] == 1.5 and vessels["123"]["shipname"] == "ALICE" and len(vessels) == 1
 
 
+def test_real_ais_catcher_output_is_understood():
+    # AIS-catcher -o 5 output for a known message, trimmed to the fields that matter.
+    line = (b'{"class":"AIS","device":"AIS-catcher","channel":"B","type":1,"mmsi":477553000,"status":5,'
+            b'"speed":0,"lon":-122.34584,"lat":47.582832,"course":51,"heading":181}')
+    vessels = {}
+    merge_ais_message(vessels, line)
+    vessel = vessels["477553000"]
+    assert (vessel["lat"], vessel["lon"], vessel["heading"]) == (47.582832, -122.34584, 181)
+
+
 def test_tracks_merge_across_receivers_and_expire(ctx):
     ctx.update_tracks("adsb", 1, "A", {"aircraft": [{"hex": "abc", "flight": "OLD"}]})
     ctx.update_tracks("adsb", 2, "B", {"aircraft": [{"hex": "abc", "flight": "NEW"}, {"hex": "def"}]})

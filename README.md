@@ -47,6 +47,15 @@ To add a slave, go to **Admin > Nodes** on the master to create a one-time token
 - **Service:** runs unprivileged under a systemd sandbox, with only its data and log folders writable. If you move `recordings_dir` or `log_dir`, add the new folder to `ReadWritePaths` in the unit.
 - **Encryption on the air:** encrypted digital traffic isn't decoded. Check the rules on recording and sharing radio traffic where you operate.
 
+## Decoder status
+
+| Tool | Status |
+|---|---|
+| `rtl_fm` (NFM, AM, WFM) | Run on a real RTL-SDR, including recording and live audio |
+| `readsb`, tar1090 | Run on a real RTL-SDR with real aircraft |
+| `AIS-catcher` | Run on a real RTL-SDR, and its output checked with a known message; no live ship received yet |
+| `dsd-fme` | Runs in the pipeline on a real RTL-SDR, and stays silent on noise; decoding a real digital signal is not yet tested |
+
 ## Tuning call detection
 
 A call is whatever passes the target's **squelch level**. Raise it if noise keeps recording, or lower it if calls are missed. The right value depends on your antenna and site, so expect to adjust it. A squelch of `0` records continuously, split into `max_call_seconds` pieces.
