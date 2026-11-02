@@ -1,0 +1,132 @@
+"""Build argument lists for the external radio tools.
+
+Commands are always argv lists, never shell strings. ``sanitize_spec`` validates
+every value first, because on a slave the spec arrives over the network.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from .config import Config
+
+ANALOG = {"nfm", "am", "wfm"}
+# Values are DSD-FME decode flags.
+DIGITAL = {"p25p1": "-f1", "p25p2": "-f2", "dmr": "-fr", "nxdn48": "-fi", "nxdn96": "-fn", "dstar": "-fd", "ysf": "-fy"}
+MODULATIONS = ANALOG | set(DIGITAL) | {"adsb", "ais"}
+PCM_RATE = 16000
+DIGITAL_INPUT_RATE = 48000
+DSD_OUTPUT_RATE = 8000
+FREQ_MIN_HZ = 500_000
+FREQ_MAX_HZ = 2_200_000_000
+
+
+class SpecError(ValueError):
+    pass
+
+
+def sanitize_spec(spec: dict) -> dict:
+    """Validate an assignment. Raises SpecError on anything unexpected."""
+    try:
+        clean = {
+            "recorder_id": int(spec["recorder_id"]),
+            "recorder_name": str(spec.get("recorder_name", ""))[:120],
+            "source_id": int(spec["source_id"]),
+            "source_name": str(spec.get("source_name", ""))[:120],
+            "target_id": int(spec["target_id"]),
+            "target_name": str(spec.get("target_name", ""))[:120],
+            "kind": str(spec.get("kind", "audio")),
+            "frequency_hz": int(spec["frequency_hz"]),
+            "modulation": str(spec["modulation"]),
+            "squelch": int(spec.get("squelch", 0)),
+            "gain_db": None if spec.get("gain_db") is None else float(spec["gain_db"]),
+            "ppm": int(spec.get("ppm", 0)),
+        }
+    except (KeyError, TypeError, ValueError) as exc:
+        raise SpecError(f"bad assignment: {exc}") from exc
+    if clean["kind"] not in ("audio", "adsb", "ais"):
+        raise SpecError("bad kind")
+    if clean["modulation"] not in MODULATIONS:
+        raise SpecError("bad modulation")
+    if not FREQ_MIN_HZ <= clean["frequency_hz"] <= FREQ_MAX_HZ:
+        raise SpecError("frequency out of range")
+    if not 0 <= clean["squelch"] <= 100000:
+        raise SpecError("squelch out of range")
+    if not -500 <= clean["ppm"] <= 500:
+        raise SpecError("ppm out of range")
+    if clean["gain_db"] is not None and not 0 <= clean["gain_db"] <= 60:
+        raise SpecError("gain out of range")
+    return clean
+
+
+def rtl_fm_args(cfg: Config, index: int, spec: dict) -> list[str]:
+    modulation = spec["modulation"]
+    args = [cfg.binary("rtl_fm") or "rtl_fm", "-d", str(index), "-f", str(spec["frequency_hz"])]
+    if modulation == "nfm":
+        args += ["-M", "fm", "-s", str(PCM_RATE), "-l", str(spec["squelch"]), "-E", "dc"]
+    elif modulation == "am":
+        args += ["-M", "am", "-s", str(PCM_RATE), "-l", str(spec["squelch"]), "-E", "dc"]
+    elif modulation == "wfm":
+        args += ["-M", "fm", "-s", "170k", "-A", "fast", "-r", str(PCM_RATE), "-l", "0", "-E", "deemp"]
+    elif modulation in DIGITAL:
+        # Decoders need the unfiltered discriminator signal at 48 kHz.
+        args += ["-M", "fm", "-s", str(DIGITAL_INPUT_RATE), "-l", str(spec["squelch"])]
+    else:
+        raise SpecError(f"{modulation} is not an rtl_fm mode")
+    if spec.get("gain_db") is not None:  # omitting -g selects tuner AGC
+        args += ["-g", f"{spec['gain_db']:g}"]
+    if spec.get("ppm"):
+        args += ["-p", str(spec["ppm"])]
+    return args + ["-"]
+
+
+def dsd_args(cfg: Config, spec: dict) -> list[str]:
+    return [cfg.binary("dsd-fme") or "dsd-fme", "-i", "-", "-o", "-", DIGITAL[spec["modulation"]]]
+
+
+def pcm_rate(spec: dict) -> int:
+    return DSD_OUTPUT_RATE if spec["modulation"] in DIGITAL else PCM_RATE
+
+
+def readsb_args(cfg: Config, index: int, spec: dict, json_dir: str) -> list[str]:
+    # No --net options: readsb opens no listening ports.
+    args = [
+        cfg.binary("readsb") or "readsb", "--device-type", "rtlsdr", "--device", str(index),
+        "--write-json", json_dir, "--write-json-every", "1", "--quiet",
+    ]
+    if spec.get("gain_db") is not None:
+        args += ["--gain", f"{spec['gain_db']:g}"]
+    if spec.get("ppm"):
+        args += ["--ppm", str(spec["ppm"])]
+    return args
+
+
+def ais_args(cfg: Config, index: int, spec: dict) -> list[str]:
+    # -o 5 prints one JSON object per message; no -N, so no web server or port.
+    args = [cfg.binary("AIS-catcher") or "AIS-catcher", f"-d:{index}", "-q", "-o", "5"]
+    if spec.get("ppm"):
+        args += ["-p", str(spec["ppm"])]
+    return args
+
+
+def encode_args(cfg: Config, raw_path: str, rate: int, out_path: str) -> list[str]:
+    return [
+        cfg.binary("ffmpeg") or "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "s16le", "-ar", str(rate), "-ac", "1", "-i", raw_path,
+        "-codec:a", "libmp3lame", "-b:a", "32k", out_path,
+    ]
+
+
+def live_encoder_args(cfg: Config, rate: int) -> list[str]:
+    return [
+        cfg.binary("ffmpeg") or "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+        "-f", "s16le", "-ar", str(rate), "-ac", "1", "-i", "pipe:0",
+        "-codec:a", "libmp3lame", "-b:a", "32k", "-flush_packets", "1", "-f", "mp3", "pipe:1",
+    ]
+
+
+def m4a_args(cfg: Config, in_path: str, out_path: str) -> list[str]:
+    # ClearCut's reference client (trunk-recorder) sends AAC in an m4a container.
+    return [
+        cfg.binary("ffmpeg") or "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+        "-i", in_path, "-codec:a", "aac", "-b:a", "32k", out_path,
+    ]
