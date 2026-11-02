@@ -15,6 +15,7 @@ import uvicorn
 from sentrysdr import pipelines
 from sentrysdr.context import Context
 from sentrysdr.engine import Supervisor
+from sentrysdr.live import LiveHub, silence_needed
 from sentrysdr.models import Node, Recording
 from sentrysdr.slave import Slave, encode_live_frame, ws_url
 from sentrysdr.web import create_app
@@ -201,6 +202,38 @@ async def test_adsb_pipeline_reads_written_json(tmp_path):
     assert await wait_for(lambda: tracks)
     await sup.shutdown()
     assert tracks[0][2]["aircraft"][0]["hex"] == "abc123"
+
+
+# --- live pacing -----------------------------------------------------------
+def test_no_silence_inserted_between_bursts_of_speech():
+    assert silence_needed(elapsed=1.0, written=2 * 16000 - 4096, rate=16000) == 0
+
+
+def test_silence_fills_a_closed_squelch_to_real_time():
+    assert silence_needed(elapsed=2.0, written=0, rate=16000) == 64000
+
+
+def test_silence_is_whole_samples():
+    assert silence_needed(elapsed=1.23457, written=1, rate=16000) % 2 == 0
+
+
+async def test_burst_arrival_keeps_stream_at_real_time(tmp_path):
+    """PCM arriving every 128 ms must not gain inserted silence."""
+    hub = LiveHub(make_config(tmp_path))
+    queue = await hub.subscribe("k")
+    stream = hub.streams["k"]
+    written = []
+    write = stream.proc.stdin.write
+    stream.proc.stdin.write = lambda data: (written.append(len(data)), write(data))[1]
+    started = time.monotonic()
+    while time.monotonic() - started < 1.5:
+        hub.feed("k", b"\1\0" * 2048, 16000)
+        await asyncio.sleep(0.128)
+    elapsed = time.monotonic() - started
+    stop_started = time.monotonic()
+    await hub.unsubscribe("k", queue)
+    assert time.monotonic() - stop_started < 1.0, "stopping a stream must be prompt"
+    assert abs(sum(written) - elapsed * 32000) < 32000 * 0.35
 
 
 # --- live frame format -----------------------------------------------------

@@ -1,0 +1,14 @@
+# /etc/cloudflared/config.yml, pairing with [proxy] in master.example.toml:
+#   trusted_proxies = ["127.0.0.1/32", "::1/128"]
+#   client_ip_header = "CF-Connecting-IP"
+#
+# If you put Cloudflare Access in front of this hostname, add a bypass for
+# /api/nodes/agent/* : slaves can't complete an Access login, and they authenticate
+# with their own device keys.
+tunnel: YOUR-TUNNEL-ID
+credentials-file: /etc/cloudflared/YOUR-TUNNEL-ID.json
+
+ingress:
+  - hostname: sentry.example.com
+    service: http://127.0.0.1:8642
+  - service: http_status:404

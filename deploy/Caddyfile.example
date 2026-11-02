@@ -1,0 +1,7 @@
+# Pair with: trusted_proxies = ["127.0.0.1/32", "::1/128"], client_ip_header = "X-Forwarded-For"
+# Caddy handles certificates, websockets and streaming without further settings.
+sentry.example.com {
+	reverse_proxy 127.0.0.1:8642 {
+		flush_interval -1
+	}
+}

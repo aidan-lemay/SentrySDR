@@ -1,0 +1,3 @@
+# Let the sentrysdr user open RTL-SDR dongles (RTL2832U/RTL2838).
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="2832", GROUP="sentrysdr", MODE="0660"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="2838", GROUP="sentrysdr", MODE="0660"

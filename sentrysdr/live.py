@@ -8,15 +8,16 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 from typing import Callable
 
 from . import pipelines
 from .config import Config
-from .engine import stop_process
 
 log = logging.getLogger("sentrysdr.live")
 
 TICK = 0.1
+SILENCE_SLACK_SECONDS = 0.3
 QUEUE_CHUNKS = 64
 MAX_BUFFER_BYTES = 1_000_000
 
@@ -24,6 +25,19 @@ MAX_BUFFER_BYTES = 1_000_000
 def upsample_double(pcm: bytes) -> bytes:
     """Repeat each 16-bit sample: turns 8 kHz decoder audio into 16 kHz."""
     return b"".join(pcm[i:i + 2] * 2 for i in range(0, len(pcm) - 1, 2))
+
+
+def silence_needed(elapsed: float, written: int, rate: int) -> int:
+    """Bytes of silence to keep the stream at real time.
+
+    PCM arrives in bursts (rtl_fm about every 128 ms), so an empty tick doesn't mean
+    the squelch closed. Silence is added only once the stream has really fallen
+    behind, otherwise it would chop gaps into active speech.
+    """
+    behind = int(elapsed * rate * 2) - written
+    if behind <= int(SILENCE_SLACK_SECONDS * rate * 2):
+        return 0
+    return behind & ~1  # whole 16-bit samples
 
 
 class _Stream:
@@ -45,15 +59,18 @@ class _Stream:
 
     async def _pump(self) -> None:
         with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+            started = time.monotonic()
+            written = 0
             while True:
                 await asyncio.sleep(TICK)
-                wanted = int(self.rate * 2 * TICK)
                 if self.buffer:
                     data, self.buffer = bytes(self.buffer), bytearray()
                 else:
-                    data = bytes(wanted)
-                self.proc.stdin.write(data)
-                await self.proc.stdin.drain()
+                    data = bytes(silence_needed(time.monotonic() - started, written, self.rate))
+                if data:
+                    written += len(data)
+                    self.proc.stdin.write(data)
+                    await self.proc.stdin.drain()
 
     async def _fanout(self) -> None:
         while chunk := await self.proc.stdout.read(4096):
@@ -67,7 +84,11 @@ class _Stream:
         for task in self.tasks:
             task.cancel()
         await asyncio.gather(*self.tasks, return_exceptions=True)
-        await stop_process(self.proc, 2.0)
+        # Nothing to flush, and SIGTERM would hang on a stdout pipe nobody is reading.
+        if self.proc and self.proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                self.proc.kill()
+            await self.proc.wait()
 
 
 class LiveHub:
@@ -108,11 +129,12 @@ class LiveHub:
             if stream is None:
                 return
             stream.subscribers.discard(queue)
-            if not stream.subscribers:
-                del self.streams[key]
-                if self.on_demand:
-                    self.on_demand(key, False)
-                await stream.stop()
+            if stream.subscribers:
+                return
+            del self.streams[key]
+            if self.on_demand:
+                self.on_demand(key, False)
+        await stream.stop()  # outside the lock, so other streams aren't held up
 
     async def shutdown(self) -> None:
         for stream in list(self.streams.values()):

@@ -1,0 +1,48 @@
+[Unit]
+Description=SentrySDR (role set in /etc/sentrysdr/sentrysdr.toml)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sentrysdr
+Group=sentrysdr
+Environment=LD_LIBRARY_PATH=/opt/sentrysdr/.vendor/lib
+ExecStart=/opt/sentrysdr/.venv/bin/python -m sentrysdr -c /etc/sentrysdr/sentrysdr.toml run
+Restart=always
+RestartSec=5
+UMask=0027
+
+# Sandbox: the only writable paths are the data and log folders. If you move
+# recordings_dir or log_dir in the configuration, add the new folder here.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/sentrysdr /var/log/sentrysdr
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+SystemCallErrorNumber=EPERM
+# AF_NETLINK lets libusb notice SDRs being plugged in.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+# USB only. Nothing else in /dev is reachable.
+PrivateDevices=no
+DevicePolicy=closed
+DeviceAllow=char-usb_device rw
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,55 @@
+# SentrySDR master. The same application as a slave; node.role selects the behaviour.
+
+[node]
+role = "master"
+name = "main-server"
+
+[server]
+# Stays on loopback. Publish it with a tunnel or reverse proxy (see deploy/).
+# A non-loopback address is refused unless allow_public_bind = true.
+bind_host = "127.0.0.1"
+bind_port = 8642
+# The address people and slaves use. Must be https unless it's a loopback address.
+public_url = "https://sentry.example.com"
+# Other addresses this server may be reached at. Anything else is refused:
+#   - a local browser, including through an SSH tunnel
+#   - a Tailscale address that slaves dial, if you use `tailscale serve`
+extra_origins = [
+    "http://localhost:8642",
+    "http://127.0.0.1:8642",
+    # "https://main-server.your-tailnet.ts.net",
+]
+# Schedules run in this time zone.
+timezone = "America/New_York"
+
+[proxy]
+# Which peers may state the real client address. Bans, rate limits and audit logs
+# all depend on this being right, so match it to how you publish the server.
+#
+# cloudflared on this machine:
+trusted_proxies = ["127.0.0.1/32", "::1/128"]
+client_ip_header = "CF-Connecting-IP"
+#
+# Caddy or nginx on this machine (use with the examples in deploy/):
+# client_ip_header = "X-Forwarded-For"
+
+[storage]
+data_dir = "/var/lib/sentrysdr"
+recordings_dir = "/var/lib/sentrysdr/recordings"
+log_dir = "/var/log/sentrysdr"
+# How long recordings and audit logs are kept is set in the UI: Admin > Settings.
+
+[sdr]
+# The only SDRs this instance may open. Others stay free for other software.
+# Find serials with: sentrysdr -c <this file> list-sdrs
+serials = []
+
+[calls]
+# Silence that ends a call, shortest call to keep, and longest before it is split.
+hang_seconds = 2.0
+min_call_seconds = 0.5
+max_call_seconds = 1800
+
+[binaries]
+# Folders searched before PATH for rtl_fm, readsb, AIS-catcher, dsd-fme, ffmpeg.
+search_dirs = ["/opt/sentrysdr/.vendor/bin"]
