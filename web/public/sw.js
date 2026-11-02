@@ -1,6 +1,6 @@
 // Caches only the app shell. API responses and audio are never cached here, so
 // signing out or losing access leaves no radio data behind on the device.
-const CACHE = 'sentrysdr-shell-v1';
+const CACHE = 'sentrysdr-shell-v2';
 
 self.addEventListener('install', () => self.skipWaiting());
 

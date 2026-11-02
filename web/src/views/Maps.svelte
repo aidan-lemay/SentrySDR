@@ -35,9 +35,8 @@
   function draw() {
     if (!layer) return;
     layer.clearLayers();
-    const color = getComputedStyle(document.documentElement).getPropertyValue('--accent').trim();
     for (const item of located) {
-      L.circleMarker([item.lat, item.lon], { radius: 6, color, weight: 2, fillOpacity: 0.6 })
+      L.circleMarker([item.lat, item.lon], { radius: 7, color: '#a80000', weight: 2, fillOpacity: 0.5 })
         .bindTooltip(String(label(item)))
         .bindPopup(() => popup(item))
         .addTo(layer);
@@ -83,19 +82,17 @@
   });
 </script>
 
-<div class="page-head">
-  <h1>Maps</h1>
-  <div class="row">
-    <button class="tab" class:active={kind === 'adsb'} onclick={() => choose('adsb')}>Aircraft</button>
-    <button class="tab" class:active={kind === 'ais'} onclick={() => choose('ais')}>Ships</button>
-    {#if user.tar1090_available}<a href="api/tar1090/index.html" target="_blank" rel="noopener">Open tar1090</a>{/if}
-  </div>
+<h1>Maps</h1>
+{#if error}<div class="err" role="alert">{error}</div>{/if}
+<div class="buttons">
+  <button aria-pressed={kind === 'adsb'} style:font-weight={kind === 'adsb' ? 'bold' : 'normal'} onclick={() => choose('adsb')}>Aircraft</button>
+  <button aria-pressed={kind === 'ais'} style:font-weight={kind === 'ais' ? 'bold' : 'normal'} onclick={() => choose('ais')}>Ships</button>
+  {#if user.tar1090_available}<a class="button" href="api/tar1090/index.html" target="_blank" rel="noopener">Open tar1090</a>{/if}
 </div>
-{#if error}<div class="notice error" role="alert">{error}</div>{/if}
-<section class="panel">
+<div class="box">
   <div class="map" bind:this={host}></div>
-  <p class="muted small" style="margin-bottom:0">
-    {located.length} {kind === 'adsb' ? 'aircraft' : 'ships'} with a position{items.length !== located.length ? `, ${items.length - located.length} without` : ''}.
-    {#if !items.length}Assign an {kind === 'adsb' ? 'ADS-B' : 'AIS'} target to a source to see traffic here.{/if}
-  </p>
-</section>
+</div>
+<p class="small">
+  {located.length} {kind === 'adsb' ? 'aircraft' : 'ships'} with a position{items.length !== located.length ? `, ${items.length - located.length} without` : ''}.
+  {#if !items.length}Assign an {kind === 'adsb' ? 'ADS-B' : 'AIS'} target to a source to see traffic here.{/if}
+</p>

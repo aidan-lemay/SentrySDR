@@ -46,32 +46,38 @@
   }
 </script>
 
-<div class="auth">
-  <h1 style="margin-bottom:.25rem">SentrySDR</h1>
-  <p class="muted small">{mode === 'login' ? 'Sign in to continue.' : 'Request an account. An administrator must approve it before you can sign in.'}</p>
-  {#if error}<div class="notice error" role="alert">{error}</div>{/if}
-  {#if message}<div class="notice" role="status">{message}</div>{/if}
-  <form class="panel stack" onsubmit={submit}>
-    {#if mode === 'signup'}
-      <label>Name <input bind:value={name} required maxlength="120" autocomplete="name" /></label>
-    {/if}
-    <label>Email <input type="email" bind:value={email} required autocomplete="username" /></label>
-    <label>Password
-      <input type="password" bind:value={password} required minlength={mode === 'signup' ? 12 : undefined}
-        autocomplete={mode === 'login' ? 'current-password' : 'new-password'} />
-      {#if mode === 'signup'}<span class="small">At least 12 characters.</span>{/if}
-    </label>
-    {#if needTotp}
-      <label>Authentication code
-        <!-- svelte-ignore a11y_autofocus -->
-        <input bind:value={totp} inputmode="numeric" autocomplete="one-time-code" maxlength="6" required autofocus />
+<div class="signin">
+  <h1>SentrySDR</h1>
+  {#if error}<div class="err" role="alert">{error}</div>{/if}
+  {#if message}<div class="msg" role="status">{message}</div>{/if}
+  <form onsubmit={submit}>
+    <fieldset>
+      <legend>{mode === 'login' ? 'Sign in' : 'Request an account'}</legend>
+      {#if mode === 'signup'}
+        <p class="small">An administrator has to approve your request before you can sign in.</p>
+        <label class="stacked"><span>Name</span><input bind:value={name} required maxlength="120" autocomplete="name" /></label>
+      {/if}
+      <label class="stacked"><span>Email</span><input type="email" bind:value={email} required autocomplete="username" /></label>
+      <label class="stacked"><span>Password{mode === 'signup' ? ' (12 characters or more)' : ''}</span>
+        <input type="password" bind:value={password} required minlength={mode === 'signup' ? 12 : undefined}
+          autocomplete={mode === 'login' ? 'current-password' : 'new-password'} />
       </label>
-    {/if}
-    <button class="primary" disabled={busy}>{mode === 'login' ? 'Sign in' : 'Request account'}</button>
+      {#if needTotp}
+        <label class="stacked"><span>Code from your authenticator app</span>
+          <input bind:value={totp} inputmode="numeric" autocomplete="one-time-code" maxlength="6" required />
+        </label>
+      {/if}
+      <div class="buttons"><button class="main" disabled={busy}>{mode === 'login' ? 'Sign in' : 'Send request'}</button></div>
+    </fieldset>
   </form>
   {#if mode === 'login'}
-    <button class="tab" onclick={() => switchMode('signup')}>Request an account</button>
+    <p><a href="#/" onclick={(event) => { event.preventDefault(); switchMode('signup'); }}>Request an account</a></p>
   {:else}
-    <button class="tab" onclick={() => switchMode('login')}>Back to sign in</button>
+    <p><a href="#/" onclick={(event) => { event.preventDefault(); switchMode('login'); }}>Back to sign in</a></p>
   {/if}
 </div>
+
+<style>
+  .stacked { display: block; margin: .5rem 0; }
+  .stacked > span { display: block; font-size: .875rem; margin-bottom: .15rem; }
+</style>

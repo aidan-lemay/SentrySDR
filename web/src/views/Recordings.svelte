@@ -15,6 +15,8 @@
   let protectedOnly = $state(false);
   let error = $state('');
   let loaded = $state(false);
+  let transcribing = $state({});
+  let requested = $state({});
 
   const sourceFilter = $derived(new URLSearchParams(route.split('?')[1] ?? '').get('source_id'));
 
@@ -55,6 +57,7 @@
   function page(delta) {
     offset = Math.max(0, offset + delta);
     load();
+    scrollTo(0, 0);
   }
 
   async function setProtected(call, value) {
@@ -67,6 +70,7 @@
   }
 
   async function remove(call) {
+    if (!confirm(`Permanently delete this recording of ${call.target_name}?`)) return;
     try {
       await api(`recordings/${call.id}`, { method: 'DELETE' });
       await load();
@@ -75,66 +79,91 @@
     }
   }
 
+  const uploadedToClearcut = (call) => call.clearcut_system && call.uploads.some((u) => u.destination === 'clearcut' && u.status === 'done');
+
+  async function requestTranscript(call) {
+    transcribing[call.id] = true;
+    error = '';
+    try {
+      const reply = await api(`recordings/${call.id}/transcribe`, { method: 'POST' });
+      call.transcript = reply.transcript;
+      if (!reply.transcript) requested[call.id] = true;
+    } catch (failure) {
+      error = failure.message;
+    } finally {
+      delete transcribing[call.id];
+    }
+  }
+
   const UPLOAD_LABEL = { clearcut: 'ClearCut', rdio: 'RDIO' };
-  const uploadClass = (status) => ({ done: 'ok', failed: 'bad' }[status] ?? 'warn');
+  const uploadClass = (status) => ({ done: 'st-ok', failed: 'st-bad' }[status] ?? 'st-warn');
 </script>
 
-<div class="page-head">
-  <h1>Recordings</h1>
-  <span class="muted small">
-    {total} call{total === 1 ? '' : 's'}
-    {#if sourceFilter}· one source · <a href="#/recordings">show all</a>{/if}
-    {#if user.clearcut_page_url}· <a href={user.clearcut_page_url} target="_blank" rel="noopener noreferrer">Open ClearCut</a>{/if}
-  </span>
-</div>
+<h1>Recordings</h1>
+<p class="small">
+  {total} call{total === 1 ? '' : 's'}{#if sourceFilter}, from one source. <a href="#/recordings">Show all</a>{/if}
+  {#if user.clearcut_page_url} | <a href={user.clearcut_page_url} target="_blank" rel="noopener noreferrer">Open ClearCut</a>{/if}
+</p>
 
-{#if error}<div class="notice error" role="alert">{error}</div>{/if}
+{#if error}<div class="err" role="alert">{error}</div>{/if}
 
-<form class="panel fields" onsubmit={applyFilters}>
-  <label>Search <input type="search" bind:value={search} placeholder="Target, source or transcript" /></label>
-  <label>From <input type="datetime-local" bind:value={start} /></label>
-  <label>To <input type="datetime-local" bind:value={end} /></label>
-  <label class="check"><input type="checkbox" bind:checked={protectedOnly} /> Protected only</label>
-  <button class="primary">Apply</button>
+<form onsubmit={applyFilters}>
+  <fieldset>
+    <legend>Search</legend>
+    <label class="field"><span>Target, source or transcript</span><input type="search" bind:value={search} /></label>
+    <details>
+      <summary class="small" style="padding:.3rem 0">Date and other filters</summary>
+      <label class="field"><span>From</span><input type="datetime-local" bind:value={start} /></label>
+      <label class="field"><span>To</span><input type="datetime-local" bind:value={end} /></label>
+      <div class="field"><span>Protected</span><label class="tick"><input type="checkbox" bind:checked={protectedOnly} /> Protected calls only</label></div>
+    </details>
+    <div class="buttons form-buttons"><button class="main">Search</button></div>
+  </fieldset>
 </form>
 
-<section class="panel">
+<div class="box">
   {#each items as call (call.id)}
-    <article class="call">
-      <div class="row spread">
-        <div>
-          <strong>{call.target_name || 'Unknown target'}</strong>
-          <span class="mono small muted">{formatMHz(call.frequency_hz)}</span>
-          {#if call.protected}<span class="pill ok">Protected</span>{/if}
+    <div class="call">
+      <div><strong>{call.target_name || 'Unknown target'}</strong> <span class="mono small nowrap">{formatMHz(call.frequency_hz)}</span></div>
+      <div class="small">{formatTime(call.started_at)}, {formatDuration(call.duration)}, {formatSize(call.size_bytes)}</div>
+      <div class="small dim">{call.source_name} on {call.node_name}</div>
+      {#if call.protected || call.uploads.length}
+        <div class="small flags">
+          {#if call.protected}<span class="st-ok">Protected</span>{/if}
           {#each call.uploads as upload}
-            <span class="pill {uploadClass(upload.status)}">{UPLOAD_LABEL[upload.destination]}: {upload.status}</span>
+            <span class={uploadClass(upload.status)}>{UPLOAD_LABEL[upload.destination]}: {upload.status}</span>
           {/each}
         </div>
-        <div class="muted small">{formatTime(call.started_at)} · {formatDuration(call.duration)} · {formatSize(call.size_bytes)}</div>
-      </div>
-      <div class="muted small">{call.source_name} on {call.node_name}</div>
-      <div class="row" style="margin-top:.35rem">
-        <!-- svelte-ignore a11y_media_has_caption -->
-        <audio src={`api/recordings/${call.id}/audio`} controls preload="none"></audio>
-        {#if can('download')}<a href={`api/recordings/${call.id}/download`} download>Download</a>{/if}
+      {/if}
+      <!-- svelte-ignore a11y_media_has_caption -->
+      <audio src={`api/recordings/${call.id}/audio`} controls preload="none"></audio>
+      {#if call.transcript}
+        <div class="transcript">{call.transcript}</div>
+      {:else if requested[call.id]}
+        <p class="small dim">Transcript requested. It will appear here once ClearCut has finished.</p>
+      {/if}
+      <div class="buttons">
+        {#if can('download')}<a class="button" href={`api/recordings/${call.id}/download`} download>Download</a>{/if}
+        {#if can('transcribe') && uploadedToClearcut(call) && !call.transcript && !requested[call.id]}
+          <button disabled={transcribing[call.id]} onclick={() => requestTranscript(call)}>{transcribing[call.id] ? 'Requesting...' : 'Get transcript'}</button>
+        {/if}
         {#if can('protect')}
           <button onclick={() => setProtected(call, !call.protected)}>{call.protected ? 'Unprotect' : 'Protect'}</button>
         {/if}
         {#if user.role === 'admin' && !call.protected}
-          <button class="danger" onclick={() => remove(call)}>Delete</button>
+          <button class="bad" onclick={() => remove(call)}>Delete</button>
         {/if}
       </div>
-      {#if call.transcript}<div class="transcript">{call.transcript}</div>{/if}
-    </article>
+    </div>
   {:else}
-    {#if loaded}<div class="empty">No recordings match.</div>{/if}
+    {#if loaded}<p class="pad dim">No recordings found.</p>{/if}
   {/each}
-</section>
+</div>
 
 {#if total > PAGE}
-  <div class="row spread">
+  <div class="pager">
     <button disabled={offset === 0} onclick={() => page(-PAGE)}>Newer</button>
-    <span class="muted small">{offset + 1}–{Math.min(offset + PAGE, total)} of {total}</span>
+    <span class="small">{offset + 1} to {Math.min(offset + PAGE, total)} of {total}</span>
     <button disabled={offset + PAGE >= total} onclick={() => page(PAGE)}>Older</button>
   </div>
 {/if}

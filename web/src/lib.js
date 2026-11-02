@@ -59,7 +59,7 @@ export const MODULATIONS = [
 export const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 
 export const formatMHz = (hz) => (hz == null ? '' : `${(hz / 1e6).toFixed(4).replace(/0{1,2}$/, '')} MHz`);
-export const formatTime = (epoch) => (epoch ? new Date(epoch * 1000).toLocaleString() : '—');
+export const formatTime = (epoch) => (epoch ? new Date(epoch * 1000).toLocaleString() : 'None');
 
 export function formatDuration(seconds) {
   const total = Math.round(seconds ?? 0);

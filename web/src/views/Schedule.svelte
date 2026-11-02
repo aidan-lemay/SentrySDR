@@ -58,9 +58,11 @@
       days: [...recorder.schedule_days], start: recorder.schedule_start, end: recorder.schedule_end,
       enabled: recorder.enabled, lock_password: '',
     };
+    document.getElementById('schedule-form')?.scrollIntoView();
   }
 
   async function remove(recorder) {
+    if (!confirm(`Remove the schedule ${recorder.name}?`)) return;
     error = '';
     try {
       await api(`recorders/${recorder.id}`, {
@@ -69,7 +71,7 @@
       });
       await refresh();
     } catch (failure) {
-      error = failure.detail === 'locked' ? 'This source is locked. Enter its lock password in the form, then remove again.' : failure.message;
+      error = failure.detail === 'locked' ? 'This source is locked. Enter its lock password in the form below, then remove it again.' : failure.message;
     }
   }
 
@@ -78,95 +80,95 @@
   }
 </script>
 
-<div class="page-head">
-  <h1>Schedule</h1>
-  {#if tz}<span class="muted small">Times are in {tz}</span>{/if}
+<h1>Schedule</h1>
+<p class="small">A schedule takes over its source for the times shown, then the source goes back to its assigned target.{#if tz} Times are in {tz}.{/if}</p>
+
+{#if error}<div class="err" role="alert">{error}</div>{/if}
+{#if message}<div class="msg" role="status">{message}</div>{/if}
+
+<div class="box">
+  <h2>Scheduled recorders</h2>
+  <table class="table">
+    <thead><tr><th>Name</th><th>Source</th><th>Target</th><th>When</th><th>Actions</th></tr></thead>
+    <tbody>
+      {#each scheduled as recorder (recorder.id)}
+        <tr>
+          <td class="title-cell">{recorder.name}{#if !recorder.enabled} <span class="st-warn">(off)</span>{/if}</td>
+          <td data-label="Source"><span>{recorder.source_name}</span></td>
+          <td data-label="Target"><span>{recorder.target_name} <span class="mono small nowrap">{formatMHz(recorder.frequency_hz)}</span></span></td>
+          <td data-label="When"><span>{formatSchedule(recorder)}</span></td>
+          <td>
+            {#if canEdit}
+              <div class="buttons" style="margin:0">
+                <button onclick={() => edit(recorder)}>Edit</button>
+                <button class="bad" onclick={() => remove(recorder)}>Remove</button>
+              </div>
+            {/if}
+          </td>
+        </tr>
+      {:else}
+        <tr><td class="empty" colspan="5">No schedules yet.</td></tr>
+      {/each}
+    </tbody>
+  </table>
 </div>
 
-{#if error}<div class="notice error" role="alert">{error}</div>{/if}
-{#if message}<div class="notice" role="status">{message}</div>{/if}
-
-<section class="panel">
-  <h2 style="margin-bottom:.5rem">Scheduled recorders</h2>
-  <p class="muted small" style="margin-top:0">A schedule takes over its source for the window, then the source returns to its assigned target.</p>
-  <div class="table-wrap">
-    <table>
-      <thead><tr><th>Name</th><th>Source</th><th>Target</th><th>When</th><th></th></tr></thead>
+{#if alwaysOn.length}
+  <div class="box">
+    <h2>Always on</h2>
+    <table class="table">
+      <thead><tr><th>Source</th><th>Target</th><th>Assigned by</th></tr></thead>
       <tbody>
-        {#each scheduled as recorder (recorder.id)}
+        {#each alwaysOn as recorder (recorder.id)}
           <tr>
-            <td>{recorder.name}{#if !recorder.enabled} <span class="pill warn">Off</span>{/if}</td>
-            <td>{recorder.source_name}</td>
-            <td>{recorder.target_name} <span class="muted mono small">{formatMHz(recorder.frequency_hz)}</span></td>
-            <td>{formatSchedule(recorder)}</td>
-            <td>
-              {#if canEdit}
-                <div class="row">
-                  <button onclick={() => edit(recorder)}>Edit</button>
-                  <button class="danger" onclick={() => remove(recorder)}>Remove</button>
-                </div>
-              {/if}
-            </td>
+            <td class="title-cell">{recorder.source_name}</td>
+            <td data-label="Target"><span>{recorder.target_name} <span class="mono small nowrap">{formatMHz(recorder.frequency_hz)}</span></span></td>
+            <td data-label="Assigned by"><span>{recorder.assigned_by}</span></td>
           </tr>
-        {:else}
-          <tr><td colspan="5" class="muted">No schedules yet.</td></tr>
         {/each}
       </tbody>
     </table>
   </div>
-</section>
-
-{#if alwaysOn.length}
-  <section class="panel">
-    <h2 style="margin-bottom:.5rem">Always-on assignments</h2>
-    <div class="table-wrap">
-      <table>
-        <thead><tr><th>Source</th><th>Target</th><th>Assigned by</th></tr></thead>
-        <tbody>
-          {#each alwaysOn as recorder (recorder.id)}
-            <tr><td>{recorder.source_name}</td><td>{recorder.target_name} <span class="muted mono small">{formatMHz(recorder.frequency_hz)}</span></td><td>{recorder.assigned_by}</td></tr>
-          {/each}
-        </tbody>
-      </table>
-    </div>
-  </section>
 {/if}
 
 {#if canEdit}
-  <form class="panel stack" onsubmit={save}>
-    <h2>{form.id ? 'Edit schedule' : 'New schedule'}</h2>
-    <div class="fields">
-      <label>Name <input bind:value={form.name} required maxlength="120" placeholder="Tuesday net" /></label>
-      <label>Source
+  <form id="schedule-form" onsubmit={save}>
+    <fieldset>
+      <legend>{form.id ? 'Edit schedule' : 'Add a schedule'}</legend>
+      <label class="field"><span>Name</span><input bind:value={form.name} required maxlength="120" /></label>
+      <label class="field"><span>Source</span>
         <select bind:value={form.source_id} required>
-          <option value="" disabled>Choose a source</option>
+          <option value="" disabled>Choose...</option>
           {#each sources as source (source.id)}<option value={source.id}>{source.name}</option>{/each}
         </select>
       </label>
-      <label>Target
+      <label class="field"><span>Target</span>
         <select bind:value={form.target_id} required>
-          <option value="" disabled>Choose a target</option>
-          {#each targets as target (target.id)}<option value={target.id}>{target.name} — {formatMHz(target.frequency_hz)}</option>{/each}
+          <option value="" disabled>Choose...</option>
+          {#each targets as target (target.id)}<option value={target.id}>{target.name} ({formatMHz(target.frequency_hz)})</option>{/each}
         </select>
       </label>
-      <label>Start <input type="time" bind:value={form.start} required /></label>
-      <label>End <input type="time" bind:value={form.end} required /></label>
-    </div>
-    <fieldset style="border:none;padding:0;margin:0">
-      <legend class="small muted">Days</legend>
-      <div class="days">
-        {#each DAYS as day, index}
-          <label><input type="checkbox" checked={form.days.includes(index)} onchange={() => toggleDay(index)} /> {day}</label>
-        {/each}
+      <label class="field"><span>Start time</span><input type="time" bind:value={form.start} required /></label>
+      <label class="field"><span>End time</span><input type="time" bind:value={form.end} required /></label>
+      <div class="field">
+        <span>Days</span>
+        <div class="days">
+          {#each DAYS as day, index}
+            <label class="tick"><input type="checkbox" checked={form.days.includes(index)} onchange={() => toggleDay(index)} /> {day}</label>
+          {/each}
+        </div>
+      </div>
+      <div class="field">
+        <span>Enabled</span>
+        <label class="tick"><input type="checkbox" bind:checked={form.enabled} /> Run this schedule</label>
+      </div>
+      {#if selectedLocked}
+        <label class="field"><span>Lock password</span><input type="password" bind:value={form.lock_password} autocomplete="off" /></label>
+      {/if}
+      <div class="buttons form-buttons">
+        <button class="main" disabled={!form.days.length}>Save</button>
+        {#if form.id}<button type="button" onclick={() => (form = blank())}>Cancel</button>{/if}
       </div>
     </fieldset>
-    <label class="check"><input type="checkbox" bind:checked={form.enabled} /> Enabled</label>
-    {#if selectedLocked}
-      <label>Lock password for this source <input type="password" bind:value={form.lock_password} autocomplete="off" /></label>
-    {/if}
-    <div class="row">
-      <button class="primary" disabled={!form.days.length}>Save schedule</button>
-      {#if form.id}<button type="button" onclick={() => (form = blank())}>Cancel</button>{/if}
-    </div>
   </form>
 {/if}

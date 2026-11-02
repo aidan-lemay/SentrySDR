@@ -4,7 +4,7 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-from sqlalchemy import JSON, ForeignKey, Index, String, create_engine, event
+from sqlalchemy import JSON, ForeignKey, Index, String, create_engine, event, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 
@@ -107,7 +107,8 @@ class Target(Base):
     modulation: Mapped[str] = mapped_column(String(12), default="nfm")
     squelch: Mapped[int] = mapped_column(default=50)  # 0 = continuous recording
     clearcut_enabled: Mapped[bool] = mapped_column(default=False)
-    clearcut_id: Mapped[int | None] = mapped_column(nullable=True)
+    clearcut_system: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    clearcut_id: Mapped[int | None] = mapped_column(nullable=True)  # talkgroup number
     rdio_enabled: Mapped[bool] = mapped_column(default=False)
     rdio_system: Mapped[int | None] = mapped_column(nullable=True)
     rdio_talkgroup: Mapped[int | None] = mapped_column(nullable=True)
@@ -149,6 +150,10 @@ class Recording(Base):
     size_bytes: Mapped[int] = mapped_column(default=0)
     protected: Mapped[bool] = mapped_column(default=False, index=True)
     transcript: Mapped[str | None] = mapped_column(nullable=True)
+    # Snapshots, so transcripts can still be found after the target is deleted.
+    clearcut_system: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    clearcut_talkgroup: Mapped[int | None] = mapped_column(nullable=True)
+    clearcut_call_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
 class UploadJob(Base):
@@ -168,6 +173,18 @@ class Setting(Base):
     value: Mapped[str] = mapped_column(String(2000))
 
 
+def _add_missing_columns(engine) -> None:
+    """Add columns new in this version. Only nullable columns may be added later."""
+    inspector = inspect(engine)
+    with engine.begin() as connection:
+        for table in Base.metadata.sorted_tables:
+            existing = {column["name"] for column in inspector.get_columns(table.name)}
+            for column in table.columns:
+                if column.name not in existing:
+                    kind = column.type.compile(dialect=engine.dialect)
+                    connection.execute(text(f'ALTER TABLE "{table.name}" ADD COLUMN "{column.name}" {kind}'))
+
+
 def make_session_factory(db_path: Path):
     db_path.parent.mkdir(parents=True, exist_ok=True)
     engine = create_engine(
@@ -184,6 +201,7 @@ def make_session_factory(db_path: Path):
         cursor.close()
 
     Base.metadata.create_all(engine)
+    _add_missing_columns(engine)
     try:
         db_path.chmod(0o600)
     except OSError:

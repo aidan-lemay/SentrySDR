@@ -22,6 +22,7 @@
   async function run(action, success) {
     error = '';
     message = '';
+    scrollTo(0, 0);
     try {
       const reply = await action();
       if (success) message = success;
@@ -43,7 +44,7 @@
 
   async function changePassword(event) {
     event.preventDefault();
-    const done = await run(() => api('me/password', { method: 'POST', body: { current_password: current, new_password: next } }), 'Password changed. Other devices were signed out.');
+    const done = await run(() => api('me/password', { method: 'POST', body: { current_password: current, new_password: next } }), 'Password changed. Your other devices were signed out.');
     if (done) {
       current = '';
       next = '';
@@ -63,7 +64,7 @@
 
   async function finishTotp(event) {
     event.preventDefault();
-    const done = await run(() => api('me/totp/enable', { method: 'POST', body: { code } }), 'Two-factor authentication is on.');
+    const done = await run(() => api('me/totp/enable', { method: 'POST', body: { code } }), 'Two-factor sign-in is on.');
     if (done) {
       setup = null;
       code = '';
@@ -73,7 +74,7 @@
 
   async function disableTotp(event) {
     event.preventDefault();
-    const done = await run(() => api('me/totp/disable', { method: 'POST', body: { password: totpPassword } }), 'Two-factor authentication is off.');
+    const done = await run(() => api('me/totp/disable', { method: 'POST', body: { password: totpPassword } }), 'Two-factor sign-in is off.');
     if (done) {
       totpPassword = '';
       await onChange();
@@ -85,73 +86,78 @@
   });
 </script>
 
-<div class="page-head"><h1>{forced ? 'Choose a new password' : 'Your account'}</h1></div>
-{#if forced}<div class="notice warn">An administrator reset your password. Choose a new one to continue.</div>{/if}
-{#if error}<div class="notice error" role="alert">{error}</div>{/if}
-{#if message}<div class="notice" role="status">{message}</div>{/if}
+<h1>{forced ? 'Choose a new password' : 'My account'}</h1>
+{#if forced}<div class="warn">An administrator reset your password. Choose a new one to continue.</div>{/if}
+{#if error}<div class="err" role="alert">{error}</div>{/if}
+{#if message}<div class="msg" role="status">{message}</div>{/if}
 
-<div class="grid">
-  {#if !forced}
-    <form class="panel stack" onsubmit={saveProfile}>
-      <h2>Profile</h2>
-      <label>Name <input bind:value={name} required maxlength="120" autocomplete="name" /></label>
-      <label>Email <input type="email" bind:value={email} required autocomplete="email" /></label>
+{#if !forced}
+  <form onsubmit={saveProfile}>
+    <fieldset>
+      <legend>Profile</legend>
+      <label class="field"><span>Name</span><input bind:value={name} required maxlength="120" autocomplete="name" /></label>
+      <label class="field"><span>Email</span><input type="email" bind:value={email} required autocomplete="email" /></label>
       {#if emailChanged}
-        <label>Current password (to change email) <input type="password" bind:value={emailPassword} required autocomplete="current-password" /></label>
+        <label class="field"><span>Current password</span><input type="password" bind:value={emailPassword} required autocomplete="current-password" /></label>
       {/if}
-      <div><button class="primary">Save profile</button></div>
-    </form>
-  {/if}
-
-  <form class="panel stack" onsubmit={changePassword}>
-    <h2>Password</h2>
-    <label>{forced ? 'Temporary password' : 'Current password'} <input type="password" bind:value={current} required autocomplete="current-password" /></label>
-    <label>New password <input type="password" bind:value={next} required minlength="12" autocomplete="new-password" />
-      <span class="small">At least 12 characters.</span>
-    </label>
-    <div><button class="primary">Change password</button></div>
+      <div class="buttons form-buttons"><button class="main">Save</button></div>
+    </fieldset>
   </form>
+{/if}
 
-  {#if !forced}
-    <section class="panel stack">
-      <h2>Two-factor authentication</h2>
-      {#if user.totp_enabled}
-        <p class="small" style="margin:0"><span class="pill ok">On</span> You'll enter a code from your authenticator app at each sign-in.</p>
-        <form class="stack" onsubmit={disableTotp}>
-          <label>Password <input type="password" bind:value={totpPassword} required autocomplete="current-password" /></label>
-          <div><button class="danger">Turn off</button></div>
-        </form>
-      {:else if setup}
-        <p class="small" style="margin:0">Scan this with your authenticator app, or enter the key by hand, then type the code it shows.</p>
-        {#if qr}<img src={qr} alt="QR code for your authenticator app" width="200" height="200" />{/if}
-        <div class="secret small">{setup.secret}</div>
-        <form class="stack" onsubmit={finishTotp}>
-          <label>Code <input bind:value={code} required inputmode="numeric" maxlength="6" autocomplete="one-time-code" /></label>
-          <div><button class="primary">Turn on</button></div>
-        </form>
-      {:else}
-        <p class="small muted" style="margin:0">Adds a code from an authenticator app to your sign-in.</p>
-        <form class="stack" onsubmit={startTotp}>
-          <label>Password <input type="password" bind:value={totpPassword} required autocomplete="current-password" /></label>
-          <div><button>Set up</button></div>
-        </form>
-      {/if}
-    </section>
-  {/if}
-</div>
+<form onsubmit={changePassword}>
+  <fieldset>
+    <legend>Password</legend>
+    <label class="field"><span>{forced ? 'Temporary password' : 'Current password'}</span><input type="password" bind:value={current} required autocomplete="current-password" /></label>
+    <label class="field"><span>New password</span>
+      <input type="password" bind:value={next} required minlength="12" autocomplete="new-password" />
+      <span class="hint">12 characters or more.</span>
+    </label>
+    <div class="buttons form-buttons"><button class="main">Change password</button></div>
+  </fieldset>
+</form>
+
+{#if !forced}
+  <fieldset>
+    <legend>Two-factor sign-in</legend>
+    {#if user.totp_enabled}
+      <p><span class="st-ok">On.</span> You'll enter a code from your authenticator app each time you sign in.</p>
+      <form onsubmit={disableTotp}>
+        <label class="field"><span>Password</span><input type="password" bind:value={totpPassword} required autocomplete="current-password" /></label>
+        <div class="buttons form-buttons"><button class="bad">Turn off</button></div>
+      </form>
+    {:else if setup}
+      <p>Scan this in your authenticator app or type in the key, then enter the code it shows.</p>
+      {#if qr}<img src={qr} alt="QR code for your authenticator app" width="200" height="200" />{/if}
+      <div class="secret small">{setup.secret}</div>
+      <form onsubmit={finishTotp}>
+        <label class="field"><span>Code</span><input bind:value={code} required inputmode="numeric" maxlength="6" autocomplete="one-time-code" /></label>
+        <div class="buttons form-buttons"><button class="main">Turn on</button></div>
+      </form>
+    {:else}
+      <p>Off. Turning it on adds a code from an authenticator app to your sign-in.</p>
+      <form onsubmit={startTotp}>
+        <label class="field"><span>Password</span><input type="password" bind:value={totpPassword} required autocomplete="current-password" /></label>
+        <div class="buttons form-buttons"><button>Set up</button></div>
+      </form>
+    {/if}
+  </fieldset>
+{/if}
 
 {#if !forced && activity.length}
-  <section class="panel" style="margin-top:1rem">
-    <h2 style="margin-bottom:.5rem">Recent activity</h2>
-    <div class="table-wrap">
-      <table>
-        <thead><tr><th>When</th><th>Action</th><th>From</th></tr></thead>
-        <tbody>
-          {#each activity as row}
-            <tr><td>{formatTime(row.ts)}</td><td class="mono small">{row.action}</td><td class="mono small">{row.ip}</td></tr>
-          {/each}
-        </tbody>
-      </table>
-    </div>
-  </section>
+  <div class="box">
+    <h2>Recent activity</h2>
+    <table class="table">
+      <thead><tr><th>When</th><th>Action</th><th>From</th></tr></thead>
+      <tbody>
+        {#each activity.slice(0, 25) as row}
+          <tr>
+            <td data-label="When"><span class="small">{formatTime(row.ts)}</span></td>
+            <td data-label="Action"><span class="mono small">{row.action}</span></td>
+            <td data-label="From"><span class="mono small">{row.ip}</span></td>
+          </tr>
+        {/each}
+      </tbody>
+    </table>
+  </div>
 {/if}

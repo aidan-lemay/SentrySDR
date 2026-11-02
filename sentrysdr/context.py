@@ -38,6 +38,10 @@ SETTING_DEFAULTS = {
 SECRET_SETTINGS = {"rdio_api_key", "clearcut_api_key"}
 TRACK_EXPIRY_SECONDS = 60
 UPLOAD_MAX_ATTEMPTS = 12
+# ClearCut only lists recent calls, so there's no point looking for much longer.
+TRANSCRIPT_WINDOW_SECONDS = 86400
+TRANSCRIPT_POLL_SECONDS = 60
+TRANSCRIPT_MAX_LOOKUPS = 20
 NODE_OFFLINE_SECONDS = 45
 
 
@@ -80,6 +84,7 @@ class Context:
         self.loop: asyncio.AbstractEventLoop | None = None
         self.wake: asyncio.Event | None = None
         self.tasks: list[asyncio.Task] = []
+        self.http_transport = None  # replaced in tests so nothing reaches a real server
         self.audit_log = logging.getLogger("sentrysdr.audit")
 
     def _ensure_local_node(self) -> int:
@@ -229,6 +234,8 @@ class Context:
             if target is not None:
                 if target.clearcut_enabled and target.clearcut_id is not None:
                     session.add(UploadJob(recording_id=call_id, destination="clearcut"))
+                    recording.clearcut_system = target.clearcut_system
+                    recording.clearcut_talkgroup = target.clearcut_id
                 if target.rdio_enabled and target.rdio_system is not None and target.rdio_talkgroup is not None:
                     session.add(UploadJob(recording_id=call_id, destination="rdio"))
             session.commit()
@@ -256,7 +263,7 @@ class Context:
             status=lambda serial, data: self.set_status(node_id, serial, data),
             enumerate_fn=self.enumerate,
         )
-        for coroutine in (self._scheduler_loop, self._upload_loop, self._retention_loop):
+        for coroutine in (self._scheduler_loop, self._upload_loop, self._transcript_loop, self._retention_loop):
             self.tasks.append(asyncio.create_task(coroutine(), name=coroutine.__name__))
 
     async def stop(self) -> None:
@@ -333,6 +340,52 @@ class Context:
             log.warning("upload %s to %s failed: %s", job.recording_id, job.destination, job.last_error)
         else:
             job.status, job.last_error = "done", ""
+
+    async def _transcript_loop(self) -> None:
+        async with httpx.AsyncClient(timeout=uploaders.UPLOAD_TIMEOUT, follow_redirects=False) as client:
+            while True:
+                try:
+                    await self.sync_transcripts(client)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception("transcript pass failed")
+                await asyncio.sleep(TRANSCRIPT_POLL_SECONDS)
+
+    async def sync_transcripts(self, client: httpx.AsyncClient) -> int:
+        """Copy finished transcripts from ClearCut. One request per talkgroup with calls waiting."""
+        server = self.get_setting("clearcut_server")
+        if not server:
+            return 0
+        found = 0
+        with self.db() as session:
+            waiting = list(session.scalars(
+                select(Recording).join(UploadJob, UploadJob.recording_id == Recording.id).where(
+                    UploadJob.destination == "clearcut", UploadJob.status == "done",
+                    Recording.transcript.is_(None), Recording.clearcut_system.is_not(None),
+                    Recording.started_at >= time.time() - TRANSCRIPT_WINDOW_SECONDS,
+                )
+            ))
+            groups: dict[tuple[str, int], list[Recording]] = {}
+            for recording in waiting:
+                groups.setdefault((recording.clearcut_system, recording.clearcut_talkgroup), []).append(recording)
+            for (system, talkgroup), recordings in list(groups.items())[:TRANSCRIPT_MAX_LOOKUPS]:
+                try:
+                    calls = await uploaders.clearcut_calls(client, server, system, talkgroup)
+                except (uploaders.UploadError, httpx.HTTPError) as exc:
+                    log.warning("transcript lookup for %s/%s failed: %s", system, talkgroup, exc)
+                    continue
+                for recording in recordings:
+                    call = uploaders.match_call(calls, recording.started_at)
+                    if call is None:
+                        continue
+                    recording.clearcut_call_id = str(call.get("id") or "")[:64] or recording.clearcut_call_id
+                    text = uploaders.transcript_text(call)
+                    if text:
+                        recording.transcript = text
+                        found += 1
+                session.commit()
+        return found
 
     async def _retention_loop(self) -> None:
         while True:

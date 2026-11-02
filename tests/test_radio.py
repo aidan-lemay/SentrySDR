@@ -404,3 +404,187 @@ def test_tracks_merge_across_receivers_and_expire(ctx):
     assert tracks["abc"]["flight"] == "NEW" and "def" in tracks
     ctx.tracks["adsb"]["2:B"]["at"] = 0
     assert [a["flight"] for a in ctx.current_tracks("adsb")] == ["OLD"]
+
+
+# --- ClearCut transcripts --------------------------------------------------
+CC_TARGET = dict(clearcut_enabled=True, clearcut_system="us-ny-test", clearcut_id=1077)
+
+
+def uploaded_call(ctx, tmp_path, admin, started=None):
+    admin.patch("/api/admin/settings", json={"clearcut_server": "https://cc.example.com", "clearcut_api_key": "k"})
+    target = next((t["id"] for t in admin.get("/api/targets").json() if t["name"] == "CC"), None) or make_target(admin, "CC", **CC_TARGET)
+    call = store(ctx, tmp_path, target_id=target, started=started)
+    with ctx.db() as session:
+        session.query(UploadJob).filter_by(recording_id=call).one().status = "done"
+        session.commit()
+    return call
+
+
+def cc_handler(calls, seen, transcribed=None):
+    def handler(request):
+        seen.append((request.method, request.url.path, dict(request.url.params)))
+        if request.url.path == "/api/v1/calls/transcribe":
+            return httpx.Response(200, json=transcribed or {})
+        return httpx.Response(200, json=calls)
+    return handler
+
+
+def started_of(ctx, call):
+    with ctx.db() as session:
+        return session.get(Recording, call).started_at
+
+
+def row_of(ctx, call):
+    with ctx.db() as session:
+        return session.get(Recording, call)
+
+
+async def run_sync(ctx, handler):
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        return await ctx.sync_transcripts(client)
+
+
+def remote_call(started, text=None, id="7523045465739231232"):
+    transcript = {"text": text, "parts": [], "callId": id, "audioFile": "a.m4a"} if text is not None else None
+    return {"id": id, "startTime": int(started), "endTime": int(started) + 3, "talkgroup": 1077, "transcript": transcript}
+
+
+async def test_transcript_copied_from_clearcut(ctx, tmp_path, admin):
+    call = uploaded_call(ctx, tmp_path, admin)
+    seen = []
+    assert await run_sync(ctx, cc_handler([remote_call(started_of(ctx, call), "Engine 5 responding")], seen)) == 1
+    assert seen == [("GET", "/api/v1/calls", {"system": "us-ny-test", "talkgroup": "1077"})]
+    assert row_of(ctx, call).transcript == "Engine 5 responding"
+    assert admin.get("/api/recordings", params={"search": "Engine 5"}).json()["total"] == 1
+    # Done with this call: no further requests to ClearCut.
+    seen.clear()
+    await run_sync(ctx, cc_handler([], seen))
+    assert seen == []
+
+
+async def test_other_calls_are_not_matched(ctx, tmp_path, admin):
+    call = uploaded_call(ctx, tmp_path, admin)
+    assert await run_sync(ctx, cc_handler([remote_call(started_of(ctx, call) + 60, "someone else")], [])) == 0
+    assert row_of(ctx, call).transcript is None
+
+
+async def test_call_id_kept_while_transcript_is_pending(ctx, tmp_path, admin):
+    call = uploaded_call(ctx, tmp_path, admin)
+    assert await run_sync(ctx, cc_handler([remote_call(started_of(ctx, call))], [])) == 0
+    assert row_of(ctx, call).clearcut_call_id == "7523045465739231232"
+
+
+async def test_one_request_per_talkgroup(ctx, tmp_path, admin):
+    uploaded_call(ctx, tmp_path, admin)
+    uploaded_call(ctx, tmp_path, admin)
+    seen = []
+    await run_sync(ctx, cc_handler([], seen))
+    assert len(seen) == 1
+
+
+async def test_old_calls_and_unconfigured_server_make_no_requests(ctx, tmp_path, admin):
+    uploaded_call(ctx, tmp_path, admin, started=time.time() - 3 * 86400)
+    seen = []
+    await run_sync(ctx, cc_handler([], seen))
+    assert seen == []
+    admin.patch("/api/admin/settings", json={"clearcut_server": ""})
+    uploaded = uploaded_call(ctx, tmp_path, admin)
+    admin.patch("/api/admin/settings", json={"clearcut_server": ""})
+    await run_sync(ctx, cc_handler([], seen))
+    assert uploaded and seen == []
+
+
+async def test_call_not_yet_uploaded_is_not_looked_up(ctx, tmp_path, admin):
+    call = uploaded_call(ctx, tmp_path, admin)
+    with ctx.db() as session:
+        session.query(UploadJob).filter_by(recording_id=call).one().status = "pending"
+        session.commit()
+    seen = []
+    await run_sync(ctx, cc_handler([], seen))
+    assert seen == []
+
+
+@pytest.mark.parametrize("body", [{"not": "a list"}, ["text"], [{"startTime": "x"}]])
+async def test_odd_clearcut_replies_are_harmless(ctx, tmp_path, admin, body):
+    call = uploaded_call(ctx, tmp_path, admin)
+    await run_sync(ctx, lambda request: httpx.Response(200, json=body))
+    assert row_of(ctx, call).transcript is None
+
+
+async def test_clearcut_outage_is_harmless(ctx, tmp_path, admin):
+    call = uploaded_call(ctx, tmp_path, admin)
+    await run_sync(ctx, lambda request: httpx.Response(500))
+    await run_sync(ctx, lambda request: httpx.Response(200, text="<html>"))
+    assert row_of(ctx, call).transcript is None
+
+
+def test_transcript_text_is_capped_and_blank_is_none():
+    assert uploaders.transcript_text({"transcript": {"text": "x" * 99999}}) == "x" * uploaders.MAX_TRANSCRIPT_CHARS
+    assert uploaders.transcript_text({"transcript": {"text": "   "}}) is None
+    assert uploaders.transcript_text({"transcript": None}) is None
+    assert uploaders.transcript_text({"transcript": {"text": 5}}) is None
+
+
+def test_request_transcript_looks_up_call_then_posts_id(ctx, tmp_path, admin):
+    call = uploaded_call(ctx, tmp_path, admin)
+    remote = remote_call(started_of(ctx, call))
+    seen = []
+    ctx.http_transport = httpx.MockTransport(cc_handler([remote], seen, {**remote, "transcript": {"text": "Copy that"}}))
+    response = admin.post(f"/api/recordings/{call}/transcribe")
+    assert response.status_code == 200, response.text
+    assert response.json()["transcript"] == "Copy that"
+    assert seen[-1] == ("POST", "/api/v1/calls/transcribe", {"id": remote["id"]})
+
+
+def test_request_transcript_refused_when_clearcut_not_listing_it_yet(ctx, tmp_path, admin):
+    call = uploaded_call(ctx, tmp_path, admin)
+    seen = []
+    ctx.http_transport = httpx.MockTransport(cc_handler([], seen))
+    assert admin.post(f"/api/recordings/{call}/transcribe").status_code == 409
+    assert all(method == "GET" for method, _, _ in seen)
+
+
+def test_request_transcript_needs_permission_and_an_upload(ctx, tmp_path, admin, listener):
+    call = uploaded_call(ctx, tmp_path, admin)
+    assert listener.post(f"/api/recordings/{call}/transcribe").status_code == 403
+    assert admin.post(f"/api/recordings/{store(ctx, tmp_path)}/transcribe").status_code == 409
+
+
+def test_existing_transcript_makes_no_request(ctx, tmp_path, admin):
+    call = uploaded_call(ctx, tmp_path, admin)
+    with ctx.db() as session:
+        session.get(Recording, call).transcript = "already here"
+        session.commit()
+    seen = []
+    ctx.http_transport = httpx.MockTransport(cc_handler([], seen))
+    assert admin.post(f"/api/recordings/{call}/transcribe").json()["transcript"] == "already here"
+    assert seen == []
+
+
+def test_transcribe_requests_rate_limited(ctx, tmp_path, admin):
+    call = uploaded_call(ctx, tmp_path, admin)
+    ctx.http_transport = httpx.MockTransport(cc_handler([], []))
+    codes = [admin.post(f"/api/recordings/{call}/transcribe").status_code for _ in range(31)]
+    assert codes[:30] == [409] * 30 and codes[30] == 429
+
+
+def test_clearcut_target_needs_system_and_talkgroup(admin):
+    body = {"name": "x", "frequency_hz": 444_000_000, "clearcut_enabled": True}
+    assert admin.post("/api/targets", json={**body, "clearcut_id": 5}).status_code == 422
+    assert admin.post("/api/targets", json={**body, "clearcut_system": "a", "clearcut_id": 5}).status_code == 201
+    assert admin.post("/api/targets", json={**body, "clearcut_system": "../x", "clearcut_id": 5}).status_code == 422
+
+
+def test_upgrade_adds_new_columns_to_an_old_database(tmp_path):
+    import sqlite3
+    from sentrysdr.models import make_session_factory
+    path = tmp_path / "old.db"
+    connection = sqlite3.connect(path)
+    connection.execute("CREATE TABLE targets (id INTEGER PRIMARY KEY, name VARCHAR(120))")
+    connection.execute("INSERT INTO targets (id, name) VALUES (1, 'kept')")
+    connection.commit()
+    connection.close()
+    make_session_factory(path)
+    connection = sqlite3.connect(path)
+    assert connection.execute("SELECT name, clearcut_system FROM targets").fetchall() == [("kept", None)]
+    connection.close()

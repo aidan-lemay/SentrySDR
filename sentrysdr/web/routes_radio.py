@@ -173,6 +173,7 @@ class TargetBody(BaseModel):
     modulation: str = "nfm"
     squelch: int = Field(default=50, ge=0, le=100000)
     clearcut_enabled: bool = False
+    clearcut_system: str | None = Field(default=None, max_length=64, pattern=r"^[A-Za-z0-9_.-]+$")
     clearcut_id: int | None = None
     rdio_enabled: bool = False
     rdio_system: int | None = None
@@ -183,8 +184,8 @@ def _validate_target(body: TargetBody) -> None:
     allowed = {"audio": pipelines.ANALOG | set(pipelines.DIGITAL), "adsb": {"adsb"}, "ais": {"ais"}}
     if body.modulation not in allowed.get(body.kind, set()):
         raise HTTPException(422, f"Modulation {body.modulation} doesn't fit a {body.kind} target")
-    if body.clearcut_enabled and body.clearcut_id is None:
-        raise HTTPException(422, "ClearCut upload needs a ClearCut ID")
+    if body.clearcut_enabled and (body.clearcut_id is None or not body.clearcut_system):
+        raise HTTPException(422, "ClearCut upload needs a system ID and a talkgroup")
     if body.rdio_enabled and (body.rdio_system is None or body.rdio_talkgroup is None):
         raise HTTPException(422, "RDIO upload needs a system and a talkgroup")
 

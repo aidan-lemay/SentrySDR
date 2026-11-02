@@ -5,15 +5,21 @@ stores copies of those names, so past pairings stay searchable after deletion.
 """
 from __future__ import annotations
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy import func, or_, select
 
+from .. import uploaders
 from ..models import Recording, UploadJob, User
 from .deps import ctx_of, current_user, get_db, ip_of, require
 
 router = APIRouter(prefix="/api/recordings")
+
+# Each request can cost ClearCut's owner real transcription time.
+TRANSCRIBE_LIMIT = 30
+TRANSCRIBE_WINDOW = 3600
 
 
 def _view(recording: Recording, uploads: list[UploadJob] | None = None) -> dict:
@@ -26,6 +32,7 @@ def _view(recording: Recording, uploads: list[UploadJob] | None = None) -> dict:
         "ended_at": recording.ended_at, "duration": recording.duration,
         "size_bytes": recording.size_bytes, "protected": recording.protected,
         "transcript": recording.transcript,
+        "clearcut_system": recording.clearcut_system,
         "uploads": [{"destination": u.destination, "status": u.status} for u in uploads or []],
     }
 
@@ -104,6 +111,42 @@ def protect(recording_id: str, body: ProtectBody, request: Request, user: User =
     recording.protected = body.protected
     db.commit()
     ctx_of(request).audit("recording.protect", user=user, ip=ip_of(request), target=recording.id, details={"protected": body.protected})
+    return _view(recording)
+
+
+@router.post("/{recording_id}/transcribe")
+async def transcribe(recording_id: str, request: Request, user: User = Depends(require("transcribe")), db=Depends(get_db)):
+    """Ask ClearCut to transcribe a call that was uploaded to it."""
+    ctx = ctx_of(request)
+    recording = _get(db, recording_id)
+    if recording.transcript:
+        return _view(recording)
+    uploaded = db.scalar(select(UploadJob).where(
+        UploadJob.recording_id == recording.id, UploadJob.destination == "clearcut", UploadJob.status == "done",
+    ))
+    server = ctx.get_setting("clearcut_server")
+    if not uploaded or not server or not recording.clearcut_system:
+        raise HTTPException(409, "This call hasn't been uploaded to ClearCut")
+    key = f"transcribe:{user.id}"
+    if ctx.limiter.blocked(key, TRANSCRIBE_LIMIT, TRANSCRIBE_WINDOW):
+        raise HTTPException(429, "Too many transcript requests. Try again later.")
+    ctx.limiter.hit(key, TRANSCRIBE_WINDOW)
+    try:
+        async with httpx.AsyncClient(transport=ctx.http_transport, follow_redirects=False) as client:
+            call_id = recording.clearcut_call_id
+            if not call_id:
+                calls = await uploaders.clearcut_calls(client, server, recording.clearcut_system, recording.clearcut_talkgroup)
+                match = uploaders.match_call(calls, recording.started_at)
+                if match is None or not match.get("id"):
+                    raise HTTPException(409, "ClearCut isn't listing this call yet. Try again shortly.")
+                call_id = str(match["id"])[:64]
+                recording.clearcut_call_id = call_id
+            call = await uploaders.clearcut_transcribe(client, server, call_id)
+    except (uploaders.UploadError, httpx.HTTPError) as exc:
+        raise HTTPException(502, "ClearCut couldn't transcribe this call right now") from exc
+    recording.transcript = uploaders.transcript_text(call)
+    db.commit()
+    ctx.audit("recording.transcribe_requested", user=user, ip=ip_of(request), target=recording.id)
     return _view(recording)
 
 

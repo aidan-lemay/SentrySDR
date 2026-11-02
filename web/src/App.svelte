@@ -12,6 +12,7 @@
 
   let user = $state(null);
   let loading = $state(true);
+  let menuOpen = $state(false);
   let route = $state(location.hash.slice(2) || 'sources');
 
   const view = $derived(route.split('?')[0]);
@@ -23,7 +24,7 @@
     { id: 'targets', label: 'Targets', show: can('manage_targets') },
     { id: 'maps', label: 'Maps', show: can('maps') },
     { id: 'admin', label: 'Admin', show: user?.role === 'admin' },
-    { id: 'account', label: 'Account' },
+    { id: 'account', label: 'My account' },
   ].filter((link) => link.show !== false));
 
   async function refreshUser() {
@@ -37,11 +38,16 @@
   async function signOut() {
     await api('auth/logout', { method: 'POST' }).catch(() => {});
     user = null;
+    menuOpen = false;
   }
 
   onMount(() => {
     setSignedOutHandler(() => { user = null; });
-    const onHash = () => { route = location.hash.slice(2) || 'sources'; };
+    const onHash = () => {
+      route = location.hash.slice(2) || 'sources';
+      menuOpen = false;
+      scrollTo(0, 0);
+    };
     addEventListener('hashchange', onHash);
     refreshUser().finally(() => { loading = false; });
     return () => removeEventListener('hashchange', onHash);
@@ -49,21 +55,31 @@
 </script>
 
 {#if loading}
-  <div class="empty">Loading…</div>
+  <p class="pad">Loading...</p>
 {:else if !user}
   <Auth onSignedIn={refreshUser} />
 {:else}
-  <header class="topbar">
-    <span class="brand">SentrySDR</span>
-    <nav aria-label="Main">
+  <header class="site">
+    <div class="site-top">
+      <span class="site-name">SentrySDR</span>
       {#if !user.must_change_password}
-        {#each links as link (link.id)}
-          <a href={`#/${link.id}`} class:active={view === link.id} aria-current={view === link.id ? 'page' : undefined}>{link.label}</a>
-        {/each}
+        <button class="menu-button" aria-expanded={menuOpen} onclick={() => (menuOpen = !menuOpen)}>{menuOpen ? 'Close' : 'Menu'}</button>
+      {:else}
+        <button onclick={signOut}>Sign out</button>
       {/if}
-    </nav>
-    <span class="muted small">{user.name}</span>
-    <button onclick={signOut}>Sign out</button>
+    </div>
+    {#if !user.must_change_password}
+      <nav class:open={menuOpen} aria-label="Main">
+        {#each links as link (link.id)}
+          <a href={`#/${link.id}`} aria-current={view === link.id ? 'page' : undefined}>{link.label}</a>
+        {/each}
+        <button class="nav-out" onclick={signOut}>Sign out ({user.name})</button>
+      </nav>
+      <div class="who small">
+        <span>{user.name}</span>
+        <button onclick={signOut}>Sign out</button>
+      </div>
+    {/if}
   </header>
   <main>
     {#if user.must_change_password}
