@@ -51,12 +51,18 @@ async def stop_process(proc: asyncio.subprocess.Process | None, timeout: float =
 
 
 async def _log_stderr(serial: str, stream, tail: list[str]) -> None:
-    while line := await stream.readline():
-        text = line.decode(errors="replace").strip()
-        if text:
-            tail.append(text)
-            del tail[:-5]
-            log.debug("[%s] %s", serial, text)
+    # Reads chunks, not lines: readline fails on a very long line, and if this stops
+    # draining the pipe fills and the tool hangs.
+    pending = b""
+    while chunk := await stream.read(4096):
+        lines = (pending + chunk).split(b"\n")
+        pending = lines.pop()[-4096:]
+        for line in lines:
+            text = line.decode(errors="replace").strip()[:500]
+            if text:
+                tail.append(text)
+                del tail[:-5]
+                log.debug("[%s] %s", serial, text)
 
 
 class PcmFramer:

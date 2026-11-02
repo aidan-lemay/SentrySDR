@@ -89,6 +89,16 @@ async def test_each_transmission_becomes_one_mp3_call(tmp_path):
     assert list((cfg.recordings_dir / ".tmp").glob("*.raw")) == []
 
 
+async def test_huge_stderr_line_does_not_hang_the_tool(tmp_path):
+    bins = tmp_path / "bin"
+    install_tool(bins, "rtl_fm", "#!/usr/bin/env python3\nimport sys,time\nsys.stderr.write('x'*300000);sys.stderr.flush()\nfor i in range(10):\n  sys.stderr.write('y'*100000);sys.stdout.buffer.write(b'A'*3200);sys.stdout.flush();time.sleep(0.02)\ntime.sleep(60)\n")
+    calls = []
+    sup = supervisor(make_config(tmp_path, bin_dirs=[bins]), calls)
+    await sup.apply({"SER1": spec()})
+    assert await wait_for(lambda: len(calls) == 1)
+    await sup.shutdown()
+
+
 async def test_call_shorter_than_minimum_discarded(tmp_path):
     bins = tmp_path / "bin"
     install_tool(bins, "rtl_fm", "#!/usr/bin/env python3\nimport sys,time\nsys.stdout.buffer.write(b'\\0\\0'*100);sys.stdout.flush();time.sleep(60)\n")

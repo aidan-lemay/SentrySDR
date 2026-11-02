@@ -54,7 +54,7 @@ To add a slave, go to **Admin > Nodes** on the master to create a one-time token
 | `rtl_fm` (NFM, AM, WFM) | Run on a real RTL-SDR, including recording and live audio |
 | `readsb`, tar1090 | Run on a real RTL-SDR with real aircraft |
 | `AIS-catcher` | Run on a real RTL-SDR, and its output checked with a known message; no live ship received yet |
-| `dsd-fme` | Runs in the pipeline on a real RTL-SDR, and stays silent on noise; decoding a real digital signal is not yet tested |
+| `dsd-fme` | DMR tested on air: a real simplex transmission recorded and played back clearly, with correct speed and call splitting, and live audio in step. P25, NXDN, D-STAR and YSF use the same pipeline but haven't been tested on air |
 
 ## Tuning call detection
 
