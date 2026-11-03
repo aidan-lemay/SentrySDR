@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import getpass
+import logging
 import os
 import sys
 from pathlib import Path
@@ -27,6 +28,11 @@ def cmd_run(cfg) -> int:
     from .context import Context
     from .web import create_app
     app = create_app(Context(cfg))
+    if cfg.local_access:
+        logging.getLogger("sentrysdr").warning(
+            "local_access is on: plain http on %s:%s is unencrypted, including passwords. "
+            "Don't forward this port from the internet.", cfg.bind_host, cfg.bind_port,
+        )
     root = Path(__file__).resolve().parent.parent
     for candidate in (os.environ.get("SENTRYSDR_TAR1090"), root / ".vendor/share/tar1090", cfg.data_dir / "tar1090"):
         if candidate and Path(candidate).is_dir():

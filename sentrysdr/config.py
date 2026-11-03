@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 SERIAL_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
+TAILSCALE_NETWORK = ipaddress.ip_network("100.64.0.0/10")
 
 
 class ConfigError(ValueError):
@@ -31,6 +32,7 @@ class Config:
     public_url: str = "http://localhost:8642"
     extra_origins: list[str] = field(default_factory=list)
     allow_public_bind: bool = False
+    local_access: bool = False
     timezone: str = "UTC"
     trusted_proxies: list[str] = field(default_factory=list)
     client_ip_header: str = ""
@@ -68,6 +70,12 @@ class Config:
         return hosts
 
     @property
+    def plain_http_hosts(self) -> set[str]:
+        """Names configured for plain http, such as http://minipc.lan:8642."""
+        urls = [urlsplit(u) for u in [self.public_url, *self.extra_origins]]
+        return {u.hostname for u in urls if u.scheme == "http" and u.hostname}
+
+    @property
     def trusted_networks(self) -> list:
         return [ipaddress.ip_network(c, strict=False) for c in self.trusted_proxies]
 
@@ -101,6 +109,26 @@ def _is_loopback_host(host: str) -> bool:
         return False
 
 
+def is_local_ip(value: str | None) -> bool:
+    """True for loopback, private, link-local and Tailscale addresses. Names are not IPs."""
+    try:
+        addr = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    addr = getattr(addr, "ipv4_mapped", None) or addr
+    return addr.is_loopback or addr.is_private or addr.is_link_local or addr in TAILSCALE_NETWORK
+
+
+def _lan_bindable(host: str) -> bool:
+    """A wildcard is allowed because local_access refuses public peers per request."""
+    try:
+        if ipaddress.ip_address(host).is_unspecified:
+            return True
+    except ValueError:
+        return False
+    return is_local_ip(host)
+
+
 def load_config(path: str | Path) -> Config:
     path = Path(path)
     try:
@@ -127,6 +155,7 @@ def load_config(path: str | Path) -> Config:
         public_url=server.get("public_url", "http://localhost:8642"),
         extra_origins=list(server.get("extra_origins", [])),
         allow_public_bind=bool(server.get("allow_public_bind", False)),
+        local_access=bool(server.get("local_access", False)),
         timezone=server.get("timezone", "UTC"),
         trusted_proxies=list(proxy.get("trusted_proxies", [])),
         client_ip_header=proxy.get("client_ip_header", ""),
@@ -174,12 +203,23 @@ def validate(cfg: Config) -> None:
     if parts.scheme not in ("http", "https") or not parts.hostname:
         raise ConfigError("server.public_url must be an http(s) URL")
     if parts.scheme == "http" and not _is_loopback_host(parts.hostname):
-        raise ConfigError("server.public_url must use https unless it is a loopback address")
+        if not (cfg.local_access and _private_transport(parts.hostname)):
+            raise ConfigError(
+                "server.public_url must use https unless it is a loopback address, "
+                "or a private address with server.local_access = true"
+            )
     if not _is_loopback_host(cfg.bind_host) and not cfg.allow_public_bind:
-        raise ConfigError(
-            "server.bind_host is not loopback. Serve through a reverse proxy or tunnel, "
-            "or set server.allow_public_bind = true if you really mean to expose it"
-        )
+        if not cfg.local_access:
+            raise ConfigError(
+                "server.bind_host is not loopback. Serve through a reverse proxy or tunnel, "
+                "set server.local_access = true for local network access, "
+                "or set server.allow_public_bind = true if you really mean to expose it"
+            )
+        if not _lan_bindable(cfg.bind_host):
+            raise ConfigError(
+                "server.bind_host must be 0.0.0.0, ::, or a private address with server.local_access; "
+                "set server.allow_public_bind = true if you really mean to expose it"
+            )
     if cfg.client_ip_header and not cfg.trusted_proxies:
         raise ConfigError("proxy.client_ip_header requires proxy.trusted_proxies")
     try:
@@ -190,10 +230,4 @@ def validate(cfg: Config) -> None:
 
 def _private_transport(host: str) -> bool:
     """True for loopback, RFC1918 and Tailscale (100.64/10, *.ts.net) hosts."""
-    if host == "localhost" or host.endswith(".ts.net"):
-        return True
-    try:
-        addr = ipaddress.ip_address(host)
-    except ValueError:
-        return False
-    return addr.is_loopback or addr.is_private or addr in ipaddress.ip_network("100.64.0.0/10")
+    return host == "localhost" or host.endswith(".ts.net") or is_local_ip(host)

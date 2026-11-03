@@ -4,10 +4,11 @@ from __future__ import annotations
 import pyotp
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 
 from sentrysdr.config import Config, ConfigError, validate
 from sentrysdr.context import Context
-from sentrysdr.models import User
+from sentrysdr.models import AuditLog, User
 from sentrysdr.security import client_ip
 from sentrysdr.web import create_app
 
@@ -353,3 +354,170 @@ def test_api_keys_are_write_only_and_encrypted(ctx, admin):
 
 def test_non_http_upload_url_refused(admin):
     assert admin.patch("/api/admin/settings", json={"rdio_server": "file:///etc/passwd"}).status_code == 422
+
+
+# --- direct access by local IP, and a proxy on another machine ---------------
+LAN_IP = "192.168.1.20"
+NGINX_IP = "192.168.1.10"
+PUBLIC_PEER = "8.8.8.8"  # the documentation ranges count as private, so use a real public address
+
+
+def local_app(tmp_path, **overrides):
+    values = dict(
+        bind_host="0.0.0.0", local_access=True, trusted_proxies=[f"{NGINX_IP}/32"],
+        client_ip_header="CF-Connecting-IP",
+    )
+    ctx = Context(make_config(tmp_path, **{**values, **overrides}), enumerate_fn=lambda: [])
+    add_user(ctx, ADMIN_EMAIL, role="admin")
+    return ctx, create_app(ctx, run_background=False)
+
+
+def direct_client(app, peer="192.168.1.50", host=LAN_IP, port=8642):
+    return TestClient(app, base_url=f"http://{host}:{port}", client=(peer, 40000),
+                      headers={"Origin": f"http://{host}:{port}"})
+
+
+def login(client):
+    return client.post("/api/auth/login", json={"email": ADMIN_EMAIL, "password": PASSWORD})
+
+
+def test_local_access_off_by_default_keeps_everything_refused(tmp_path):
+    ctx = Context(make_config(tmp_path), enumerate_fn=lambda: [])
+    app = create_app(ctx, run_background=False)
+    assert direct_client(app).get("/api/health").status_code == 400
+    with pytest.raises(ConfigError, match="not loopback"):
+        validate(Config(bind_host="192.168.1.20"))
+    with pytest.raises(ConfigError, match="https"):
+        validate(Config(public_url=f"http://{LAN_IP}:8642"))
+
+
+@pytest.mark.parametrize("bind", ["0.0.0.0", "::", "192.168.1.20", "100.66.199.106", "fd00::1"])
+def test_local_access_allows_private_or_wildcard_bind(bind):
+    validate(Config(bind_host=bind, local_access=True))
+
+
+@pytest.mark.parametrize("bind", ["8.8.8.8", "2001:4860:4860::8888", "server.example.com"])
+def test_local_access_refuses_public_bind(bind):
+    with pytest.raises(ConfigError, match="private address"):
+        validate(Config(bind_host=bind, local_access=True))
+
+
+def test_local_access_allows_http_url_only_on_private_addresses():
+    validate(Config(local_access=True, public_url=f"http://{LAN_IP}:8642"))
+    with pytest.raises(ConfigError, match="https"):
+        validate(Config(local_access=True, public_url="http://sentry.example.com"))
+    with pytest.raises(ConfigError, match="https"):
+        validate(Config(local_access=True, public_url="http://8.8.8.8:8642"))
+
+
+@pytest.mark.parametrize("peer", ["192.168.1.50", "10.0.0.5", "172.16.0.9", "100.66.199.106", "127.0.0.1", "::ffff:192.168.1.50"])
+def test_local_peers_can_connect(tmp_path, peer):
+    _, app = local_app(tmp_path)
+    assert direct_client(app, peer=peer).get("/api/health").status_code == 200
+
+
+@pytest.mark.parametrize("peer", [PUBLIC_PEER, "2001:4860:4860::8888", "::ffff:8.8.8.8", "not-an-ip"])
+def test_public_peers_refused_even_with_a_valid_host(tmp_path, peer):
+    _, app = local_app(tmp_path)
+    assert direct_client(app, peer=peer).get("/api/health").status_code == 403
+    assert TestClient(app, base_url="https://sentry.example.com", client=(peer, 1)).get("/api/health").status_code == 403
+
+
+def test_local_access_only_opens_literal_private_hosts(tmp_path):
+    _, app = local_app(tmp_path)
+    for host in ("evil.example.net", "8.8.8.8"):
+        assert direct_client(app, host=host).get("/api/health").status_code == 400
+    assert direct_client(app, host="100.66.199.106").get("/api/health").status_code == 200
+
+
+@pytest.mark.parametrize("value", ["[bad", "http://[bad", "a b"])
+def test_malformed_host_is_refused_not_an_error(tmp_path, value):
+    _, app = local_app(tmp_path)
+    client = TestClient(app, base_url=f"http://{LAN_IP}:8642", client=("192.168.1.50", 1))
+    assert client.get("/api/health", headers={"Host": value}).status_code == 400
+
+
+def test_direct_sign_in_stays_signed_in_over_plain_http(tmp_path):
+    _, app = local_app(tmp_path)
+    client = direct_client(app)
+    response = login(client)
+    assert response.status_code == 200
+    cookie = response.headers["set-cookie"].lower()
+    assert "secure" not in cookie and "httponly" in cookie and "samesite=strict" in cookie
+    assert client.get("/api/me").status_code == 200
+    assert "strict-transport-security" not in client.get("/api/health").headers
+
+
+def test_direct_sign_in_uses_root_cookie_when_public_url_has_a_sub_path(tmp_path):
+    _, app = local_app(tmp_path, public_url="https://sentry.example.com/sdr")
+    assert "path=/;" in login(direct_client(app)).headers["set-cookie"].lower()
+
+
+def test_configured_lan_name_gets_a_usable_cookie(tmp_path):
+    _, app = local_app(tmp_path, extra_origins=["http://minipc.lan:8642"])
+    assert "secure" not in login(direct_client(app, host="minipc.lan")).headers["set-cookie"].lower()
+
+
+def test_unconfigured_lan_name_refused(tmp_path):
+    _, app = local_app(tmp_path)
+    assert direct_client(app, host="minipc.lan").get("/api/health").status_code == 400
+
+
+def test_cross_origin_post_refused_on_local_address(tmp_path):
+    _, app = local_app(tmp_path)
+    client = direct_client(app)
+    for origin in ("https://evil.example.net", "http://192.168.1.99:8642", "null", "http://[bad"):
+        assert client.post("/api/auth/logout", headers={"Origin": origin}).status_code == 403
+
+
+def test_local_address_grants_nothing_without_sign_in(tmp_path):
+    _, app = local_app(tmp_path)
+    client = direct_client(app, peer="127.0.0.1", host="127.0.0.1")
+    for path in ("/api/me", "/api/sources", "/api/admin/audit"):
+        assert client.get(path).status_code == 401
+
+
+def proxied_client(app, peer=NGINX_IP, visitor="1.1.1.1"):
+    """What the master sees from cloudflared and then nginx."""
+    return TestClient(app, base_url="https://sentry.example.com", client=(peer, 40000), headers={
+        "Origin": "https://sentry.example.com", "CF-Connecting-IP": visitor,
+        "Connection": "upgrade",
+    })
+
+
+def test_nginx_on_another_machine_gets_secure_cookie_and_real_client(tmp_path):
+    ctx, app = local_app(tmp_path)
+    client = proxied_client(app)
+    response = login(client)
+    assert response.status_code == 200
+    assert "secure" in response.headers["set-cookie"].lower()
+    assert client.get("/api/me").status_code == 200
+    assert "strict-transport-security" in client.get("/api/health").headers
+    with ctx.db() as session:
+        entry = session.scalars(select(AuditLog).where(AuditLog.action == "login.success")).first()
+    assert entry.ip == "1.1.1.1"
+
+
+def test_nginx_with_only_a_host_header_still_gets_a_secure_cookie(tmp_path):
+    _, app = local_app(tmp_path)
+    client = TestClient(app, base_url="https://sentry.example.com", client=(NGINX_IP, 1),
+                        headers={"Origin": "https://sentry.example.com"})
+    assert "secure" in login(client).headers["set-cookie"].lower()
+
+
+def test_lan_device_cannot_claim_a_client_address(tmp_path):
+    assert client_ip(make_config(tmp_path, trusted_proxies=[f"{NGINX_IP}/32"], client_ip_header="CF-Connecting-IP"),
+                     "192.168.1.50", {"CF-Connecting-IP": "1.1.1.1"}) == "192.168.1.50"
+
+
+def test_trusted_proxy_on_a_public_address_is_allowed(tmp_path):
+    _, app = local_app(tmp_path, trusted_proxies=[f"{PUBLIC_PEER}/32"])
+    assert proxied_client(app, peer=PUBLIC_PEER).get("/api/health").status_code == 200
+
+
+def test_proxy_that_sets_forwarded_proto_counts_as_a_proxy(tmp_path):
+    _, app = local_app(tmp_path)
+    client = direct_client(app)
+    response = client.post("/api/auth/login", json={"email": ADMIN_EMAIL, "password": PASSWORD},
+                           headers={"X-Forwarded-Proto": "https"})
+    assert "secure" in response.headers["set-cookie"].lower()

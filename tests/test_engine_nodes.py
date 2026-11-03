@@ -10,10 +10,12 @@ import time
 import uuid
 from array import array
 
+import httpx
 import pytest
 import uvicorn
 
 from sentrysdr import pipelines
+from sentrysdr.config import Config
 from sentrysdr.context import Context
 from sentrysdr.engine import PcmFramer, Supervisor
 from sentrysdr.live import LiveHub, silence_needed
@@ -466,3 +468,50 @@ def test_slave_spool_limit_drops_oldest(tmp_path):
     os.utime(old, (1, 1))
     slave._enforce_spool_limit()
     assert not old.exists() and (slave.spool / "2.mp3").exists()
+
+
+# --- a proxy's size limit must never destroy a recording ---------------------
+def spooled_slave(tmp_path, names):
+    cfg = Config(role="slave", master_url="https://sentry.example.com", data_dir=tmp_path / "s",
+                 recordings_dir=tmp_path / "s" / "rec", log_dir=tmp_path / "s" / "logs")
+    slave = Slave(cfg, enumerate_fn=lambda: [])
+    for name in names:
+        (slave.spool / f"{name}.json").write_text("{}")
+        (slave.spool / f"{name}.mp3").write_bytes(b"audio")
+    return slave
+
+
+async def run_upload(slave, handler):
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        await slave.upload_spool(client, "key")
+
+
+@pytest.mark.asyncio
+async def test_proxy_413_keeps_the_call_and_lets_the_queue_through(tmp_path):
+    slave = spooled_slave(tmp_path, ["a-big", "b-small"])
+
+    def handler(request):
+        if b'filename="a-big.mp3"' in request.read():
+            return httpx.Response(413, headers={"content-type": "text/html"}, text="<html>413</html>")
+        return httpx.Response(200, json={"ok": True})
+
+    await run_upload(slave, handler)
+    assert (slave.spool / "a-big.mp3").exists() and (slave.spool / "a-big.json").exists()
+    assert not (slave.spool / "b-small.mp3").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [413, 422])
+async def test_master_rejection_still_discards_the_call(tmp_path, status):
+    slave = spooled_slave(tmp_path, ["bad"])
+    await run_upload(slave, lambda request: httpx.Response(status, json={"detail": "no"}))
+    assert not (slave.spool / "bad.mp3").exists()
+
+
+@pytest.mark.asyncio
+async def test_kept_call_uploads_once_the_proxy_limit_is_raised(tmp_path):
+    slave = spooled_slave(tmp_path, ["big"])
+    await run_upload(slave, lambda request: httpx.Response(413, text="too big"))
+    assert (slave.spool / "big.mp3").exists()
+    await run_upload(slave, lambda request: httpx.Response(200, json={"ok": True}))
+    assert not (slave.spool / "big.mp3").exists()

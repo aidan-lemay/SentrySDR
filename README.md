@@ -7,7 +7,7 @@ It supervises existing tools instead of reimplementing them: `rtl_fm`, `ffmpeg`,
 ## How it fits together
 
 - **One application, two roles.** `node.role` in the configuration file selects `master` or `slave`.
-- **Master:** holds users and recordings, serves the web UI, runs schedules, and forwards calls to RDIO and ClearCut. It listens on loopback only, so publish it through a tunnel or reverse proxy.
+- **Master:** holds users and recordings, serves the web UI, runs schedules, and forwards calls to RDIO and ClearCut. By default it listens on loopback only, so publish it through a tunnel or reverse proxy. Direct access by local IP is opt-in.
 - **Slave:** opens no listening ports. It dials out to the master, takes its configuration from the master's UI, and sends everything back. If the link drops, it keeps recording its last assignment and uploads the calls when the link returns.
 - **One target per SDR at a time.** A schedule takes over its source for the window, then the source returns to its assigned target.
 - **Recordings stand alone.** Each keeps its own copy of the source and target names, so it stays searchable after that setup is deleted.
@@ -31,10 +31,29 @@ To add a slave, go to **Admin > Nodes** on the master to create a one-time token
 | Tailscale | `tailscale serve --bg 8642`, and add the `https://….ts.net` address to `extra_origins` | None on the public internet |
 | Caddy | [Caddyfile.example](deploy/Caddyfile.example) | 80, 443 |
 | nginx | [nginx.example.conf](deploy/nginx.example.conf) | 80, 443 |
+| Cloudflare Tunnel, then nginx on another machine | [nginx-tunnel.example.conf](deploy/nginx-tunnel.example.conf) | 8642, from your network only |
 
-**Set `[proxy]` to match your method.** Bans, rate limits and audit logs need the real client address. Tunnels and proxies connect from loopback, so with this unset every visitor appears to be `127.0.0.1`, and the rate limit on sign-ins is shared by everyone.
+**Set `[proxy]` to match your method.** Bans, rate limits and audit logs need the real client address. With this unset, every visitor appears to come from the proxy's address, and the rate limit on sign-ins is shared by everyone.
 
 [nftables.example.conf](deploy/nftables.example.conf) is a default-deny firewall. Review it before loading it.
+
+### Using a local IP address
+
+A tunnel or proxy is the better choice, but you can also open the master directly at `http://<ip>:8642` from your own network:
+
+```toml
+[server]
+bind_host = "0.0.0.0"
+local_access = true
+```
+
+- **Who can connect:** only private, link-local, loopback and Tailscale addresses, plus anything in `trusted_proxies`. Other addresses get a 403. Everyone still has to sign in.
+- **Which addresses work:** any private or Tailscale IP of the machine, with no further setup. To use a name such as `minipc.lan`, add `http://minipc.lan:8642` to `extra_origins`.
+- **What you give up:** plain http isn't encrypted, so anyone on your network who can see the traffic can read passwords and session cookies. Don't use it on a shared network, and never forward the port from the internet. Browsers also won't install the PWA without HTTPS; the site itself still works.
+- **Slaves:** a slave can use `http://<ip>:8642` as `master.url`. Its enrolment token and device key travel unencrypted too, unless the address is on Tailscale or another VPN.
+- **`allow_public_bind`:** setting this turns off the address restriction, so leave it off.
+
+This can run alongside a proxy. Requests through the proxy still get Secure cookies, and those through the local address don't.
 
 ## Security model
 

@@ -10,13 +10,14 @@ import threading
 import time
 from collections import defaultdict, deque
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pyotp
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerificationError
 from cryptography.fernet import Fernet, InvalidToken
 
-from .config import Config
+from .config import Config, is_local_ip
 
 MIN_PASSWORD_LENGTH = 12
 MAX_PASSWORD_LENGTH = 256
@@ -187,6 +188,62 @@ def is_direct_loopback(cfg: Config, peer: str | None, headers) -> bool:
             return False
     except ValueError:
         return False
+    return not _has_proxy_headers(cfg, headers)
+
+
+def _has_proxy_headers(cfg: Config, headers) -> bool:
     if cfg.client_ip_header and headers.get(cfg.client_ip_header):
+        return True
+    return any(headers.get(name) for name in ("x-forwarded-for", "x-forwarded-proto", "forwarded", "cf-connecting-ip"))
+
+
+def host_of(headers) -> str:
+    """The lowercase host named by a request, without its port. Malformed values give ''."""
+    try:
+        return (urlsplit(f"//{headers.get('host', '')}").hostname or "").lower()
+    except ValueError:
+        return ""
+
+
+def peer_permitted(cfg: Config, peer: str | None) -> bool:
+    """With local_access, only local devices and configured proxies may connect."""
+    if not cfg.local_access or cfg.allow_public_bind:
+        return True
+    return is_local_ip(peer) or _in_networks(peer or "", cfg.trusted_networks)
+
+
+def host_permitted(cfg: Config, host: str) -> bool:
+    # A literal IP can't be repointed by DNS, so allowing these keeps rebinding protection.
+    return host in cfg.allowed_hosts or (cfg.local_access and is_local_ip(host))
+
+
+def origin_permitted(cfg: Config, origin: str, headers) -> bool:
+    origin = origin.lower()
+    if origin in cfg.allowed_origins:
+        return True
+    if not cfg.local_access:
         return False
-    return not (headers.get("x-forwarded-for") or headers.get("cf-connecting-ip"))
+    try:
+        parts = urlsplit(origin)
+        hostname = parts.hostname
+    except ValueError:
+        return False
+    return (
+        parts.scheme in ("http", "https")
+        and is_local_ip(hostname)
+        and parts.netloc == headers.get("host", "").lower()
+    )
+
+
+def is_direct_plain_http(cfg: Config, peer: str | None, headers) -> bool:
+    """True when a browser reached this server itself, with no HTTPS proxy in between.
+
+    Decides only whether cookies can be Secure. It grants no access: these
+    requests sign in like any other.
+    """
+    if is_direct_loopback(cfg, peer, headers):
+        return True
+    if not cfg.local_access or not is_local_ip(peer) or _has_proxy_headers(cfg, headers):
+        return False
+    host = host_of(headers)
+    return is_local_ip(host) or host in cfg.plain_http_hosts

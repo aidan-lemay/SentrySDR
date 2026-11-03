@@ -9,7 +9,7 @@ from sqlalchemy import select
 
 from ..context import Context
 from ..models import Ban, User, UserSession
-from ..security import client_ip, hash_token, is_direct_loopback
+from ..security import client_ip, hash_token, is_direct_plain_http
 
 COOKIE_NAME = "sentrysdr_session"
 SESSION_SECONDS = 14 * 86400
@@ -78,18 +78,25 @@ def email_banned(ctx: Context, email: str) -> bool:
     return any(ban.kind == "email" and ban.value == email for ban in load_bans(ctx))
 
 
-def set_session_cookie(request: Request, response, token: str) -> None:
-    ctx = ctx_of(request)
+def _direct(request: Request) -> bool:
     peer = request.client.host if request.client else None
+    return is_direct_plain_http(ctx_of(request).cfg, peer, request.headers)
+
+
+def _cookie_path(request: Request) -> str:
+    # A sub-path in public_url belongs to the proxy; a direct visit is served from the root.
+    return "/" if _direct(request) else ctx_of(request).cfg.base_path
+
+
+def set_session_cookie(request: Request, response, token: str) -> None:
     response.set_cookie(
-        COOKIE_NAME, token, max_age=SESSION_SECONDS, path=ctx.cfg.base_path,
-        httponly=True, samesite="strict",
-        secure=not is_direct_loopback(ctx.cfg, peer, request.headers),
+        COOKIE_NAME, token, max_age=SESSION_SECONDS, path=_cookie_path(request),
+        httponly=True, samesite="strict", secure=not _direct(request),
     )
 
 
 def clear_session_cookie(request: Request, response) -> None:
-    response.delete_cookie(COOKIE_NAME, path=ctx_of(request).cfg.base_path)
+    response.delete_cookie(COOKIE_NAME, path=_cookie_path(request))
 
 
 def _current_session(request: Request, db) -> tuple[User, UserSession] | None:

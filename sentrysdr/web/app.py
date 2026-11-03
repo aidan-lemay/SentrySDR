@@ -13,7 +13,9 @@ from sqlalchemy import select
 
 from ..context import Context
 from ..models import Node
-from ..security import client_ip, hash_token
+from ..security import (
+    client_ip, hash_token, host_of, host_permitted, is_direct_plain_http, origin_permitted, peer_permitted,
+)
 from . import routes_account, routes_admin, routes_nodes, routes_radio, routes_recordings
 from .deps import ip_banned
 
@@ -61,10 +63,11 @@ class SecurityMiddleware:
         if scope["type"] not in ("http", "websocket"):
             return await self.app(scope, receive, send)
         headers = Headers(scope=scope)
-        host = urlsplit(f"//{headers.get('host', '')}").hostname or ""
-        if host.lower() not in self.cfg.allowed_hosts:
-            return await self._reject(scope, receive, send, 400, "Invalid host")
         peer = scope["client"][0] if scope.get("client") else None
+        if not peer_permitted(self.cfg, peer):
+            return await self._reject(scope, receive, send, 403, "Local network access only")
+        if not host_permitted(self.cfg, host_of(headers)):
+            return await self._reject(scope, receive, send, 400, "Invalid host")
         ip = client_ip(self.cfg, peer, headers)
         if ip_banned(self.ctx, ip):
             return await self._reject(scope, receive, send, 403, "Access denied")
@@ -76,7 +79,7 @@ class SecurityMiddleware:
         if method not in SAFE_METHODS and not path.startswith("/api/nodes/agent/"):
             origin = headers.get("origin")
             if origin is not None:
-                if origin.lower() not in self.cfg.allowed_origins:
+                if not origin_permitted(self.cfg, origin, headers):
                     return await self._reject(scope, receive, send, 403, "Cross-origin request refused")
             elif headers.get("x-sentrysdr") != "1":
                 return await self._reject(scope, receive, send, 403, "Missing request header")
@@ -116,7 +119,7 @@ class SecurityMiddleware:
                 out["Content-Security-Policy"] = policy
                 out["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
                 out["Cross-Origin-Opener-Policy"] = "same-origin"
-                if urlsplit(self.cfg.public_url).scheme == "https":
+                if urlsplit(self.cfg.public_url).scheme == "https" and not is_direct_plain_http(self.cfg, peer, headers):
                     out["Strict-Transport-Security"] = "max-age=31536000"
                 if path.startswith("/api/") and "cache-control" not in out:
                     out["Cache-Control"] = "no-store"

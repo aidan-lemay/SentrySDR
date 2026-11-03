@@ -42,6 +42,11 @@ def ws_url(master_url: str) -> str:
     return urlunsplit((scheme, parts.netloc, parts.path.rstrip("/") + "/api/nodes/agent/ws", "", ""))
 
 
+def _from_master(response: httpx.Response) -> bool:
+    """The master answers in JSON; proxies in front of it send their own HTML error pages."""
+    return response.headers.get("content-type", "").startswith("application/json")
+
+
 def api_url(master_url: str, path: str) -> str:
     return master_url.rstrip("/") + path
 
@@ -179,10 +184,17 @@ class Slave:
             if response.status_code == 200:
                 audio.unlink(missing_ok=True)
                 meta_path.unlink(missing_ok=True)
-            elif response.status_code in (413, 422):
+            elif response.status_code == 422 or (response.status_code == 413 and _from_master(response)):
                 log.error("master rejected call %s: HTTP %s; discarding", meta_path.stem, response.status_code)
                 audio.unlink(missing_ok=True)
                 meta_path.unlink(missing_ok=True)
+            elif response.status_code == 413:
+                # A proxy's size limit says nothing about the call, so keep it and let
+                # the rest of the queue through. nginx defaults to a 1 MB limit.
+                log.error(
+                    "a proxy refused call %s as too large; keeping it. "
+                    "Raise the limit (nginx: client_max_body_size)", meta_path.stem,
+                )
             else:
                 raise httpx.HTTPError(f"upload returned HTTP {response.status_code}")
 
