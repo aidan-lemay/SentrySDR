@@ -1,0 +1,36 @@
+# SentrySDR slave, such as a field Raspberry Pi. It opens no listening ports: it only
+# dials out to the master, which configures it and receives all of its data.
+
+[node]
+role = "slave"
+name = "field-pi"
+
+[master]
+# Any address that reaches the master:
+#   public name through its tunnel: https://sentry.example.com
+#   Tailscale serve:                https://main-server.your-tailnet.ts.net
+#   VPN or Tailscale address:       http://100.64.0.10:8642
+#   Local address of the master:    http://192.168.1.20:8642 (needs local_access there)
+# Plain http is refused unless the address is loopback, private, or Tailscale.
+url = "https://sentry.example.com"
+# From the master's UI: Admin > Nodes. One use, valid for 24 hours. After enrolment the
+# slave stores its own revocable key and this line can be removed.
+enrollment_token = ""
+# Calls wait here during an outage. The oldest are dropped above this size.
+spool_max_mb = 2048
+
+[storage]
+data_dir = "/var/lib/sentrysdr"
+recordings_dir = "/var/lib/sentrysdr/tmp"
+log_dir = "/var/log/sentrysdr"
+
+[sdr]
+serials = []
+
+[calls]
+hang_seconds = 2.0
+min_call_seconds = 0.5
+max_call_seconds = 1800
+
+[binaries]
+search_dirs = ["/opt/sentrysdr/.vendor/bin"]
