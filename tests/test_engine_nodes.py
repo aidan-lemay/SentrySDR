@@ -3,12 +3,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import signal
 import socket
 import stat
+import sys
 import textwrap
 import time
 import uuid
 from array import array
+from pathlib import Path
 
 import httpx
 import pytest
@@ -718,3 +722,71 @@ async def test_slave_answers_a_measure_request_and_rejects_bad_ones(tmp_path, mo
             assert reply["ok"] is False and reply["error"]
     finally:
         await slave.supervisor.shutdown()
+
+
+# --- stopping a slave keeps the call in progress ---------------------------------
+RUN_SLAVE = """\
+import asyncio, sys
+from pathlib import Path
+from sentrysdr.config import Config
+from sentrysdr.__main__ import run_slave
+from sentrysdr.slave import Slave
+
+root = Path(sys.argv[1])
+cfg = Config(role="slave", master_url="http://127.0.0.1:9", enrollment_token="unused", serials=["FIELD1"],
+             data_dir=root / "data", recordings_dir=root / "rec", log_dir=root / "logs", bin_dirs=[root / "bin"])
+slave = Slave(cfg, enumerate_fn=lambda: ["FIELD1"])
+try:
+    asyncio.run(run_slave(slave))
+except asyncio.CancelledError:
+    pass
+"""
+FAKE_ON_AIR = """\
+#!/usr/bin/env python3
+import os, sys, time
+open(sys.argv[0] + ".pid", "w").write(str(os.getpid()))
+while True:
+    sys.stdout.buffer.write(b"\\x10\\x00" * 800); sys.stdout.flush(); time.sleep(0.05)
+"""
+
+
+async def test_sigterm_spools_the_call_in_progress_and_stops_the_tool(tmp_path):
+    install_tool(tmp_path / "bin", "rtl_fm", FAKE_ON_AIR)
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "assignments.json").write_text(json.dumps({"FIELD1": spec()}))
+    env = {**os.environ, "PYTHONPATH": str(Path(engine.__file__).parent.parent)}
+    process = await asyncio.create_subprocess_exec(sys.executable, "-c", RUN_SLAVE, str(tmp_path), env=env)
+    pid_file = tmp_path / "bin" / "rtl_fm.pid"
+    try:
+        assert await wait_for(pid_file.exists, timeout=20)
+        await asyncio.sleep(1.5)
+        process.send_signal(signal.SIGTERM)
+        assert await asyncio.wait_for(process.wait(), 30) == 0
+    finally:
+        if process.returncode is None:
+            process.kill()
+    spooled = list((data / "spool").glob("*.json"))
+    assert len(spooled) == 1 and spooled[0].with_suffix(".mp3").stat().st_size > 0
+    assert json.loads(spooled[0].read_text())["duration"] > 0.5
+    tool = int(pid_file.read_text())
+    assert await wait_for(lambda: not Path(f"/proc/{tool}").exists())
+
+
+async def test_stopping_a_slave_cancels_a_measurement_without_reopening_the_stick(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "MEASURE_SECONDS", 30)
+    bins = tmp_path / "bin"
+    install_tool(bins, "rtl_fm", FAKE_MODES)
+    cfg = make_config(tmp_path, role="slave", master_url="http://127.0.0.1:9", enrollment_token="unused",
+                      bin_dirs=[bins], serials=["FIELD1"])
+    slave = Slave(cfg, enumerate_fn=lambda: ["FIELD1"])
+    slave.save_assignments({"FIELD1": spec()})
+    running = asyncio.create_task(slave.run())
+    worker = slave.supervisor.workers["FIELD1"]
+    assert await wait_for(lambda: worker.task is not None)
+    await slave.handle_message({"t": "measure", "id": "a", "serial": "FIELD1", **MEASURE})
+    assert await wait_for(lambda: worker.measuring)
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+    assert not worker.measuring and worker.task is None

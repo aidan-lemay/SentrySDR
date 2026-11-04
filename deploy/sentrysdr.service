@@ -10,6 +10,9 @@ Group=sentrysdr
 ExecStart=/opt/sentrysdr/.venv/bin/python -m sentrysdr -c /etc/sentrysdr/sentrysdr.toml run
 Restart=always
 RestartSec=5
+# Stop the application first, so it can finish saving calls and stop its own tools.
+KillMode=mixed
+TimeoutStopSec=120
 UMask=0027
 
 # Sandbox: the only writable paths are the data and log folders. If you move

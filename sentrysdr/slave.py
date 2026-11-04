@@ -282,24 +282,30 @@ class Slave:
 
     async def run(self) -> None:
         self.spool_event = asyncio.Event()
-        await self.supervisor.apply(self.load_assignments())  # keep recording while offline
-        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=15.0)) as client:
-            key = await self.ensure_enrolled(client)
-            spool_task = asyncio.create_task(self._spool_loop(client, key))
-            delay = RECONNECT_MIN
-            try:
-                while True:
-                    started = time.monotonic()
-                    try:
-                        await self._link_once(key)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:
-                        log.warning("master link lost: %s", exc)
-                    if time.monotonic() - started > RECONNECT_MAX:
-                        delay = RECONNECT_MIN
-                    await asyncio.sleep(delay)
-                    delay = min(delay * 2, RECONNECT_MAX)
-            finally:
-                spool_task.cancel()
-                await self.supervisor.shutdown()
+        try:
+            await self.supervisor.apply(self.load_assignments())  # keep recording while offline
+            async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=15.0)) as client:
+                key = await self.ensure_enrolled(client)
+                spool_task = asyncio.create_task(self._spool_loop(client, key))
+                delay = RECONNECT_MIN
+                try:
+                    while True:
+                        started = time.monotonic()
+                        try:
+                            await self._link_once(key)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            log.warning("master link lost: %s", exc)
+                        if time.monotonic() - started > RECONNECT_MAX:
+                            delay = RECONNECT_MIN
+                        await asyncio.sleep(delay)
+                        delay = min(delay * 2, RECONNECT_MAX)
+                finally:
+                    spool_task.cancel()
+        finally:
+            # Spools the call in progress. It uploads after the next start.
+            for task in list(self.measure_tasks):
+                task.cancel()
+            await asyncio.gather(*self.measure_tasks, return_exceptions=True)
+            await self.supervisor.shutdown()

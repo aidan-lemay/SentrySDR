@@ -6,6 +6,7 @@ import asyncio
 import getpass
 import logging
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -17,6 +18,12 @@ from .pipelines import ANALOG, DIGITAL
 MEASURABLE_MODES = ANALOG | set(DIGITAL)
 
 
+async def run_slave(slave) -> None:
+    """Run until stopped. SIGTERM must unwind normally, or the call in progress is lost."""
+    asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, asyncio.current_task().cancel)
+    await slave.run()
+
+
 def cmd_run(cfg) -> int:
     from .context import setup_audit_file, setup_logging
     setup_logging(cfg)
@@ -24,8 +31,8 @@ def cmd_run(cfg) -> int:
     if cfg.role == "slave":
         from .slave import Slave
         try:
-            asyncio.run(Slave(cfg).run())
-        except KeyboardInterrupt:
+            asyncio.run(run_slave(Slave(cfg)))
+        except (KeyboardInterrupt, asyncio.CancelledError):
             pass
         return 0
 
