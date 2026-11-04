@@ -29,6 +29,8 @@ READ_SIZE = 4096
 RESTART_MIN = 2.0
 RESTART_MAX = 60.0
 AIS_EXPIRY_SECONDS = 900
+SQUELCH_STUCK_SECONDS = 600
+SQUELCH_STUCK_WARNING = "Squelch has been open for over 10 minutes. If nothing is transmitting, raise the target's squelch."
 RADIO_KEYS = ("kind", "frequency_hz", "modulation", "squelch", "gain_db", "ppm")
 
 CallSink = Callable[[dict, Path], Awaitable[None]]
@@ -272,13 +274,18 @@ class Worker:
             procs.append(proc)
             tasks.append(asyncio.create_task(_log_stderr(self.serial, proc.stderr, tail)))
             self._publish("listening", "")
+            open_since: float | None = None
+            warn_stuck = spec["squelch"] > 0 and not digital
 
             while True:
                 try:
                     chunk = await asyncio.wait_for(proc.stdout.read(READ_SIZE), cfg.hang_seconds)
                 except asyncio.TimeoutError:
+                    open_since = None
                     if writer:
                         writer = await self._end_call(writer)
+                    if self.error:
+                        self._publish(error="")
                     continue
                 if not chunk:
                     break
@@ -291,6 +298,10 @@ class Worker:
                     self._publish()
                 writer.write(chunk)
                 self.sup.pcm(self.serial, chunk, rate)
+                # Measured across max_call_seconds splits, which don't close the squelch.
+                open_since = open_since or time.monotonic()
+                if warn_stuck and not self.error and time.monotonic() - open_since >= SQUELCH_STUCK_SECONDS:
+                    self._publish(error=SQUELCH_STUCK_WARNING)
                 if writer.duration >= cfg.max_call_seconds:
                     writer = await self._end_call(writer)  # stuck carriers and continuous mode
             await asyncio.gather(*(p.wait() for p in procs), return_exceptions=True)

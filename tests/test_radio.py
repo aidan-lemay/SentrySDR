@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import time
 import uuid
+from array import array
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -355,6 +356,37 @@ def test_nfm_uses_tuner_agc_when_gain_unset(ctx):
     args = pipelines.rtl_fm_args(ctx.cfg, 2, spec())
     assert args[1:5] == ["-d", "2", "-f", "444444000"] and "-g" not in args
     assert args[args.index("-l") + 1] == "50"
+
+
+@pytest.mark.parametrize("modulation", ["nfm", "am", "wfm", "dmr", "p25p1"])
+def test_every_rtl_fm_mode_uses_the_targets_squelch(ctx, modulation):
+    args = pipelines.rtl_fm_args(ctx.cfg, 0, spec(modulation=modulation, squelch=137))
+    assert args[args.index("-l") + 1] == "137"
+
+
+def test_measure_reads_at_the_targets_rate_and_gain(ctx):
+    args = pipelines.measure_args(ctx.cfg, 1, 444_850_000, "wfm", 40.2, 3)
+    assert args[args.index("-M") + 1] == "raw" and args[args.index("-s") + 1] == "170000"
+    assert args[args.index("-g") + 1] == "40.2" and args[args.index("-p") + 1] == "3"
+    assert "-g" not in pipelines.measure_args(ctx.cfg, 1, 444_850_000, "nfm", None)
+
+
+def iq(level, seconds, rate=16000):
+    return array("h", [level, -level] * int(rate * seconds)).tobytes()
+
+
+def test_signal_levels_skip_settling_and_match_rms():
+    levels = pipelines.signal_levels(iq(9000, 1) + iq(100, 2), 16000)
+    assert len(levels) == 20 and all(value == pytest.approx(100) for value in levels)
+
+
+def test_suggested_squelch_ignores_a_brief_transmission():
+    pcm = iq(0, 1) + iq(64, 9) + iq(3000, 1)
+    assert pipelines.suggest_squelch(pipelines.signal_levels(pcm, 16000)) == 103
+
+
+def test_signal_levels_ignore_a_partial_sample_and_too_little_audio():
+    assert pipelines.signal_levels(iq(100, 0.5) + b"\x01", 16000) == []
 
 
 def test_manual_gain_and_ppm_passed(ctx):

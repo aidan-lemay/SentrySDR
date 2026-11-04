@@ -14,7 +14,8 @@ import httpx
 import pytest
 import uvicorn
 
-from sentrysdr import pipelines
+from sentrysdr import engine, pipelines
+from sentrysdr.__main__ import cmd_measure
 from sentrysdr.config import Config
 from sentrysdr.context import Context
 from sentrysdr.engine import PcmFramer, Supervisor
@@ -515,3 +516,78 @@ async def test_kept_call_uploads_once_the_proxy_limit_is_raised(tmp_path):
     assert (slave.spool / "big.mp3").exists()
     await run_upload(slave, lambda request: httpx.Response(200, json={"ok": True}))
     assert not (slave.spool / "big.mp3").exists()
+
+
+# --- a squelch that never closes ----------------------------------------------
+# Writes steadily for a while, then goes quiet as if the squelch closed.
+FAKE_STUCK_OPEN = """\
+#!/usr/bin/env python3
+import sys, time
+for _ in range(30):
+    sys.stdout.buffer.write(b"\\x10\\x00" * 800); sys.stdout.flush(); time.sleep(0.05)
+time.sleep(60)
+"""
+
+
+async def run_stuck(tmp_path, monkeypatch, **spec_overrides):
+    monkeypatch.setattr(engine, "SQUELCH_STUCK_SECONDS", 0.3)
+    bins = tmp_path / "bin"
+    install_tool(bins, "rtl_fm", FAKE_STUCK_OPEN)
+    calls, statuses = [], {}
+    # A short maximum proves the warning spans the splits, which never close the squelch.
+    cfg = make_config(tmp_path, bin_dirs=[bins], max_call_seconds=0.2)
+    sup = supervisor(cfg, calls, statuses=statuses)
+    try:
+        await sup.apply({"SER1": spec(**spec_overrides)})
+        assert await wait_for(lambda: any(not s["in_call"] and len(calls) >= 2 for s in statuses.get("SER1", [])))
+        await wait_for(lambda: statuses["SER1"][-1]["error"] == "", timeout=3)
+    finally:
+        history = [s["error"] for s in statuses["SER1"]]
+        await sup.shutdown()
+    return history
+
+
+async def test_warns_when_squelch_stays_open_then_clears(tmp_path, monkeypatch):
+    history = await run_stuck(tmp_path, monkeypatch, squelch=60)
+    assert engine.SQUELCH_STUCK_WARNING in history
+    assert history[-1] == ""
+
+
+async def test_no_warning_for_continuous_recording(tmp_path, monkeypatch):
+    assert engine.SQUELCH_STUCK_WARNING not in await run_stuck(tmp_path, monkeypatch, squelch=0)
+
+
+# --- the measure command -------------------------------------------------------
+def measure_cfg(tmp_path, tool):
+    bins = tmp_path / "bin"
+    install_tool(bins, "rtl_fm", tool)
+    return make_config(tmp_path, bin_dirs=[bins], serials=["SER1"])
+
+
+FAKE_RAW = """\
+#!/usr/bin/env python3
+import sys, time
+for _ in range(100):
+    sys.stdout.buffer.write(b"\\x40\\x00\\xc0\\xff" * 800); sys.stdout.flush(); time.sleep(0.02)
+"""
+
+
+def test_measure_prints_a_suggestion(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr("sentrysdr.sdr.enumerate_serials", lambda: ["SER1"])
+    cfg = measure_cfg(tmp_path, FAKE_RAW)
+    assert cmd_measure(cfg, "SER1", 444.85, "nfm", None, 0, 1.0) == 0
+    out = capsys.readouterr().out
+    assert "typical 64" in out and "Suggested squelch: 103" in out
+
+
+def test_measure_refuses_an_unlisted_sdr(tmp_path, capsys):
+    assert cmd_measure(measure_cfg(tmp_path, FAKE_RAW), "OTHER", 444.85, "nfm", None, 0, 1.0) == 2
+    assert "sdr.serials" in capsys.readouterr().err
+
+
+def test_measure_explains_a_busy_sdr(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr("sentrysdr.sdr.enumerate_serials", lambda: ["SER1"])
+    cfg = measure_cfg(tmp_path, "#!/bin/sh\necho 'usb_claim_interface error -6' >&2\nexit 1\n")
+    assert cmd_measure(cfg, "SER1", 444.85, "nfm", None, 0, 1.0) == 1
+    err = capsys.readouterr().err
+    assert "clear it or stop the service" in err and "usb_claim_interface" in err

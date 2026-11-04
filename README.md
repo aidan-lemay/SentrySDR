@@ -77,7 +77,18 @@ This can run alongside a proxy. Requests through the proxy still get Secure cook
 
 ## Tuning call detection
 
-A call is whatever passes the target's **squelch level**. Raise it if noise keeps recording, or lower it if calls are missed. The right value depends on your antenna and site, so expect to adjust it. A squelch of `0` records continuously, split into `max_call_seconds` pieces.
+A call is whatever passes the target's **squelch level**. If the level is below the noise, the squelch never closes, and you get back-to-back `max_call_seconds` recordings of static. After 10 minutes open, the Sources page shows a warning. A squelch of `0` records continuously, split into `max_call_seconds` pieces.
+
+The noise level changes a lot with frequency, mode, gain and antenna, so one number doesn't suit every target. On an R828D stick with AGC, for example, noise read about 64 at 444.85 MHz but about 540 at 154 MHz. Measure it on the machine the SDR is attached to, with the channel quiet:
+
+```sh
+sudo systemctl stop sentrysdr   # or clear the SDR's target, so the SDR is free
+sudo -u sentrysdr /opt/sentrysdr/.venv/bin/python -m sentrysdr -c /etc/sentrysdr/sentrysdr.toml \
+  measure --serial 18150304 --mhz 444.85 --mode nfm
+sudo systemctl start sentrysdr
+```
+
+Use the suggestion as the target's squelch, then raise it if noise still records or lower it if weak calls are missed. Include `--gain` if the target uses a fixed gain.
 
 ## Uploads
 

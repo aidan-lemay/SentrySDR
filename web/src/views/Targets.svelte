@@ -120,7 +120,7 @@
       </label>
       <label class="field"><span>Squelch level</span>
         <input class="mono" type="number" inputmode="numeric" min="0" max="100000" bind:value={form.squelch} />
-        <span class="hint">Raise this if noise keeps recording. 0 records all the time.</span>
+        <span class="hint">Must sit above the noise, which changes with frequency, mode and gain. Raise this if a source stays ON AIR with nothing transmitting. 0 records all the time.</span>
       </label>
       <div class="field"><span>ClearCut</span><label class="tick"><input type="checkbox" bind:checked={form.clearcut_enabled} /> Upload calls to ClearCut</label></div>
       {#if form.clearcut_enabled}
