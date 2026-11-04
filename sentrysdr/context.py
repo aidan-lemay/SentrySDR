@@ -9,6 +9,7 @@ import logging.handlers
 import os
 import shutil
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -18,13 +19,14 @@ from sqlalchemy import delete, select
 
 from . import pipelines, schedule, uploaders
 from .config import Config
-from .engine import Supervisor
+from .engine import MeasureError, Supervisor
 from .live import LiveHub
-from .models import AuditLog, Node, Recorder, Recording, Setting, Source, Target, UploadJob, make_session_factory
+from .models import AuditLog, Node, Recorder, Recording, SdrProfile, Setting, Source, Target, UploadJob, make_session_factory
 from .sdr import enumerate_serials
 from .security import RateLimiter, SecretBox
 
 log = logging.getLogger("sentrysdr")
+MEASURE_TIMEOUT = 45.0
 
 SETTING_DEFAULTS = {
     "audit_retention_days": "365",
@@ -77,6 +79,7 @@ class Context:
         self.tracks: dict[str, dict[str, dict]] = {"adsb": {}, "ais": {}}
         self.live = LiveHub(cfg, self._live_demand)
         self.node_links: dict[int, object] = {}
+        self.pending_measures: dict[str, tuple[int, asyncio.Future]] = {}
         self.bans_cache: tuple[float, list] = (0.0, [])
         self._tile_origin: str | None = None
         self.local_node_id = self._ensure_local_node()
@@ -188,20 +191,62 @@ class Context:
                 target = session.get(Target, recorder.target_id)
                 if source is None or target is None:
                     continue
+                profile = session.scalar(select(SdrProfile).where(
+                    SdrProfile.source_id == source.id, SdrProfile.target_id == target.id,
+                ))
                 try:
                     spec = pipelines.sanitize_spec({
                         "recorder_id": recorder.id, "recorder_name": recorder.name,
                         "source_id": source.id, "source_name": source.name,
                         "target_id": target.id, "target_name": target.name,
                         "kind": target.kind, "frequency_hz": target.frequency_hz,
-                        "modulation": target.modulation, "squelch": target.squelch,
-                        "gain_db": source.gain_db, "ppm": source.ppm,
+                        "modulation": target.modulation,
+                        "squelch": profile.squelch if profile else target.squelch,
+                        "gain_db": profile.gain_db if profile else source.gain_db,
+                        "ppm": source.ppm,
                     })
                 except pipelines.SpecError as exc:
                     log.error("recorder %s has an invalid configuration: %s", recorder.id, exc)
                     continue
                 result.setdefault(source.node_id, {})[source.serial] = spec
             return result
+
+    async def measure(self, node: Node, serial: str, request: dict) -> dict:
+        """Measure on the node that holds the SDR. Raises MeasureError with a user-facing reason."""
+        if node.is_local:
+            if self.supervisor is None:
+                raise MeasureError("Radios aren't running on this server.")
+            return await self.supervisor.measure(serial, **request)
+        link = self.node_links.get(node.id)
+        if link is None:
+            raise MeasureError("That node is offline.")
+        request_id = uuid.uuid4().hex
+        future = asyncio.get_running_loop().create_future()
+        self.pending_measures[request_id] = (node.id, future)
+        try:
+            link.request_measure(request_id, serial, request)
+            return await asyncio.wait_for(future, MEASURE_TIMEOUT)
+        except asyncio.TimeoutError:
+            raise MeasureError("The node didn't answer. Check that it runs the same version as this server.") from None
+        finally:
+            self.pending_measures.pop(request_id, None)
+
+    def finish_measure(self, node_id: int, message: dict) -> None:
+        pending = self.pending_measures.get(str(message.get("id")))
+        if pending is None or pending[0] != node_id or pending[1].done():
+            return  # late, unknown, or from a node that wasn't asked
+        future = pending[1]
+        if not message.get("ok"):
+            future.set_exception(MeasureError(str(message.get("error") or "The measurement failed.")[:300]))
+            return
+        try:
+            result = message["result"]
+            future.set_result({
+                "low": int(result["low"]), "typical": int(result["typical"]), "high": int(result["high"]),
+                "suggested": int(result["suggested"]), "moved": bool(result["moved"]),
+            })
+        except (KeyError, TypeError, ValueError):
+            future.set_exception(MeasureError("The node sent an unreadable result."))
 
     def kick(self) -> None:
         """Ask the scheduler to re-evaluate now. Safe from any thread."""

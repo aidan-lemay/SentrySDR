@@ -1,6 +1,7 @@
 """Scheduling, assignment, locks, recordings, uploads, retention and pipelines."""
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
 from array import array
@@ -9,10 +10,11 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from sqlalchemy import select
 
 from sentrysdr import pipelines, schedule, sdr, uploaders
-from sentrysdr.engine import merge_ais_message
-from sentrysdr.models import Recording, UploadJob
+from sentrysdr.engine import MeasureError, merge_ais_message
+from sentrysdr.models import Recording, SdrProfile, UploadJob
 
 from .conftest import ADMIN_EMAIL, PASSWORD, add_user, client_for
 
@@ -630,3 +632,206 @@ def test_upgrade_adds_new_columns_to_an_old_database(tmp_path):
     connection = sqlite3.connect(path)
     assert connection.execute("SELECT name, clearcut_system FROM targets").fetchall() == [("kept", None)]
     connection.close()
+
+
+# --- saved profiles and noise measurement -----------------------------------
+def local_setup(admin, ctx, serial="SER1", target_mhz=441.0, **target):
+    source = admin.post("/api/sources", json={"serial": serial, "name": f"Stick {serial}", "gain_db": 10.0}).json()["id"]
+    target_id = admin.post("/api/targets", json={
+        "name": f"T{target_mhz}", "frequency_hz": int(target_mhz * 1e6), "modulation": "nfm", "squelch": 50, **target,
+    }).json()["id"]
+    return source, target_id
+
+
+def running_spec(ctx, serial):
+    return ctx.assignments()[ctx.local_node_id][serial]
+
+
+def test_profile_sets_squelch_and_gain_for_that_stick_and_target_only(admin, ctx):
+    one, target = local_setup(admin, ctx)
+    two = admin.post("/api/sources", json={"serial": "SER2", "name": "Other", "gain_db": 20.0}).json()["id"]
+    for source in (one, two):
+        admin.post(f"/api/sources/{source}/assign", json={"target_id": target})
+    saved = admin.put(f"/api/sources/{one}/profiles/{target}", json={"squelch": 98, "gain_db": 19.2, "noise_level": 62})
+    assert saved.status_code == 200 and saved.json()["measured_at"]
+    first, second = running_spec(ctx, "SER1"), running_spec(ctx, "SER2")
+    assert (first["squelch"], first["gain_db"]) == (98, 19.2)
+    assert (second["squelch"], second["gain_db"]) == (50, 20.0)
+    view = next(s for s in admin.get("/api/sources").json() if s["id"] == one)
+    assert view["active_target"]["from_profile"] and view["active_target"]["squelch"] == 98
+    assert view["profiles"][0]["squelch"] == 98
+
+
+def test_profile_with_empty_gain_means_agc_not_the_source_gain(admin, ctx):
+    source, target = local_setup(admin, ctx)
+    admin.post(f"/api/sources/{source}/assign", json={"target_id": target})
+    admin.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": 101, "gain_db": None})
+    assert running_spec(ctx, "SER1")["gain_db"] is None
+
+
+def test_saving_again_replaces_and_removing_restores_defaults(admin, ctx):
+    source, target = local_setup(admin, ctx)
+    admin.post(f"/api/sources/{source}/assign", json={"target_id": target})
+    path = f"/api/sources/{source}/profiles/{target}"
+    admin.put(path, json={"squelch": 98})
+    admin.put(path, json={"squelch": 120, "gain_db": 7.1})
+    view = next(s for s in admin.get("/api/sources").json() if s["id"] == source)
+    assert len(view["profiles"]) == 1 and view["profiles"][0]["squelch"] == 120
+    assert view["profiles"][0]["measured_at"] is None  # typed in, not measured
+    assert admin.delete(path).status_code == 200
+    assert (running_spec(ctx, "SER1")["squelch"], running_spec(ctx, "SER1")["gain_db"]) == (50, 10.0)
+    assert admin.delete(path).status_code == 404
+
+
+def test_retuning_a_target_removes_profiles_but_renaming_keeps_them(admin, ctx):
+    source, target = local_setup(admin, ctx)
+    admin.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": 98})
+    body = {"frequency_hz": 441_000_000, "modulation": "nfm", "squelch": 50}
+    reply = admin.put(f"/api/targets/{target}", json={"name": "Renamed", **body}).json()
+    assert reply["profiles_cleared"] == 0
+    reply = admin.put(f"/api/targets/{target}", json={"name": "Renamed", **{**body, "frequency_hz": 444_850_000}}).json()
+    assert reply["profiles_cleared"] == 1
+    assert next(s for s in admin.get("/api/sources").json() if s["id"] == source)["profiles"] == []
+
+
+def test_deleting_a_source_or_target_removes_its_profiles(admin, ctx):
+    source, target = local_setup(admin, ctx)
+    admin.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": 98})
+    admin.delete(f"/api/targets/{target}")
+    with ctx.db() as session:
+        assert session.scalar(select(SdrProfile)) is None
+    target = admin.post("/api/targets", json={"name": "T", "frequency_hz": 441_000_000, "modulation": "nfm"}).json()["id"]
+    admin.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": 98})
+    admin.delete(f"/api/sources/{source}")
+    with ctx.db() as session:
+        assert session.scalar(select(SdrProfile)) is None
+
+
+@pytest.mark.parametrize("squelch", [-1, 100001])
+def test_profile_values_are_validated(admin, ctx, squelch):
+    source, target = local_setup(admin, ctx)
+    assert admin.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": squelch}).status_code == 422
+    assert admin.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": 1, "gain_db": 99}).status_code == 422
+
+
+def test_only_audio_targets_have_profiles(admin, ctx):
+    source, _ = local_setup(admin, ctx)
+    adsb = admin.post("/api/targets", json={"name": "A", "kind": "adsb", "frequency_hz": 1_090_000_000, "modulation": "adsb"}).json()["id"]
+    assert admin.put(f"/api/sources/{source}/profiles/{adsb}", json={"squelch": 9}).status_code == 422
+    assert admin.post(f"/api/sources/{source}/measure", json={"target_id": adsb}).status_code == 422
+
+
+def fake_supervisor(ctx, result=None, error=None):
+    calls = []
+
+    class Fake:
+        async def measure(self, serial, **request):
+            calls.append((serial, request))
+            if error:
+                raise MeasureError(error)
+            return result or {"low": 61, "typical": 62, "high": 70, "suggested": 98, "moved": False}
+
+    ctx.supervisor = Fake()
+    return calls
+
+
+def test_measure_uses_the_targets_frequency_and_sources_ppm(admin, ctx):
+    source = admin.post("/api/sources", json={"serial": "SER1", "name": "S", "ppm": 4}).json()["id"]
+    target = admin.post("/api/targets", json={"name": "T", "frequency_hz": 444_850_000, "modulation": "wfm"}).json()["id"]
+    calls = fake_supervisor(ctx)
+    reply = admin.post(f"/api/sources/{source}/measure", json={"target_id": target, "gain_db": 19.2})
+    assert reply.status_code == 200 and reply.json()["suggested"] == 98 and reply.json()["gain_db"] == 19.2
+    assert calls == [("SER1", {"frequency_hz": 444_850_000, "modulation": "wfm", "gain_db": 19.2, "ppm": 4})]
+    assert any(e["action"] == "source.measured" for e in admin.get("/api/admin/audit").json())
+
+
+def test_measure_failure_is_explained(admin, ctx):
+    source, target = local_setup(admin, ctx)
+    fake_supervisor(ctx, error="This SDR isn't connected, or its serial is duplicated.")
+    reply = admin.post(f"/api/sources/{source}/measure", json={"target_id": target})
+    assert reply.status_code == 409 and "isn't connected" in reply.json()["detail"]
+
+
+def test_measure_is_rate_limited_per_user(admin, ctx):
+    source, target = local_setup(admin, ctx)
+    fake_supervisor(ctx)
+    codes = [admin.post(f"/api/sources/{source}/measure", json={"target_id": target}).status_code for _ in range(31)]
+    assert codes[:30] == [200] * 30 and codes[30] == 429
+
+
+def test_listeners_cannot_measure_or_save_profiles(admin, ctx, app):
+    source, target = local_setup(admin, ctx)
+    calls = fake_supervisor(ctx)
+    add_user(ctx, "listener@example.com")
+    client = client_for(app, "listener@example.com")
+    assert client.post(f"/api/sources/{source}/measure", json={"target_id": target}).status_code == 403
+    assert client.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": 1}).status_code == 403
+    assert client.delete(f"/api/sources/{source}/profiles/{target}").status_code == 403
+    anonymous = client_for(app)
+    assert anonymous.post(f"/api/sources/{source}/measure", json={"target_id": target}).status_code == 401
+    assert anonymous.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": 1}).status_code == 401
+    assert calls == []
+
+
+def test_a_lock_covers_measuring_and_profiles_for_everyone_but_admins(admin, ctx, app):
+    source, target = local_setup(admin, ctx)
+    admin.post(f"/api/sources/{source}/assign", json={"target_id": target})
+    admin.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": 98})
+    admin.post(f"/api/sources/{source}/lock", json={"password": "secret-lock"})
+    calls = fake_supervisor(ctx)
+    add_user(ctx, "op@example.com", role="operator")
+    operator = client_for(app, "op@example.com")
+    assert operator.post(f"/api/sources/{source}/measure", json={"target_id": target}).status_code == 403
+    assert operator.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": 1}).status_code == 403
+    assert operator.delete(f"/api/sources/{source}/profiles/{target}").status_code == 403
+    assert calls == [] and running_spec(ctx, "SER1")["squelch"] == 98
+    assert admin.post(f"/api/sources/{source}/measure", json={"target_id": target}).status_code == 200
+    assert admin.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": 110}).status_code == 200
+
+
+def test_operator_can_measure_and_save_on_an_unlocked_source(admin, ctx, app):
+    source, target = local_setup(admin, ctx)
+    fake_supervisor(ctx)
+    add_user(ctx, "op@example.com", role="operator")
+    operator = client_for(app, "op@example.com")
+    assert operator.post(f"/api/sources/{source}/measure", json={"target_id": target}).status_code == 200
+    assert operator.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": 98}).status_code == 200
+
+
+@pytest.mark.parametrize("bad", [
+    {"modulation": "adsb"}, {"modulation": "nfm; rm -rf /"}, {"frequency_hz": 1}, {"frequency_hz": "abc"},
+    {"gain_db": 99}, {"gain_db": "x"}, {"ppm": 9999}, {"frequency_hz": None},
+])
+def test_measure_requests_from_the_network_are_validated(bad):
+    good = {"frequency_hz": 441_000_000, "modulation": "nfm", "gain_db": 19.2, "ppm": 0}
+    assert pipelines.sanitize_measure(good)["gain_db"] == 19.2
+    with pytest.raises(pipelines.SpecError):
+        pipelines.sanitize_measure({**good, **bad})
+
+
+def pending_future(ctx, node_id=7):
+    loop = asyncio.new_event_loop()
+    future = loop.create_future()
+    ctx.pending_measures["abc"] = (node_id, future)
+    return loop, future
+
+
+GOOD_RESULT = {"low": 61, "typical": 62, "high": 70, "suggested": 98, "moved": False}
+
+
+def test_a_node_cannot_answer_another_nodes_measurement(ctx):
+    loop, future = pending_future(ctx)
+    ctx.finish_measure(8, {"id": "abc", "ok": True, "result": GOOD_RESULT})
+    ctx.finish_measure(7, {"id": "other", "ok": True, "result": GOOD_RESULT})
+    assert not future.done()
+    ctx.finish_measure(7, {"id": "abc", "ok": True, "result": GOOD_RESULT})
+    assert future.result()["suggested"] == 98
+    loop.close()
+
+
+@pytest.mark.parametrize("message", [{"ok": True, "result": {"low": "x"}}, {"ok": True}, {"ok": True, "result": 5}, {"ok": False, "error": "busy"}])
+def test_bad_measurement_replies_become_errors(ctx, message):
+    loop, future = pending_future(ctx)
+    ctx.finish_measure(7, {"id": "abc", **message})
+    assert isinstance(future.exception(), MeasureError)
+    loop.close()

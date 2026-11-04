@@ -30,13 +30,19 @@ RESTART_MIN = 2.0
 RESTART_MAX = 60.0
 AIS_EXPIRY_SECONDS = 900
 SQUELCH_STUCK_SECONDS = 600
-SQUELCH_STUCK_WARNING = "Squelch has been open for over 10 minutes. If nothing is transmitting, raise the target's squelch."
+SQUELCH_STUCK_WARNING = "Squelch has been open for over 10 minutes. If nothing is transmitting, measure this SDR and raise its squelch."
+MEASURE_SECONDS = 6.0
+MEASURE_ATTEMPTS = 3
 RADIO_KEYS = ("kind", "frequency_hz", "modulation", "squelch", "gain_db", "ppm")
 
 CallSink = Callable[[dict, Path], Awaitable[None]]
 PcmSink = Callable[[str, bytes, int], None]
 TrackSink = Callable[[str, str, dict], None]
 Status = Callable[[str, dict], None]
+
+
+class MeasureError(Exception):
+    """A noise measurement could not be taken. The message is shown to the user."""
 
 
 async def stop_process(proc: asyncio.subprocess.Process | None, timeout: float = 5.0) -> None:
@@ -155,6 +161,7 @@ class Worker:
     """Owns one SDR. Runs whichever pipeline its current spec requires."""
 
     def __init__(self, supervisor: "Supervisor", serial: str):
+        self.measuring = False
         self.sup = supervisor
         self.cfg = supervisor.cfg
         self.serial = serial
@@ -185,6 +192,9 @@ class Worker:
         self.sup.status(self.serial, self.snapshot())
 
     async def apply(self, spec: dict | None) -> None:
+        if self.measuring:
+            self.spec = spec  # started when the measurement finishes
+            return
         current = self.spec
         same_radio = (
             current is not None and spec is not None
@@ -208,6 +218,56 @@ class Worker:
             with contextlib.suppress(asyncio.CancelledError):
                 await self.task
             self.task = None
+
+    async def measure(self, frequency_hz: int, modulation: str, gain_db: float | None, ppm: int) -> dict:
+        """Pause this SDR's assignment, read the noise level, then resume."""
+        if self.measuring:
+            raise MeasureError("This SDR is already being measured.")
+        self.measuring = True
+        try:
+            await self.stop()  # saves a call in progress
+            self.in_call, self.call_started = False, None
+            self._publish("measuring", "")
+            devices = await asyncio.to_thread(self.sup.enumerate)
+            index = sdr.index_for_serial(self.serial, devices)
+            if index is None:
+                raise MeasureError("This SDR isn't connected, or its serial is duplicated.")
+            args = pipelines.measure_args(self.cfg, index, frequency_hz, modulation, gain_db, ppm)
+            return await self._read_levels(args, pipelines.measure_rate(modulation))
+        finally:
+            self.measuring = False
+            if self.spec is not None:
+                self.task = asyncio.create_task(self._run(self.spec), name=f"sdr-{self.serial}")
+            else:
+                self._publish("idle", "")
+
+    async def _read_levels(self, args: list[str], rate: int) -> dict:
+        tail: list[str] = []
+        for attempt in range(MEASURE_ATTEMPTS):
+            if attempt:
+                await asyncio.sleep(1.0)  # the stick can take a moment to be released
+            proc = await asyncio.create_subprocess_exec(
+                *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            drain = asyncio.create_task(_log_stderr(self.serial, proc.stderr, tail))
+            pcm = bytearray()
+            deadline = time.monotonic() + MEASURE_SECONDS + 1  # the first second is discarded
+            try:
+                while (remaining := deadline - time.monotonic()) > 0:
+                    try:
+                        chunk = await asyncio.wait_for(proc.stdout.read(65536), remaining)
+                    except asyncio.TimeoutError:
+                        break
+                    if not chunk:
+                        break
+                    pcm += chunk
+            finally:
+                await stop_process(proc)
+                drain.cancel()
+            levels = await asyncio.to_thread(pipelines.signal_levels, bytes(pcm), rate)
+            if levels:
+                return pipelines.measure_summary(levels)
+        raise MeasureError(f"No samples from the SDR. {tail[-1] if tail else ''}".strip()[:300])
 
     async def _run(self, spec: dict) -> None:
         delay = RESTART_MIN
@@ -415,6 +475,12 @@ class Supervisor:
     async def apply(self, assignments: dict[str, dict | None]) -> None:
         for serial, worker in self.workers.items():
             await worker.apply(assignments.get(serial))
+
+    async def measure(self, serial: str, **request) -> dict:
+        worker = self.workers.get(serial)
+        if worker is None:
+            raise MeasureError("That SDR isn't in sdr.serials on this node.")
+        return await worker.measure(**request)
 
     async def shutdown(self) -> None:
         await asyncio.gather(*(w.stop() for w in self.workers.values()), return_exceptions=True)

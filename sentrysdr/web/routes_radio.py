@@ -15,13 +15,16 @@ from sqlalchemy import select
 from .. import pipelines, schedule, security
 from ..config import SERIAL_RE
 from ..context import Context
-from ..models import Node, Recorder, Source, Target, User, now
+from ..engine import MeasureError
+from ..models import Node, Recorder, SdrProfile, Source, Target, User, now
 from .deps import admin_user, ctx_of, current_user, get_db, ip_of, require
 
 router = APIRouter(prefix="/api")
 
 LOCK_WINDOW = 900
 LOCK_LIMIT = 8
+MEASURE_LIMIT = 30
+MEASURE_WINDOW = 3600
 LIVE_MAX_TOTAL = 50
 LIVE_MAX_PER_USER = 3
 _live_counts: dict[int, int] = {}
@@ -52,6 +55,8 @@ def _source_view(ctx: Context, db, source: Source, winners: dict, recorders: lis
     base = next((r for r in recorders if r.source_id == source.id and r.schedule_days is None), None)
     active = winners.get(source.id)
     target = db.get(Target, active.target_id) if active else None
+    profiles = list(db.scalars(select(SdrProfile).where(SdrProfile.source_id == source.id)))
+    profile = next((p for p in profiles if target and p.target_id == target.id), None)
     online = ctx.node_online(node) if node else False
     status = ctx.status.get((source.node_id, source.serial), {}) if online else {}
     return {
@@ -73,7 +78,19 @@ def _source_view(ctx: Context, db, source: Source, winners: dict, recorders: lis
         "active_target": {
             "id": target.id, "name": target.name, "frequency_hz": target.frequency_hz,
             "modulation": target.modulation, "kind": target.kind,
+            "squelch": profile.squelch if profile else target.squelch,
+            "gain_db": profile.gain_db if profile else source.gain_db,
+            "from_profile": profile is not None,
         } if target else None,
+        "profiles": [_profile_view(p) for p in profiles],
+    }
+
+
+def _profile_view(profile: SdrProfile) -> dict:
+    return {
+        "target_id": profile.target_id, "squelch": profile.squelch, "gain_db": profile.gain_db,
+        "noise_level": profile.noise_level, "measured_at": profile.measured_at,
+        "updated_by": profile.updated_by,
     }
 
 
@@ -224,12 +241,18 @@ def update_target(target_id: int, body: TargetBody, request: Request, user: User
     if user.role != "admin" and _active_uses_locked(db, target_id):
         raise HTTPException(403, "A locked recorder uses this target. Ask an administrator.")
     _validate_target(body)
+    # A measurement only describes the frequency and mode it was taken on.
+    retuned = (body.frequency_hz, body.modulation) != (target.frequency_hz, target.modulation)
+    cleared = list(db.scalars(select(SdrProfile).where(SdrProfile.target_id == target_id))) if retuned else []
+    for profile in cleared:
+        db.delete(profile)
     for key, value in body.model_dump().items():
         setattr(target, key, value)
     db.commit()
-    ctx.audit("target.updated", user=user, ip=ip_of(request), target=target.name)
+    ctx.audit("target.updated", user=user, ip=ip_of(request), target=target.name,
+              details={"profiles_cleared": len(cleared)} if cleared else None)
     ctx.kick()
-    return _target_view(target)
+    return {**_target_view(target), "profiles_cleared": len(cleared)}
 
 
 @router.delete("/targets/{target_id}")
@@ -340,6 +363,94 @@ def unlock_source(source_id: int, request: Request, admin: User = Depends(admin_
         db.commit()
     ctx.audit("source.unlocked", user=admin, ip=ip_of(request), target=str(source_id))
     return {"detail": "Unlocked"}
+
+
+# --- noise measurement and saved profiles -----------------------------------
+def _source_and_audio_target(db, source_id: int, target_id: int) -> tuple[Source, Target]:
+    source, target = db.get(Source, source_id), db.get(Target, target_id)
+    if source is None or target is None:
+        raise HTTPException(404, "Source or target not found")
+    if target.kind != "audio":
+        raise HTTPException(422, "Only audio targets use squelch")
+    return source, target
+
+
+def _refuse_if_locked(db, user: User, source_id: int) -> None:
+    """Measuring interrupts recording and a profile changes it, so a lock must cover both."""
+    locked = db.scalar(select(Recorder.id).where(Recorder.source_id == source_id, Recorder.lock_hash.is_not(None)))
+    if locked and user.role != "admin":
+        raise HTTPException(403, "A locked recorder uses this source. Ask an administrator.")
+
+
+class MeasureBody(BaseModel):
+    target_id: int
+    gain_db: float | None = Field(default=None, ge=0, le=60)
+
+
+@router.post("/sources/{source_id}/measure")
+async def measure_source(source_id: int, body: MeasureBody, request: Request, user: User = Depends(require("assign")), db=Depends(get_db)):
+    """Read the noise on a target's frequency. Pauses this SDR's recording for a few seconds."""
+    ctx = ctx_of(request)
+    source, target = _source_and_audio_target(db, source_id, body.target_id)
+    _refuse_if_locked(db, user, source_id)
+    node = db.get(Node, source.node_id)
+    if node is None or not ctx.node_online(node):
+        raise HTTPException(409, "That node is offline.")
+    key = f"measure:{user.id}"
+    if ctx.limiter.blocked(key, MEASURE_LIMIT, MEASURE_WINDOW):
+        raise HTTPException(429, "Too many measurements. Try again later.")
+    ctx.limiter.hit(key, MEASURE_WINDOW)
+    measure_request = {
+        "frequency_hz": target.frequency_hz, "modulation": target.modulation,
+        "gain_db": body.gain_db, "ppm": source.ppm,
+    }
+    names = {"target": source.name, "details": {"target": target.name, "gain_db": body.gain_db}}
+    db.commit()  # ends the read transaction: the reading takes seconds
+    ctx.audit("source.measured", user=user, ip=ip_of(request), **names)
+    try:
+        result = await ctx.measure(node, source.serial, measure_request)
+    except MeasureError as exc:
+        raise HTTPException(409, str(exc)) from None
+    return {**result, "gain_db": body.gain_db}
+
+
+class ProfileBody(BaseModel):
+    squelch: int = Field(ge=0, le=100000)
+    gain_db: float | None = Field(default=None, ge=0, le=60)
+    noise_level: float | None = Field(default=None, ge=0, le=100000)
+
+
+@router.put("/sources/{source_id}/profiles/{target_id}")
+def save_profile(source_id: int, target_id: int, body: ProfileBody, request: Request, user: User = Depends(require("assign")), db=Depends(get_db)):
+    ctx = ctx_of(request)
+    source, target = _source_and_audio_target(db, source_id, target_id)
+    _refuse_if_locked(db, user, source_id)
+    profile = db.scalar(select(SdrProfile).where(SdrProfile.source_id == source_id, SdrProfile.target_id == target_id))
+    if profile is None:
+        profile = SdrProfile(source_id=source_id, target_id=target_id)
+        db.add(profile)
+    profile.squelch, profile.gain_db, profile.noise_level = body.squelch, body.gain_db, body.noise_level
+    profile.measured_at = time.time() if body.noise_level is not None else None
+    profile.updated_by = user.email
+    db.commit()
+    ctx.audit("profile.saved", user=user, ip=ip_of(request), target=source.name,
+              details={"target": target.name, "squelch": body.squelch, "gain_db": body.gain_db})
+    ctx.kick()
+    return _profile_view(profile)
+
+
+@router.delete("/sources/{source_id}/profiles/{target_id}")
+def delete_profile(source_id: int, target_id: int, request: Request, user: User = Depends(require("assign")), db=Depends(get_db)):
+    ctx = ctx_of(request)
+    _refuse_if_locked(db, user, source_id)
+    profile = db.scalar(select(SdrProfile).where(SdrProfile.source_id == source_id, SdrProfile.target_id == target_id))
+    if profile is None:
+        raise HTTPException(404, "Profile not found")
+    db.delete(profile)
+    db.commit()
+    ctx.audit("profile.deleted", user=user, ip=ip_of(request), target=str(source_id), details={"target_id": target_id})
+    ctx.kick()
+    return {"detail": "Deleted"}
 
 
 # --- scheduled recorders ---------------------------------------------------

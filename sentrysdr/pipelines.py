@@ -126,6 +126,37 @@ def suggest_squelch(levels: list[float]) -> int:
     return math.ceil(levels[len(levels) // 10] * SQUELCH_MARGIN)
 
 
+def measure_summary(levels: list[float]) -> dict:
+    low, typical, high = levels[len(levels) // 10], levels[len(levels) // 2], levels[-1]
+    return {
+        "low": round(low), "typical": round(typical), "high": round(high),
+        "suggested": suggest_squelch(levels),
+        "moved": high > low * 2,  # something probably transmitted during the reading
+    }
+
+
+def sanitize_measure(request: dict) -> dict:
+    """Validate a measure request. On a slave it arrives over the network."""
+    try:
+        clean = {
+            "frequency_hz": int(request["frequency_hz"]),
+            "modulation": str(request["modulation"]),
+            "gain_db": None if request.get("gain_db") is None else float(request["gain_db"]),
+            "ppm": int(request.get("ppm", 0)),
+        }
+    except (KeyError, TypeError, ValueError) as exc:
+        raise SpecError(f"bad measure request: {exc}") from exc
+    if clean["modulation"] not in ANALOG | set(DIGITAL):
+        raise SpecError("bad modulation")
+    if not FREQ_MIN_HZ <= clean["frequency_hz"] <= FREQ_MAX_HZ:
+        raise SpecError("frequency out of range")
+    if not -500 <= clean["ppm"] <= 500:
+        raise SpecError("ppm out of range")
+    if clean["gain_db"] is not None and not 0 <= clean["gain_db"] <= 60:
+        raise SpecError("gain out of range")
+    return clean
+
+
 def dsd_args(cfg: Config, spec: dict) -> list[str]:
     return [cfg.binary("dsd-fme") or "dsd-fme", "-i", "-", "-o", "-", DIGITAL[spec["modulation"]]]
 

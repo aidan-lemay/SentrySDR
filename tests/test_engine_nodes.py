@@ -591,3 +591,130 @@ def test_measure_explains_a_busy_sdr(tmp_path, monkeypatch, capsys):
     assert cmd_measure(cfg, "SER1", 444.85, "nfm", None, 0, 1.0) == 1
     err = capsys.readouterr().err
     assert "clear it or stop the service" in err and "usb_claim_interface" in err
+
+
+# --- measuring pauses a worker and hands the SDR back ----------------------------
+# Raw mode gets constant noise. Anything else stays open, like a squelch on a live call.
+FAKE_MODES = """\
+#!/usr/bin/env python3
+import sys, time
+if "raw" in sys.argv:
+    for _ in range(200):
+        sys.stdout.buffer.write(b"\\x40\\x00\\xc0\\xff" * 800); sys.stdout.flush(); time.sleep(0.02)
+    sys.exit(0)
+for _ in range(1000):
+    sys.stdout.buffer.write(b"\\x10\\x00" * 800); sys.stdout.flush(); time.sleep(0.05)
+"""
+MEASURE = {"frequency_hz": 441_000_000, "modulation": "nfm", "gain_db": 19.2, "ppm": 0}
+
+
+def measuring_sup(tmp_path, monkeypatch, tool=FAKE_MODES):
+    monkeypatch.setattr(engine, "MEASURE_SECONDS", 1.2)
+    bins = tmp_path / "bin"
+    install_tool(bins, "rtl_fm", tool)
+    calls, statuses = [], {}
+    return supervisor(make_config(tmp_path, bin_dirs=[bins]), calls, statuses=statuses), calls, statuses
+
+
+async def test_measure_saves_the_call_then_resumes_the_assignment(tmp_path, monkeypatch):
+    sup, calls, statuses = measuring_sup(tmp_path, monkeypatch)
+    try:
+        await sup.apply({"SER1": spec()})
+        assert await wait_for(lambda: statuses.get("SER1") and statuses["SER1"][-1]["in_call"])
+        await asyncio.sleep(0.8)
+        result = await sup.measure("SER1", **MEASURE)
+        assert result["typical"] == 64 and result["suggested"] == 103 and result["moved"] is False
+        assert "measuring" in [s["state"] for s in statuses["SER1"]]
+        assert len(calls) == 1  # the interrupted call was kept
+        assert await wait_for(lambda: statuses["SER1"][-1]["state"] == "listening" and statuses["SER1"][-1]["in_call"])
+    finally:
+        await sup.shutdown()
+
+
+async def test_measure_leaves_an_unassigned_sdr_idle(tmp_path, monkeypatch):
+    sup, _, statuses = measuring_sup(tmp_path, monkeypatch)
+    try:
+        await sup.measure("SER1", **MEASURE)
+        assert statuses["SER1"][-1]["state"] == "idle" and sup.workers["SER1"].task is None
+    finally:
+        await sup.shutdown()
+
+
+async def test_assignment_changing_during_a_measurement_waits_for_it(tmp_path, monkeypatch):
+    sup, _, statuses = measuring_sup(tmp_path, monkeypatch)
+    try:
+        running = asyncio.create_task(sup.measure("SER1", **MEASURE))
+        assert await wait_for(lambda: sup.workers["SER1"].measuring)
+        await sup.apply({"SER1": spec(frequency_hz=444_850_000)})
+        assert sup.workers["SER1"].task is None  # nothing else may open the stick yet
+        await running
+        assert sup.workers["SER1"].spec["frequency_hz"] == 444_850_000
+        assert await wait_for(lambda: statuses["SER1"][-1]["state"] == "listening")
+    finally:
+        await sup.shutdown()
+
+
+async def test_measuring_twice_at_once_is_refused(tmp_path, monkeypatch):
+    sup, _, _ = measuring_sup(tmp_path, monkeypatch)
+    try:
+        running = asyncio.create_task(sup.measure("SER1", **MEASURE))
+        assert await wait_for(lambda: sup.workers["SER1"].measuring)
+        with pytest.raises(engine.MeasureError, match="already"):
+            await sup.measure("SER1", **MEASURE)
+        await running
+    finally:
+        await sup.shutdown()
+
+
+async def test_measure_retries_while_the_stick_is_released(tmp_path, monkeypatch):
+    marker = tmp_path / "tried"
+    tool = FAKE_MODES.replace('if "raw" in sys.argv:', f"""import os
+if not os.path.exists({str(marker)!r}):
+    open({str(marker)!r}, "w").close()
+    sys.stderr.write("usb_claim_interface error\\n")
+    sys.exit(1)
+if "raw" in sys.argv:""")
+    sup, _, _ = measuring_sup(tmp_path, monkeypatch, tool)
+    try:
+        assert (await sup.measure("SER1", **MEASURE))["typical"] == 64
+    finally:
+        await sup.shutdown()
+
+
+async def test_measure_reports_why_it_failed_and_recovers(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "MEASURE_ATTEMPTS", 2)
+    tool = "#!/bin/sh\nif echo \"$*\" | grep -q raw; then echo 'usb_claim_interface error -6' >&2; exit 1; fi\nsleep 60\n"
+    sup, _, statuses = measuring_sup(tmp_path, monkeypatch, tool)
+    try:
+        await sup.apply({"SER1": spec()})
+        assert await wait_for(lambda: statuses.get("SER1") and statuses["SER1"][-1]["state"] == "listening")
+        with pytest.raises(engine.MeasureError, match="usb_claim_interface"):
+            await sup.measure("SER1", **MEASURE)
+        assert await wait_for(lambda: statuses["SER1"][-1]["state"] == "listening")
+    finally:
+        await sup.shutdown()
+
+
+async def test_measure_refuses_a_serial_the_node_does_not_own(tmp_path, monkeypatch):
+    sup, _, _ = measuring_sup(tmp_path, monkeypatch)
+    with pytest.raises(engine.MeasureError, match="sdr.serials"):
+        await sup.measure("NOT-MINE", **MEASURE)
+
+
+async def test_slave_answers_a_measure_request_and_rejects_bad_ones(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "MEASURE_SECONDS", 1.2)
+    bins = tmp_path / "bin"
+    install_tool(bins, "rtl_fm", FAKE_MODES)
+    cfg = make_config(tmp_path, role="slave", master_url="https://sentry.example.com", bin_dirs=[bins], serials=["FIELD1"])
+    slave = Slave(cfg, enumerate_fn=lambda: ["FIELD1"])
+    slave.outgoing = asyncio.Queue()
+    try:
+        await slave.handle_message({"t": "measure", "id": "a1", "serial": "FIELD1", **MEASURE})
+        reply = json.loads(await asyncio.wait_for(slave.outgoing.get(), 15))
+        assert reply["t"] == "measure_result" and reply["id"] == "a1" and reply["ok"] and reply["result"]["typical"] == 64
+        for bad in ({"serial": "OTHER", **MEASURE}, {"serial": "FIELD1", **MEASURE, "modulation": "x; rm"}):
+            await slave.handle_message({"t": "measure", "id": "a2", **bad})
+            reply = json.loads(await asyncio.wait_for(slave.outgoing.get(), 15))
+            assert reply["ok"] is False and reply["error"]
+    finally:
+        await slave.supervisor.shutdown()

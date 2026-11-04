@@ -189,6 +189,9 @@ class NodeLink:
     def request_live(self, serial: str, on: bool) -> None:
         self._queue({"t": "live", "serial": serial, "on": on})
 
+    def request_measure(self, request_id: str, serial: str, request: dict) -> None:
+        self._queue({"t": "measure", "id": request_id, "serial": serial, **request})
+
     def _queue(self, message: dict) -> None:
         try:
             self.outbox.put_nowait(json.dumps(message))
@@ -237,6 +240,8 @@ def handle_agent_message(ctx: Context, node_id: int, allowed: list[str], message
                     "in_call": bool(status.get("in_call")), "call_started": status.get("call_started"),
                     "last_call_at": status.get("last_call_at"),
                 })
+    elif kind == "measure_result":
+        ctx.finish_measure(node_id, message)
     elif kind == "tracks":
         serial, track_kind = message.get("serial"), message.get("kind")
         if serial in allowed and track_kind in ("adsb", "ais") and isinstance(message.get("data"), dict):
