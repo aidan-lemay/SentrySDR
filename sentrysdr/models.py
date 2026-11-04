@@ -106,6 +106,7 @@ class Target(Base):
     frequency_hz: Mapped[int] = mapped_column()
     modulation: Mapped[str] = mapped_column(String(12), default="nfm")
     squelch: Mapped[int] = mapped_column(default=50)  # 0 = continuous recording
+    volume_db: Mapped[float | None] = mapped_column(nullable=True)  # applied to the audio
     clearcut_enabled: Mapped[bool] = mapped_column(default=False)
     clearcut_system: Mapped[str | None] = mapped_column(String(64), nullable=True)
     clearcut_id: Mapped[int | None] = mapped_column(nullable=True)  # talkgroup number

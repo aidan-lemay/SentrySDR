@@ -25,6 +25,8 @@ FREQ_MIN_HZ = 500_000
 FREQ_MAX_HZ = 2_200_000_000
 # rtl_fm checks far shorter blocks than a measurement, so noise peaks above its average.
 SQUELCH_MARGIN = 1.6
+VOLUME_MIN_DB = -20.0
+VOLUME_MAX_DB = 30.0
 
 
 class SpecError(ValueError):
@@ -47,9 +49,12 @@ def sanitize_spec(spec: dict) -> dict:
             "squelch": int(spec.get("squelch", 0)),
             "gain_db": None if spec.get("gain_db") is None else float(spec["gain_db"]),
             "ppm": int(spec.get("ppm", 0)),
+            "volume_db": float(spec.get("volume_db") or 0),
         }
     except (KeyError, TypeError, ValueError) as exc:
         raise SpecError(f"bad assignment: {exc}") from exc
+    if not VOLUME_MIN_DB <= clean["volume_db"] <= VOLUME_MAX_DB:
+        raise SpecError("volume out of range")
     if clean["kind"] not in ("audio", "adsb", "ais"):
         raise SpecError("bad kind")
     if clean["modulation"] not in MODULATIONS:

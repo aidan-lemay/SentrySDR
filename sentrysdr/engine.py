@@ -103,6 +103,40 @@ class PcmFramer:
         return mixed.tobytes()
 
 
+class VolumeControl:
+    """Scale 16-bit audio. At 0 dB it passes the audio through untouched.
+
+    A tuning offset puts a large DC step on each call, and scaling that would clip the
+    voice for the first seconds, so a boost also removes DC. Peaks limit at full scale.
+    """
+
+    DC_POLE = 0.995  # about 13 Hz at 16 kHz, well below voice
+
+    def __init__(self):
+        self.previous_in = 0.0
+        self.previous_out = 0.0
+
+    def __call__(self, chunk: bytes, db: float) -> bytes:
+        if not db:
+            self.previous_in = self.previous_out = 0.0
+            return chunk
+        samples = array("h")
+        samples.frombytes(chunk)
+        if sys.byteorder == "big":
+            samples.byteswap()
+        factor = 10 ** (db / 20)
+        previous_in, previous_out, pole = self.previous_in, self.previous_out, self.DC_POLE
+        for index, value in enumerate(samples):
+            previous_out = value - previous_in + pole * previous_out
+            previous_in = value
+            scaled = int(previous_out * factor)
+            samples[index] = 32767 if scaled > 32767 else -32768 if scaled < -32768 else scaled
+        self.previous_in, self.previous_out = previous_in, previous_out
+        if sys.byteorder == "big":
+            samples.byteswap()
+        return samples.tobytes()
+
+
 class CallWriter:
     """Accumulates PCM for one call, then encodes it to MP3."""
 
@@ -303,6 +337,7 @@ class Worker:
         cfg = self.cfg
         rate = pipelines.pcm_rate(spec)
         framer = PcmFramer(pipelines.pcm_channels(spec))
+        volume = VolumeControl()
         digital = spec["modulation"] in pipelines.DIGITAL
         tail: list[str] = []
         procs: list[asyncio.subprocess.Process] = []
@@ -352,6 +387,8 @@ class Worker:
                 chunk = framer(chunk)
                 if not chunk:
                     continue
+                # Read each time: changing a target's volume needs no retune.
+                chunk = volume(chunk, (self.spec or spec).get("volume_db", 0))
                 if writer is None:
                     writer = CallWriter(cfg, self.spec or spec, self.serial, rate, self.sup.tmp_dir, self.sup.call_sink)
                     self.in_call, self.call_started = True, writer.started_at

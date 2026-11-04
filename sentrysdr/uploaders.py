@@ -159,8 +159,12 @@ async def send_broadcastify(cfg, client: httpx.AsyncClient, server: str, system_
             raise UploadRejected(f"Rejected by Broadcastify: {_clean_reply(reply, api_key)}")
         if code != "0":
             raise UploadError(f"Broadcastify replied: {_clean_reply(f'{code} {reply}', api_key)}")
-        parts = urlsplit(reply.strip())
-        if parts.scheme != "https" or not parts.hostname:
+        try:
+            parts = urlsplit(reply.strip())
+            usable = parts.scheme == "https" and bool(parts.hostname)
+        except ValueError:
+            usable = False
+        if not usable:
             raise UploadError("Broadcastify didn't return a usable upload address")
         upload = await client.put(reply.strip(), content=m4a.read_bytes(), headers={"Content-Type": "audio/aac"})
     if not 200 <= upload.status_code < 300:

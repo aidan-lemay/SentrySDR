@@ -97,6 +97,8 @@ With nothing else running, `sentrysdr measure --serial <serial> --mhz 444.85 --m
 
 Set server URLs and keys in **Admin > Settings**, then enable uploads per target. Failed uploads retry with increasing delays, up to 12 attempts.
 
+A target's **Volume** setting applies to its recordings, uploads and live audio. It doesn't affect squelch. Any setting other than 0 dB also removes DC, which stops a tuning offset from clipping the start of a call.
+
 ### Broadcastify Calls
 
 Replaces trunk-recorder's `broadcastify_uploader` for conventional channels. Broadcastify must already have approved your node: apply at broadcastify.com/apply/calls, and each frequency needs a matching RadioReference entry.
@@ -104,7 +106,13 @@ Replaces trunk-recorder's `broadcastify_uploader` for conventional channels. Bro
 1. In **Admin > Settings > Broadcastify Calls systems**, add each node's name, system ID and API key, then select **Check credentials**. This sends no call.
 2. On each target, turn on **Upload calls to Broadcastify Calls**, then choose the system and the frequency's slot. Slots are on Broadcastify's Manage Calls Systems page, under Node Frequencies.
 
-All uploads go from the master, including calls recorded on slaves. A call Broadcastify skips counts as finished, and a call it rejects is not retried. The reason shows on the recording. Stop any other uploader on the same slot before you switch.
+All uploads go from the master, including calls recorded on slaves. A call Broadcastify skips counts as finished, and a call it rejects is not retried. The reason shows on the recording, and other calls keep uploading. Stop any other uploader on the same slot before you switch.
+
+### Duplicate channels
+
+- A Broadcastify slot can only belong to one target, and saving a second is refused.
+- Saving a target with the same frequency and mode as another, or giving an SDR a channel that another SDR can also record, shows a warning.
+- If two SDRs do record the same target at once, both recordings are kept, but only the first copy of each call is uploaded. The other shows as skipped.
 
 ### ClearCut transcripts
 

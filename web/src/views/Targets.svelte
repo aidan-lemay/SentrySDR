@@ -3,7 +3,7 @@
   import { api, formatMHz, MODULATIONS } from '../lib.js';
 
   const blank = () => ({
-    id: null, name: '', kind: 'audio', mhz: '', modulation: 'nfm', squelch: 50,
+    id: null, name: '', kind: 'audio', mhz: '', modulation: 'nfm', squelch: 50, volume_db: 0,
     clearcut_enabled: false, clearcut_system: '', clearcut_id: '', rdio_enabled: false, rdio_system: '', rdio_talkgroup: '',
     broadcastify_enabled: false, broadcastify_system_ref: '', broadcastify_slot: '',
   });
@@ -37,7 +37,7 @@
       name: form.name, kind: form.kind,
       frequency_hz: Math.round(Number(fixed ? fixed.mhz : form.mhz) * 1e6),
       modulation: fixed ? fixed.modulation : form.modulation,
-      squelch: Number(form.squelch),
+      squelch: Number(form.squelch), volume_db: Number(form.volume_db || 0),
       clearcut_enabled: form.clearcut_enabled, clearcut_system: form.clearcut_system || null, clearcut_id: optionalInt(form.clearcut_id),
       rdio_enabled: form.rdio_enabled, rdio_system: optionalInt(form.rdio_system), rdio_talkgroup: optionalInt(form.rdio_talkgroup),
       broadcastify_enabled: Boolean(form.broadcastify_enabled), broadcastify_system_ref: optionalInt(form.broadcastify_system_ref), broadcastify_slot: optionalInt(form.broadcastify_slot),
@@ -46,7 +46,7 @@
       const saved = form.id ? await api(`targets/${form.id}`, { method: 'PUT', body }) : await api('targets', { method: 'POST', body });
       message = saved.profiles_cleared
         ? `Target saved. Its frequency or mode changed, so ${saved.profiles_cleared} saved SDR profile(s) were removed. Measure again on the Sources page.`
-        : 'Target saved.';
+        : saved.warning ?? 'Target saved.';
       form = blank();
       await refresh();
     } catch (failure) {
@@ -58,7 +58,7 @@
     form = {
       ...blank(), ...target, mhz: target.frequency_hz / 1e6,
       clearcut_system: target.clearcut_system ?? '', clearcut_id: target.clearcut_id ?? '',
-      rdio_system: target.rdio_system ?? '', rdio_talkgroup: target.rdio_talkgroup ?? '',
+      rdio_system: target.rdio_system ?? '', rdio_talkgroup: target.rdio_talkgroup ?? '', volume_db: target.volume_db ?? 0,
       broadcastify_enabled: Boolean(target.broadcastify_enabled), broadcastify_system_ref: target.broadcastify_system_ref ?? '', broadcastify_slot: target.broadcastify_slot ?? '',
     };
     document.getElementById('target-form')?.scrollIntoView();
@@ -126,6 +126,10 @@
       <label class="field"><span>Squelch level</span>
         <input class="mono" type="number" inputmode="numeric" min="0" max="100000" bind:value={form.squelch} />
         <span class="hint">Used on any SDR without a saved profile for this target. Must sit above the noise, so measure each SDR on the Sources page. 0 records all the time.</span>
+      </label>
+      <label class="field"><span>Volume (dB)</span>
+        <input class="mono" type="number" inputmode="decimal" min="-20" max="30" step="1" bind:value={form.volume_db} />
+        <span class="hint">Applies to recordings, uploads and live audio, on any SDR. 0 leaves the audio unchanged. Too much boost clips loud voices.</span>
       </label>
       <div class="field"><span>ClearCut</span><label class="tick"><input type="checkbox" bind:checked={form.clearcut_enabled} /> Upload calls to ClearCut</label></div>
       {#if form.clearcut_enabled}

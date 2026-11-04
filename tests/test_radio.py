@@ -16,7 +16,8 @@ import pytest
 from sqlalchemy import select
 
 from sentrysdr import pipelines, schedule, sdr, uploaders
-from sentrysdr.engine import MeasureError, merge_ais_message
+from sentrysdr.context import UPLOAD_MAX_ATTEMPTS
+from sentrysdr.engine import MeasureError, VolumeControl, merge_ais_message
 from sentrysdr.models import BroadcastifySystem, Recording, SdrProfile, Target, UploadJob, make_session_factory
 
 from .conftest import ADMIN_EMAIL, PASSWORD, add_user, client_for
@@ -1075,3 +1076,237 @@ def test_a_database_from_before_broadcastify_upgrades_and_keeps_its_targets(tmp_
         assert target.name == "Old" and not target.broadcastify_enabled and target.broadcastify_slot is None
         session.add(BroadcastifySystem(name="n", system_id=1, api_key_sealed="x"))
         session.commit()
+
+
+# --- one bad call must not stop the others -----------------------------------
+async def run_replies(ctx, replies):
+    answers = iter(replies)
+
+    def handler(request):
+        request.read()
+        if request.method == "PUT":
+            return httpx.Response(200)
+        reply = next(answers)
+        if isinstance(reply, Exception):
+            raise reply
+        return httpx.Response(200, text=reply)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        return await ctx.process_uploads(client)
+
+
+@pytest.mark.parametrize("bad", [
+    "1 REJECTED-CALL-SKEW", "0 https://[bad-address", "garbage", "", "\x00\xff", RuntimeError("anything"), ValueError("anything"),
+])
+async def test_a_bad_reply_never_holds_up_the_next_call(admin, ctx, tmp_path, bad):
+    _, target = bcfy_target(admin)
+    first = bcfy_recording(ctx, target, tmp_path, started=1_800_000_000.0)
+    second = bcfy_recording(ctx, target, tmp_path, started=1_800_000_100.0)
+    await run_replies(ctx, [bad, f"0 {SIGNED}"])
+    assert bcfy_job(ctx, second).status == "done"
+    job = bcfy_job(ctx, first)
+    assert job.status in ("failed", "pending") and job.last_error and job.attempts == 1
+
+
+async def test_unexpected_errors_stop_retrying_after_the_limit(admin, ctx, tmp_path, monkeypatch):
+    _, target = bcfy_target(admin)
+    call = bcfy_recording(ctx, target, tmp_path)
+
+    async def explode(*args, **kwargs):
+        raise RuntimeError("secret detail https://signed.example.com")
+
+    monkeypatch.setattr(ctx, "_attempt_upload", explode)
+    async with httpx.AsyncClient(transport=bcfy_transport([])) as client:
+        for _ in range(UPLOAD_MAX_ATTEMPTS):
+            with ctx.db() as session:
+                session.get(UploadJob, bcfy_job(ctx, call).id).next_attempt_at = 0
+                session.commit()
+            await ctx.process_uploads(client)
+    job = bcfy_job(ctx, call)
+    assert job.status == "failed" and job.last_error == "Unexpected error: RuntimeError"
+
+
+async def test_a_rejected_call_leaves_the_recording_usable(admin, ctx, tmp_path):
+    _, target = bcfy_target(admin)
+    call = bcfy_recording(ctx, target, tmp_path)
+    await run_replies(ctx, ["1 REJECTED"])
+    assert admin.get(f"/api/recordings/{call}/audio").status_code == 200
+    assert admin.get("/api/recordings").json()["items"][0]["id"] == call
+
+
+# --- duplicate channels -------------------------------------------------------
+def second_slot_body(system, slot=3, frequency=155_000_000, name="Other"):
+    return {"name": name, "frequency_hz": frequency, "modulation": "nfm", "broadcastify_enabled": True,
+            "broadcastify_system_ref": system, "broadcastify_slot": slot}
+
+
+def test_a_slot_can_only_belong_to_one_target(admin):
+    system, target = bcfy_target(admin, slot=3)
+    reply = admin.post("/api/targets", json=second_slot_body(system))
+    assert reply.status_code == 409 and "Fire Dispatch" in reply.json()["detail"]
+    assert admin.post("/api/targets", json=second_slot_body(system, slot=4)).status_code == 201
+    other = admin.post("/api/admin/broadcastify", json={"name": "B", "system_id": 2, "api_key": "k"}).json()["id"]
+    assert admin.post("/api/targets", json=second_slot_body(other, slot=3)).status_code == 201
+
+
+def test_a_target_can_keep_its_own_slot_but_not_take_another(admin):
+    system, target = bcfy_target(admin, slot=3)
+    keep = second_slot_body(system, frequency=154_430_000, name="Fire Dispatch")
+    assert admin.put(f"/api/targets/{target}", json=keep).status_code == 200
+    other = admin.post("/api/targets", json=second_slot_body(system, slot=4)).json()["id"]
+    assert admin.put(f"/api/targets/{other}", json=second_slot_body(system, slot=3)).status_code == 409
+
+
+def test_a_disabled_target_does_not_hold_its_slot(admin):
+    system, target = bcfy_target(admin, slot=3)
+    assert admin.put(f"/api/targets/{target}", json={**second_slot_body(system, frequency=154_430_000), "broadcastify_enabled": False}).status_code == 200
+    assert admin.post("/api/targets", json=second_slot_body(system, name="New")).status_code == 201
+
+
+def test_same_frequency_and_mode_warns_but_saves(admin):
+    body = {"name": "A", "frequency_hz": 441_000_000, "modulation": "nfm"}
+    first = admin.post("/api/targets", json=body).json()
+    assert first["warning"] is None
+    second = admin.post("/api/targets", json={**body, "name": "B"})
+    assert second.status_code == 201 and "A" in second.json()["warning"]
+    assert admin.post("/api/targets", json={**body, "name": "C", "modulation": "am"}).json()["warning"] is None
+    assert admin.put(f"/api/targets/{first['id']}", json={**body, "name": "A", "frequency_hz": 442_000_000}).json()["warning"] is None
+
+
+def test_assigning_a_channel_another_sdr_records_warns(admin, ctx):
+    one = make_source(admin, "SER1", "Stick one")
+    two = make_source(admin, "SER2", "Stick two")
+    target = admin.post("/api/targets", json={"name": "T", "frequency_hz": 441_000_000, "modulation": "nfm"}).json()["id"]
+    assert admin.post(f"/api/sources/{one}/assign", json={"target_id": target}).json()["warning"] is None
+    reply = admin.post(f"/api/sources/{two}/assign", json={"target_id": target})
+    assert reply.status_code == 200 and "Stick one" in reply.json()["warning"]
+    assert admin.post(f"/api/sources/{one}/assign", json={"target_id": target}).json()["warning"]  # names the other stick
+    assert ctx.assignments()[ctx.local_node_id]["SER2"]["target_id"] == target
+
+
+def overlap_call(ctx, target, tmp_path, serial, started, node="local", duration=6.0):
+    wav = tmp_path / f"{uuid.uuid4().hex}.mp3"
+    subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=1", "-ar", "16000", "-ac", "1", str(wav)], check=True)
+    call = uuid.uuid4().hex
+    assert ctx.store_call({
+        "id": call, "target_id": target, "target_name": "T", "serial": serial, "frequency_hz": 154_430_000, "modulation": "nfm",
+        "started_at": started, "ended_at": started + duration, "duration": duration,
+    }, wav, node)
+    return call
+
+
+async def test_only_the_first_sdrs_copy_of_a_call_is_uploaded(admin, ctx, tmp_path):
+    _, target = bcfy_target(admin)
+    first = overlap_call(ctx, target, tmp_path, "SER1", 1_800_000_000.0)
+    second = overlap_call(ctx, target, tmp_path, "SER2", 1_800_000_000.4)
+    from_slave = overlap_call(ctx, target, tmp_path, "SER1", 1_800_000_001.0, node="pi")
+    seen = []
+    await run_bcfy(ctx, seen)
+    assert len([r for r in seen if r.method == "POST"]) == 1
+    assert bcfy_job(ctx, first).last_error == ""
+    for call in (second, from_slave):
+        job = bcfy_job(ctx, call)
+        assert job.status == "done" and job.last_error.startswith("Skipped")
+    assert len(admin.get("/api/recordings").json()["items"]) == 3  # every recording is kept
+
+
+def test_separate_calls_and_the_same_stick_are_never_treated_as_duplicates(admin, ctx, tmp_path):
+    _, target = bcfy_target(admin)
+    calls = [
+        overlap_call(ctx, target, tmp_path, "SER1", 1_800_000_000.0),
+        overlap_call(ctx, target, tmp_path, "SER2", 1_800_000_006.0),  # starts as the last one ends
+        overlap_call(ctx, target, tmp_path, "SER2", 1_800_000_009.0),  # same stick, overlapping
+    ]
+    assert all(bcfy_job(ctx, call).status == "pending" for call in calls)
+
+
+def test_a_different_channel_at_the_same_time_is_not_a_duplicate(admin, ctx, tmp_path):
+    system, one = bcfy_target(admin)
+    two = admin.post("/api/targets", json=second_slot_body(system, slot=4)).json()["id"]
+    overlap_call(ctx, one, tmp_path, "SER1", 1_800_000_000.0)
+    assert bcfy_job(ctx, overlap_call(ctx, two, tmp_path, "SER2", 1_800_000_000.0)).status == "pending"
+
+
+def test_a_skipped_clearcut_copy_is_not_matched_for_a_transcript(admin, ctx, tmp_path):
+    target = admin.post("/api/targets", json={
+        "name": "T", "frequency_hz": 154_430_000, "modulation": "nfm", "clearcut_enabled": True, "clearcut_system": "s", "clearcut_id": 5,
+    }).json()["id"]
+    overlap_call(ctx, target, tmp_path, "SER1", 1_800_000_000.0)
+    second = overlap_call(ctx, target, tmp_path, "SER2", 1_800_000_000.0)
+    with ctx.db() as session:
+        assert session.get(Recording, second).clearcut_system is None
+
+
+# --- volume -------------------------------------------------------------------
+def tone(level, count=8000):
+    return array("h", [level if i % 40 < 20 else -level for i in range(count)])
+
+
+def test_zero_db_leaves_audio_byte_for_byte():
+    chunk = tone(1000).tobytes()
+    assert VolumeControl()(chunk, 0) is chunk
+    assert VolumeControl()(chunk, 0.0) is chunk
+
+
+@pytest.mark.parametrize("db,factor", [(6.0206, 2.0), (12.0412, 4.0), (-6.0206, 0.5)])
+def test_volume_scales_audio(db, factor):
+    out = array("h")
+    out.frombytes(VolumeControl()(tone(1000).tobytes(), db))
+    rms = lambda a: (sum(x * x for x in a) / len(a)) ** 0.5
+    assert rms(out[4000:]) == pytest.approx(rms(tone(1000)[4000:]) * factor, rel=0.05)
+
+
+def test_boost_removes_a_dc_step_instead_of_clipping_it():
+    samples = array("h", [8000 + (500 if i % 40 < 20 else -500) for i in range(16000)])
+    out = array("h")
+    out.frombytes(VolumeControl()(samples.tobytes(), 12))
+    settled = out[2000:]
+    assert abs(sum(settled) / len(settled)) < 100
+    assert max(settled) < 32767 and min(settled) > -32768
+
+
+def test_boost_limits_at_full_scale_without_wrapping():
+    out = array("h")
+    out.frombytes(VolumeControl()(tone(30000).tobytes(), 30))
+    assert max(out) == 32767 and min(out) == -32768
+    assert all(a * b >= 0 or abs(a - b) > 30000 for a, b in zip(out[2000:2019], out[2001:2020]))
+
+
+def test_the_filter_carries_across_chunks():
+    data = tone(1000, 8000).tobytes()
+    whole = VolumeControl()(data, 6)
+    control = VolumeControl()
+    split = control(data[:6000], 6) + control(data[6000:], 6)
+    assert whole == split
+
+
+def test_volume_is_sent_to_the_radio_and_validated(admin, ctx):
+    source = make_source(admin)
+    target = admin.post("/api/targets", json={"name": "T", "frequency_hz": 441_000_000, "modulation": "nfm", "volume_db": 12}).json()
+    admin.post(f"/api/sources/{source}/assign", json={"target_id": target["id"]})
+    assert target["volume_db"] == 12 and ctx.assignments()[ctx.local_node_id]["SER1"]["volume_db"] == 12
+    for bad in (-21, 31):
+        assert admin.post("/api/targets", json={"name": "B", "frequency_hz": 441_000_000, "modulation": "nfm", "volume_db": bad}).status_code == 422
+
+
+@pytest.mark.parametrize("bad", [{"volume_db": 31}, {"volume_db": -21}, {"volume_db": "loud"}, {"volume_db": float("nan")}])
+def test_volume_from_the_network_is_validated(bad):
+    with pytest.raises(pipelines.SpecError):
+        spec(**bad)
+
+
+def test_a_slave_without_volume_in_its_saved_assignment_still_loads():
+    assert spec()["volume_db"] == 0
+    assert spec(volume_db=None)["volume_db"] == 0
+
+
+def test_a_database_from_before_volume_upgrades(tmp_path):
+    db = tmp_path / "old.db"
+    make_session_factory(db)
+    connection = sqlite3.connect(db)
+    connection.execute("INSERT INTO targets (name, kind, frequency_hz, modulation, squelch, clearcut_enabled, rdio_enabled) VALUES ('Old', 'audio', 441000000, 'nfm', 60, 0, 0)")
+    connection.execute("ALTER TABLE targets DROP COLUMN volume_db")
+    connection.commit()
+    connection.close()
+    with make_session_factory(db)() as session:
+        assert session.scalar(select(Target)).volume_db is None
