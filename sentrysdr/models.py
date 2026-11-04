@@ -5,6 +5,7 @@ import time
 from pathlib import Path
 
 from sqlalchemy import JSON, ForeignKey, Index, String, create_engine, event, inspect, text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 
@@ -156,7 +157,7 @@ class Recorder(Base):
     schedule_days: Mapped[list | None] = mapped_column(JSON, nullable=True)  # 0=Mon..6=Sun
     schedule_start: Mapped[str | None] = mapped_column(String(5), nullable=True)  # HH:MM
     schedule_end: Mapped[str | None] = mapped_column(String(5), nullable=True)
-    lock_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    locked: Mapped[bool | None] = mapped_column(nullable=True)  # only admins may change it
     assigned_by: Mapped[str] = mapped_column(String(254), default="")
     assigned_at: Mapped[float] = mapped_column(default=now)
 
@@ -216,6 +217,20 @@ def _add_missing_columns(engine) -> None:
                     connection.execute(text(f'ALTER TABLE "{table.name}" ADD COLUMN "{column.name}" {kind}'))
 
 
+def _retire_lock_passwords(engine) -> None:
+    """Locks used to have passwords. Keep what's locked, but don't keep the hashes."""
+    if "lock_hash" not in {column["name"] for column in inspect(engine).get_columns("recorders")}:
+        return
+    with engine.begin() as connection:
+        connection.execute(text("UPDATE recorders SET locked = 1 WHERE lock_hash IS NOT NULL"))
+        connection.execute(text("UPDATE recorders SET lock_hash = NULL"))
+    try:
+        with engine.begin() as connection:
+            connection.execute(text('ALTER TABLE recorders DROP COLUMN lock_hash'))
+    except OperationalError:
+        pass  # an older SQLite: the column stays, empty and unused
+
+
 def make_session_factory(db_path: Path):
     db_path.parent.mkdir(parents=True, exist_ok=True)
     engine = create_engine(
@@ -233,6 +248,7 @@ def make_session_factory(db_path: Path):
 
     Base.metadata.create_all(engine)
     _add_missing_columns(engine)
+    _retire_lock_passwords(engine)
     try:
         db_path.chmod(0o600)
     except OSError:

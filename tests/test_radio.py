@@ -18,7 +18,7 @@ from sqlalchemy import select
 from sentrysdr import pipelines, schedule, sdr, uploaders
 from sentrysdr.context import UPLOAD_MAX_ATTEMPTS
 from sentrysdr.engine import MeasureError, VolumeControl, merge_ais_message
-from sentrysdr.models import BroadcastifySystem, Recording, SdrProfile, Target, UploadJob, make_session_factory
+from sentrysdr.models import BroadcastifySystem, Node, Recorder, Recording, SdrProfile, Source, Target, UploadJob, make_session_factory
 
 from .conftest import ADMIN_EMAIL, PASSWORD, add_user, client_for
 
@@ -129,62 +129,114 @@ def test_permission_override_grants_listener_assign(ctx, app, admin):
     assert "download" not in client.get("/api/me").json()["permissions"]
 
 
-def test_lock_requires_password_for_users(ctx, admin, operator):
-    source, first, second = make_source(admin), make_target(admin), make_target(admin, "Other", 145_000_000)
-    admin.post(f"/api/sources/{source}/assign", json={"target_id": first})
-    assert admin.post(f"/api/sources/{source}/lock", json={"password": "open-sesame"}).status_code == 200
+def lock(admin, source):
+    assert admin.post(f"/api/sources/{source}/lock").status_code == 200
 
+
+def test_a_locked_assignment_is_admin_only(ctx, admin, operator):
+    source, first, second = make_source(admin), make_target(admin), make_target(admin, "Other", 145_000_000)
     url = f"/api/sources/{source}/assign"
-    assert operator.post(url, json={"target_id": second}).json()["detail"] == "locked"
-    assert operator.post(url, json={"target_id": second, "lock_password": "wrong"}).status_code == 403
+    admin.post(url, json={"target_id": first})
+    lock(admin, source)
+    assert source_row(operator, source)["locked"] is True
+    for body in ({"target_id": second}, {"target_id": None}):
+        reply = operator.post(url, json=body)
+        assert reply.status_code == 403 and "administrator" in reply.json()["detail"]
     assert ctx.assignments()[ctx.local_node_id]["SER1"]["target_id"] == first
-    assert operator.post(url, json={"target_id": second, "lock_password": "open-sesame"}).status_code == 200
+    assert any(e["action"] == "recorder.lock_denied" for e in admin.get("/api/admin/audit").json())
+    assert admin.post(url, json={"target_id": second}).status_code == 200
     assert ctx.assignments()[ctx.local_node_id]["SER1"]["target_id"] == second
+    assert source_row(operator, source)["locked"] is True  # reassigning keeps the lock
 
 
-def test_admin_overrides_lock_without_password(ctx, admin):
+def test_old_clients_cannot_use_a_password_to_get_past_a_lock(admin, operator):
     source, first, second = make_source(admin), make_target(admin), make_target(admin, "Other", 145_000_000)
     admin.post(f"/api/sources/{source}/assign", json={"target_id": first})
-    admin.post(f"/api/sources/{source}/lock", json={"password": "open-sesame"})
-    assert admin.post(f"/api/sources/{source}/assign", json={"target_id": second}).status_code == 200
+    lock(admin, source)
+    reply = operator.post(f"/api/sources/{source}/assign", json={"target_id": second, "lock_password": "anything"})
+    assert reply.status_code == 403
 
 
-def test_lock_password_guessing_rate_limited(admin, operator):
+def test_unlocking_lets_users_change_it_again(ctx, admin, operator):
+    source, first, second = make_source(admin), make_target(admin), make_target(admin, "Other", 145_000_000)
+    url = f"/api/sources/{source}/assign"
+    admin.post(url, json={"target_id": first})
+    lock(admin, source)
+    assert admin.delete(f"/api/sources/{source}/lock").status_code == 200
+    assert source_row(operator, source)["locked"] is False
+    assert operator.post(url, json={"target_id": second}).status_code == 200
+
+
+def test_only_admins_can_lock_or_unlock(admin, operator, listener, app):
     source, target = make_source(admin), make_target(admin)
     admin.post(f"/api/sources/{source}/assign", json={"target_id": target})
-    admin.post(f"/api/sources/{source}/lock", json={"password": "open-sesame"})
-    url = f"/api/sources/{source}/assign"
-    codes = [operator.post(url, json={"target_id": target, "lock_password": f"guess{i}"}).status_code for i in range(9)]
-    assert codes[:8] == [403] * 8 and codes[8] == 429
+    for client in (operator, listener):
+        assert client.post(f"/api/sources/{source}/lock").status_code == 403
+    lock(admin, source)
+    for client in (operator, listener):
+        assert client.delete(f"/api/sources/{source}/lock").status_code == 403
+    assert client_for(app).post(f"/api/sources/{source}/lock").status_code == 401
+    assert source_row(admin, source)["locked"] is True
 
 
-def test_schedule_cannot_bypass_a_lock(admin, operator):
+def test_nothing_to_lock_without_an_assignment(admin):
+    assert admin.post(f"/api/sources/{make_source(admin)}/lock").status_code == 409
+
+
+def test_schedules_cannot_bypass_a_lock(admin, operator):
     source, first, second = make_source(admin), make_target(admin), make_target(admin, "Other", 145_000_000)
+    other = make_source(admin, "SER2", "Other stick")
     admin.post(f"/api/sources/{source}/assign", json={"target_id": first})
-    admin.post(f"/api/sources/{source}/lock", json={"password": "open-sesame"})
     body = {"name": "sneak", "source_id": source, "target_id": second, "schedule_days": [1],
             "schedule_start": "22:00", "schedule_end": "23:00"}
+    existing = admin.post("/api/recorders", json=body).json()["id"]
+    elsewhere = admin.post("/api/recorders", json={**body, "name": "free", "source_id": other}).json()["id"]
+    lock(admin, source)
     assert operator.post("/api/recorders", json=body).status_code == 403
-    assert operator.post("/api/recorders", json={**body, "lock_password": "open-sesame"}).status_code == 201
+    assert operator.put(f"/api/recorders/{existing}", json=body).status_code == 403
+    assert operator.delete(f"/api/recorders/{existing}").status_code == 403
+    assert operator.put(f"/api/recorders/{elsewhere}", json={**body, "source_id": source}).status_code == 403  # moving one in
+    assert operator.put(f"/api/recorders/{existing}", json={**body, "source_id": other}).status_code == 403  # moving one out
+    assert admin.delete(f"/api/recorders/{existing}").status_code == 200
 
 
 def test_editing_target_cannot_retune_a_locked_recorder(admin, operator):
     source, target = make_source(admin), make_target(admin)
     admin.post(f"/api/sources/{source}/assign", json={"target_id": target})
-    admin.post(f"/api/sources/{source}/lock", json={"password": "open-sesame"})
+    lock(admin, source)
     body = {"name": "K1ABC", "frequency_hz": 146_520_000}
     assert operator.put(f"/api/targets/{target}", json=body).status_code == 403
     assert operator.delete(f"/api/targets/{target}").status_code == 403
     assert admin.put(f"/api/targets/{target}", json=body).status_code == 200
 
 
-def test_lock_hash_never_exposed(admin, listener):
-    source, target = make_source(admin), make_target(admin)
-    admin.post(f"/api/sources/{source}/assign", json={"target_id": target})
-    admin.post(f"/api/sources/{source}/lock", json={"password": "open-sesame"})
-    for path in ("/api/sources", "/api/recorders"):
-        assert "argon2" not in listener.get(path).text
-    assert source_row(listener, source)["locked"] is True
+def test_old_lock_passwords_become_plain_locks_and_are_deleted(tmp_path):
+    db = tmp_path / "old.db"
+    with make_session_factory(db)() as session:
+        session.add(Node(name="n"))
+        session.flush()
+        node = session.scalar(select(Node)).id
+        session.add(Source(node_id=node, serial="S", name="S"))
+        session.add(Target(name="T", frequency_hz=441_000_000))
+        session.commit()
+    connection = sqlite3.connect(db)
+    connection.execute("ALTER TABLE recorders DROP COLUMN locked")
+    connection.execute("ALTER TABLE recorders ADD COLUMN lock_hash VARCHAR(255)")
+    for name, lock_hash in (("locked", "$argon2id$secret-hash"), ("open", None)):
+        connection.execute(
+            "INSERT INTO recorders (name, source_id, target_id, enabled, assigned_by, assigned_at, lock_hash) VALUES (?, 1, 1, 1, '', 0, ?)",
+            (name, lock_hash),
+        )
+    connection.commit()
+    connection.close()
+    for _ in range(2):  # a second start must change nothing
+        with make_session_factory(db)() as session:
+            found = {r.name: bool(r.locked) for r in session.scalars(select(Recorder))}
+        assert found == {"locked": True, "open": False}
+    connection = sqlite3.connect(db)
+    columns = [row[1] for row in connection.execute("PRAGMA table_info(recorders)")]
+    connection.close()
+    assert "lock_hash" not in columns and "locked" in columns
 
 
 def test_out_of_range_target_warns(admin):
@@ -781,7 +833,7 @@ def test_a_lock_covers_measuring_and_profiles_for_everyone_but_admins(admin, ctx
     source, target = local_setup(admin, ctx)
     admin.post(f"/api/sources/{source}/assign", json={"target_id": target})
     admin.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": 98})
-    admin.post(f"/api/sources/{source}/lock", json={"password": "secret-lock"})
+    lock(admin, source)
     calls = fake_supervisor(ctx)
     add_user(ctx, "op@example.com", role="operator")
     operator = client_for(app, "op@example.com")

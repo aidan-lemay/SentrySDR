@@ -4,7 +4,7 @@
 
   let { user } = $props();
   const canEdit = user.permissions.includes('assign');
-  const blank = () => ({ id: null, name: '', source_id: '', target_id: '', days: [], start: '22:00', end: '23:00', enabled: true, lock_password: '' });
+  const blank = () => ({ id: null, name: '', source_id: '', target_id: '', days: [], start: '22:00', end: '23:00', enabled: true });
 
   let recorders = $state([]);
   let sources = $state([]);
@@ -38,7 +38,6 @@
     const body = {
       name: form.name, source_id: Number(form.source_id), target_id: Number(form.target_id), enabled: form.enabled,
       schedule_days: form.days, schedule_start: form.start, schedule_end: form.end,
-      lock_password: form.lock_password || null,
     };
     try {
       const reply = form.id
@@ -48,7 +47,7 @@
       form = blank();
       await refresh();
     } catch (failure) {
-      error = failure.detail === 'locked' ? 'This source is locked. Enter its lock password.' : failure.message;
+      error = failure.message;
     }
   }
 
@@ -56,7 +55,7 @@
     form = {
       id: recorder.id, name: recorder.name, source_id: recorder.source_id, target_id: recorder.target_id,
       days: [...recorder.schedule_days], start: recorder.schedule_start, end: recorder.schedule_end,
-      enabled: recorder.enabled, lock_password: '',
+      enabled: recorder.enabled,
     };
     document.getElementById('schedule-form')?.scrollIntoView();
   }
@@ -65,13 +64,10 @@
     if (!confirm(`Remove the schedule ${recorder.name}?`)) return;
     error = '';
     try {
-      await api(`recorders/${recorder.id}`, {
-        method: 'DELETE',
-        headers: form.lock_password ? { 'X-Lock-Password': form.lock_password } : {},
-      });
+      await api(`recorders/${recorder.id}`, { method: 'DELETE' });
       await refresh();
     } catch (failure) {
-      error = failure.detail === 'locked' ? 'This source is locked. Enter its lock password in the form below, then remove it again.' : failure.message;
+      error = failure.message;
     }
   }
 
@@ -162,11 +158,9 @@
         <span>Enabled</span>
         <label class="tick"><input type="checkbox" bind:checked={form.enabled} /> Run this schedule</label>
       </div>
-      {#if selectedLocked}
-        <label class="field"><span>Lock password</span><input type="password" bind:value={form.lock_password} autocomplete="off" /></label>
-      {/if}
+      {#if selectedLocked}<p class="small st-warn">This source's assignment is locked. Only an administrator can change its schedule.</p>{/if}
       <div class="buttons form-buttons">
-        <button class="main" disabled={!form.days.length}>Save</button>
+        <button class="main" disabled={!form.days.length || selectedLocked}>Save</button>
         {#if form.id}<button type="button" onclick={() => (form = blank())}>Cancel</button>{/if}
       </div>
     </fieldset>

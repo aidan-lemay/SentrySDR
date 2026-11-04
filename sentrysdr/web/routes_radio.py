@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 
-from .. import pipelines, schedule, security
+from .. import pipelines, schedule
 from ..config import SERIAL_RE
 from ..context import Context
 from ..engine import MeasureError
@@ -21,8 +21,6 @@ from .deps import admin_user, ctx_of, current_user, get_db, ip_of, require
 
 router = APIRouter(prefix="/api")
 
-LOCK_WINDOW = 900
-LOCK_LIMIT = 8
 MEASURE_LIMIT = 30
 MEASURE_WINDOW = 3600
 LIVE_MAX_TOTAL = 50
@@ -68,7 +66,7 @@ def _source_view(ctx: Context, db, source: Source, winners: dict, recorders: lis
         "state": status.get("state", "offline" if not online else "idle"),
         "error": status.get("error", ""), "in_call": status.get("in_call", False),
         "call_started": status.get("call_started"), "last_call_at": status.get("last_call_at"),
-        "locked": bool(base and base.lock_hash),
+        "locked": bool(base and base.locked),
         "base_recorder_id": base.id if base else None,
         "base_target_id": base.target_id if base else None,
         "assigned_by": base.assigned_by if base else "",
@@ -262,7 +260,7 @@ def create_target(body: TargetBody, request: Request, user: User = Depends(requi
 
 
 def _active_uses_locked(db, target_id: int) -> bool:
-    return bool(db.scalar(select(Recorder.id).where(Recorder.target_id == target_id, Recorder.lock_hash.is_not(None))))
+    return bool(db.scalar(select(Recorder.id).where(Recorder.target_id == target_id, Recorder.locked.is_(True))))
 
 
 @router.put("/targets/{target_id}")
@@ -307,17 +305,15 @@ def delete_target(target_id: int, request: Request, user: User = Depends(require
 
 
 # --- locks -----------------------------------------------------------------
-def _check_lock(ctx: Context, request: Request, user: User, recorder: Recorder | None, password: str | None) -> None:
-    """Admins bypass locks. Everyone else needs the password, rate limited."""
-    if recorder is None or not recorder.lock_hash or user.role == "admin":
+LOCKED_MESSAGE = "This assignment is locked. Only an administrator can change it."
+
+
+def _check_lock(ctx: Context, request: Request, user: User, recorder: Recorder | None) -> None:
+    """Only administrators can change a locked assignment."""
+    if recorder is None or not recorder.locked or user.role == "admin":
         return
-    key = f"lock:{user.id}"
-    if ctx.limiter.blocked(key, LOCK_LIMIT, LOCK_WINDOW):
-        raise HTTPException(429, "Too many attempts. Try again later.")
-    if not password or not security.verify_password(recorder.lock_hash, password):
-        ctx.limiter.hit(key, LOCK_WINDOW)
-        ctx.audit("recorder.lock_denied", user=user, ip=ip_of(request), target=recorder.name)
-        raise HTTPException(403, "locked")
+    ctx.audit("recorder.lock_denied", user=user, ip=ip_of(request), target=recorder.name)
+    raise HTTPException(403, LOCKED_MESSAGE)
 
 
 def _base_for(db, source_id: int) -> Recorder | None:
@@ -358,7 +354,6 @@ def _warnings(db, source: Source, target: Target) -> str | None:
 
 class AssignBody(BaseModel):
     target_id: int | None = None
-    lock_password: str | None = Field(default=None, max_length=256)
 
 
 @router.post("/sources/{source_id}/assign")
@@ -369,7 +364,7 @@ def assign(source_id: int, body: AssignBody, request: Request, user: User = Depe
     if source is None:
         raise HTTPException(404, "Source not found")
     base = _base_for(db, source_id)
-    _check_lock(ctx, request, user, base, body.lock_password)
+    _check_lock(ctx, request, user, base)
     warning = None
     if body.target_id is None:
         if base:
@@ -392,18 +387,14 @@ def assign(source_id: int, body: AssignBody, request: Request, user: User = Depe
     return {"detail": "Assigned", "warning": warning}
 
 
-class LockBody(BaseModel):
-    password: str = Field(min_length=4, max_length=256)
-
-
 @router.post("/sources/{source_id}/lock")
-def lock_source(source_id: int, body: LockBody, request: Request, admin: User = Depends(admin_user), db=Depends(get_db)):
+def lock_source(source_id: int, request: Request, admin: User = Depends(admin_user), db=Depends(get_db)):
     ctx = ctx_of(request)
     source = db.get(Source, source_id)
     base = _base_for(db, source_id)
     if source is None or base is None:
         raise HTTPException(409, "Assign a target before locking this source")
-    base.lock_hash = security.hash_password(body.password)
+    base.locked = True
     db.commit()
     ctx.audit("source.locked", user=admin, ip=ip_of(request), target=source.name)
     return {"detail": "Locked"}
@@ -414,7 +405,7 @@ def unlock_source(source_id: int, request: Request, admin: User = Depends(admin_
     ctx = ctx_of(request)
     base = _base_for(db, source_id)
     if base is not None:
-        base.lock_hash = None
+        base.locked = False
         db.commit()
     ctx.audit("source.unlocked", user=admin, ip=ip_of(request), target=str(source_id))
     return {"detail": "Unlocked"}
@@ -432,7 +423,7 @@ def _source_and_audio_target(db, source_id: int, target_id: int) -> tuple[Source
 
 def _refuse_if_locked(db, user: User, source_id: int) -> None:
     """Measuring interrupts recording and a profile changes it, so a lock must cover both."""
-    locked = db.scalar(select(Recorder.id).where(Recorder.source_id == source_id, Recorder.lock_hash.is_not(None)))
+    locked = db.scalar(select(Recorder.id).where(Recorder.source_id == source_id, Recorder.locked.is_(True)))
     if locked and user.role != "admin":
         raise HTTPException(403, "A locked recorder uses this source. Ask an administrator.")
 
@@ -517,7 +508,6 @@ class RecorderBody(BaseModel):
     schedule_days: list[int] = Field(min_length=1, max_length=7)
     schedule_start: str
     schedule_end: str
-    lock_password: str | None = Field(default=None, max_length=256)
 
 
 def _validate_schedule(body: RecorderBody) -> None:
@@ -550,7 +540,7 @@ def _save_recorder(ctx, request, user, db, body: RecorderBody, recorder: Recorde
     if source is None or target is None:
         raise HTTPException(404, "Source or target not found")
     # A schedule overrides the base assignment, so it must honour that lock too.
-    _check_lock(ctx, request, user, _base_for(db, body.source_id), body.lock_password)
+    _check_lock(ctx, request, user, _base_for(db, body.source_id))
     if recorder is None:
         recorder = Recorder(name=body.name, source_id=source.id, target_id=target.id)
         db.add(recorder)
@@ -581,7 +571,7 @@ def _scheduled_recorder(db, recorder_id: int) -> Recorder:
 def update_recorder(recorder_id: int, body: RecorderBody, request: Request, user: User = Depends(require("assign")), db=Depends(get_db)):
     ctx = ctx_of(request)
     recorder = _scheduled_recorder(db, recorder_id)
-    _check_lock(ctx, request, user, _base_for(db, recorder.source_id), body.lock_password)
+    _check_lock(ctx, request, user, _base_for(db, recorder.source_id))
     return _save_recorder(ctx, request, user, db, body, recorder)
 
 
@@ -590,7 +580,7 @@ def delete_recorder(recorder_id: int, request: Request,
                     user: User = Depends(require("assign")), db=Depends(get_db)):
     ctx = ctx_of(request)
     recorder = _scheduled_recorder(db, recorder_id)
-    _check_lock(ctx, request, user, _base_for(db, recorder.source_id), request.headers.get("x-lock-password"))
+    _check_lock(ctx, request, user, _base_for(db, recorder.source_id))
     name = recorder.name
     db.delete(recorder)
     db.commit()

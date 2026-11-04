@@ -10,6 +10,7 @@ It supervises existing tools instead of reimplementing them: `rtl_fm`, `ffmpeg`,
 - **Master:** holds users and recordings, serves the web UI, runs schedules, and forwards calls to RDIO and ClearCut. By default it listens on loopback only, so publish it through a tunnel or reverse proxy. Direct access by local IP is opt-in.
 - **Slave:** opens no listening ports. It dials out to the master, takes its configuration from the master's UI, and sends everything back. If the link drops, it keeps recording its last assignment and uploads the calls when the link returns.
 - **One target per SDR at a time.** A schedule takes over its source for the window, then the source returns to its assigned target.
+- **Locks.** An administrator can tick **Lock this assignment** on the Sources page. Other users then can't change that SDR's assignment or schedules, its target, or its squelch profiles, and can't measure it. There's no password. Locks set with a password in an older version stay locked, and their passwords are deleted on upgrade.
 - **Recordings stand alone.** Each keeps its own copy of the source and target names, so it stays searchable after that setup is deleted.
 
 ## Install
@@ -152,7 +153,7 @@ The noise level changes a lot with stick, frequency, mode, gain and antenna, so 
 - A profile replaces the target's squelch and the source's gain when that target runs on that SDR. Other SDRs and targets keep their own settings.
 - Changing a target's frequency or mode removes its profiles, because the readings no longer apply.
 - Saving a profile applies straight away if that target is running.
-- Measuring and saving need the `assign` permission. If a recorder on the SDR is locked, only an administrator can do either.
+- Measuring and saving need the `assign` permission. If the SDR's assignment is locked, only an administrator can do either.
 - Master and slaves must run the same version for measuring to work on a slave.
 
 A new source's gain box starts at 40.2 dB. Leave it empty for automatic gain (AGC). 0 is a real 0 dB, not automatic, and may miss most calls. Existing sources keep their setting.
