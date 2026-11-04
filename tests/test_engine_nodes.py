@@ -581,7 +581,7 @@ def test_measure_prints_a_suggestion(tmp_path, monkeypatch, capsys):
     cfg = measure_cfg(tmp_path, FAKE_RAW)
     assert cmd_measure(cfg, "SER1", 444.85, "nfm", None, 0, 1.0) == 0
     out = capsys.readouterr().out
-    assert "typical 64" in out and "Suggested squelch: 103" in out
+    assert "typical 64" in out and "Suggested squelch: 128" in out
 
 
 def test_measure_refuses_an_unlisted_sdr(tmp_path, capsys):
@@ -627,7 +627,7 @@ async def test_measure_saves_the_call_then_resumes_the_assignment(tmp_path, monk
         assert await wait_for(lambda: statuses.get("SER1") and statuses["SER1"][-1]["in_call"])
         await asyncio.sleep(0.8)
         result = await sup.measure("SER1", **MEASURE)
-        assert result["typical"] == 64 and result["suggested"] == 103 and result["moved"] is False
+        assert result["typical"] == 64 and result["suggested"] == 128 and result["moved"] is False
         assert "measuring" in [s["state"] for s in statuses["SER1"]]
         assert len(calls) == 1  # the interrupted call was kept
         assert await wait_for(lambda: statuses["SER1"][-1]["state"] == "listening" and statuses["SER1"][-1]["in_call"])

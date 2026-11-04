@@ -388,7 +388,7 @@ def test_signal_levels_skip_settling_and_match_rms():
 
 def test_suggested_squelch_ignores_a_brief_transmission():
     pcm = iq(0, 1) + iq(64, 9) + iq(3000, 1)
-    assert pipelines.suggest_squelch(pipelines.signal_levels(pcm, 16000)) == 103
+    assert pipelines.suggest_squelch(pipelines.signal_levels(pcm, 16000)) == 128
 
 
 def test_signal_levels_ignore_a_partial_sample_and_too_little_audio():

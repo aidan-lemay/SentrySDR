@@ -23,8 +23,9 @@ DIGITAL_INPUT_RATE = 48000
 DSD_OUTPUT_RATE = 8000
 FREQ_MIN_HZ = 500_000
 FREQ_MAX_HZ = 2_200_000_000
-# rtl_fm checks far shorter blocks than a measurement, so noise peaks above its average.
-SQUELCH_MARGIN = 1.6
+# Noise peaks above its average and drifts as a stick warms up. In testing, quiet readings
+# stayed under 1.3x within a run, but 1.6x still let one stick open by itself.
+SQUELCH_MARGIN = 2.0
 VOLUME_MIN_DB = -20.0
 VOLUME_MAX_DB = 30.0
 

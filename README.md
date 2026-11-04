@@ -77,6 +77,16 @@ This can run alongside a proxy. Requests through the proxy still get Secure cook
 
 Squelch, calls and noise measurement have been tested on air with NFM on three tuners: R820T (NESDR Mini), R828D and FC0012. Noise readings and squelch numbers differ between them, so measure each stick.
 
+## USB connections
+
+RTL-SDRs are USB 2.0 devices and can be sensitive to how they're connected. Three sticks behind a stacked, powered USB 3.0 hub repeatedly failed USB resets, took about four times as long to start, gave wrong noise readings, and eventually dropped off the bus. Plugged straight into the computer they ran with no errors. Use the computer's own ports or a powered USB 2.0 hub, and look for trouble with:
+
+```sh
+journalctl -k | grep -i -E "cannot reset|not accepting address|descriptor read"
+```
+
+If a stick is unplugged, its source shows a fault, and recording resumes by itself when it's back. Other SDRs are not affected. Calls in progress are saved.
+
 ## Tuning call detection
 
 A call is whatever passes the target's **squelch level**. If the level is below the noise, the squelch never closes, and you get back-to-back `max_call_seconds` recordings of static. After 10 minutes open, the Sources page shows a warning. A squelch of `0` records continuously, split into `max_call_seconds` pieces.
@@ -90,6 +100,8 @@ The noise level changes a lot with stick, frequency, mode, gain and antenna, so 
 - Saving a profile applies straight away if that target is running.
 - Measuring and saving need the `assign` permission. If a recorder on the SDR is locked, only an administrator can do either.
 - Master and slaves must run the same version for measuring to work on a slave.
+
+Noise also changes with how a stick is connected, and rises when other sticks run nearby. Measure each SDR in its final position with the others running, and measure again if it records noise by itself.
 
 With nothing else running, `sentrysdr measure --serial <serial> --mhz 444.85 --mode nfm` takes the same reading from the terminal.
 
