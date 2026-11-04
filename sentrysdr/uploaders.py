@@ -1,8 +1,8 @@
 """Forward finished calls to rdio-scanner, ClearCut and Broadcastify Calls, with retries.
 
-The Broadcastify format mirrors trunk-recorder's broadcastify_uploader plugin, the client
-Broadcastify takes conventional calls from today. A conventional channel's talkgroup is
-its frequency slot on the node.
+Broadcastify's published API takes the fields ts, tg, src and freq, while trunk-recorder's
+plugin sends a metadata file instead. Both are sent, with matching values. A conventional
+channel's talkgroup is its frequency slot on the node.
 
 ClearCut has no published docs. The upload format comes from the clearcut_uploader
 plugin in galenguyer/trunk-recorder (branch ``clearcut``). The read and transcribe
@@ -30,6 +30,8 @@ UPLOAD_TIMEOUT = httpx.Timeout(60.0, connect=15.0)
 TRANSCRIBE_TIMEOUT = httpx.Timeout(180.0, connect=15.0)
 MAX_RESPONSE_BYTES = 5 * 1024 * 1024
 MAX_TRANSCRIPT_CHARS = 20000
+BROADCASTIFY_PUT_ATTEMPTS = 3
+BROADCASTIFY_PUT_DELAY = 2.0
 
 
 class UploadError(Exception):
@@ -129,6 +131,20 @@ def broadcastify_metadata(recording, target) -> dict:
     }
 
 
+def broadcastify_form(recording, target, metadata: dict, system_id: int, api_key: str) -> dict[str, str]:
+    """The fields in Broadcastify's API documentation, agreeing with the metadata file."""
+    return {
+        "apiKey": api_key,
+        "systemId": str(system_id),
+        "callDuration": f"{recording.duration:.3f}",
+        "ts": str(metadata["start_time"]),
+        "tg": str(target.broadcastify_slot),
+        "src": "0",  # an analog channel has no unit ID
+        "freq": f"{recording.frequency_hz / 1e6:.6f}",
+        "enc": "m4a",
+    }
+
+
 def _clean_reply(text: str, api_key: str) -> str:
     """Replies get stored and shown: remove the key and any signed upload address."""
     if api_key:
@@ -146,10 +162,11 @@ async def send_broadcastify(cfg, client: httpx.AsyncClient, server: str, system_
         )
         if await proc.wait() != 0:
             raise UploadError("could not convert audio for Broadcastify")
+        metadata = broadcastify_metadata(recording, target)
         response = await client.post(
             server,
-            data={"callDuration": f"{recording.duration:.3f}", "systemId": str(system_id), "apiKey": api_key},
-            files={"metadata": ("call_meta.json", json.dumps(broadcastify_metadata(recording, target)), "application/json")},
+            data=broadcastify_form(recording, target, metadata, system_id, api_key),
+            files={"metadata": ("call_meta.json", json.dumps(metadata), "application/json")},
         )
         _check("Broadcastify", response)
         code, _, reply = response.text[:2000].strip().partition(" ")
@@ -157,6 +174,8 @@ async def send_broadcastify(cfg, client: httpx.AsyncClient, server: str, system_
             return f"Skipped by Broadcastify: {_clean_reply(reply, api_key)}"
         if code == "1" and reply.startswith("REJECTED"):
             raise UploadRejected(f"Rejected by Broadcastify: {_clean_reply(reply, api_key)}")
+        if code == "100":
+            raise UploadRejected(f"Broadcastify refused the API key, so correct it under Admin > Settings: {_clean_reply(reply, api_key)}")
         if code != "0":
             raise UploadError(f"Broadcastify replied: {_clean_reply(f'{code} {reply}', api_key)}")
         try:
@@ -166,10 +185,28 @@ async def send_broadcastify(cfg, client: httpx.AsyncClient, server: str, system_
             usable = False
         if not usable:
             raise UploadError("Broadcastify didn't return a usable upload address")
-        upload = await client.put(reply.strip(), content=m4a.read_bytes(), headers={"Content-Type": "audio/aac"})
-    if not 200 <= upload.status_code < 300:
-        raise UploadError(f"Broadcastify audio upload returned HTTP {upload.status_code}")
+        await _put_audio(client, reply.strip(), m4a.read_bytes())
     return ""
+
+
+async def _put_audio(client: httpx.AsyncClient, url: str, audio: bytes) -> None:
+    """Retry here: registering again would be refused as a duplicate, losing the audio."""
+    problem = ""
+    for attempt in range(BROADCASTIFY_PUT_ATTEMPTS):
+        if attempt:
+            await asyncio.sleep(BROADCASTIFY_PUT_DELAY)
+        try:
+            upload = await client.put(url, content=audio, headers={"Content-Type": "audio/aac"})
+        except httpx.HTTPError as exc:
+            # The message could include the signed address, so only its type is kept.
+            problem = type(exc).__name__
+            continue
+        if 200 <= upload.status_code < 300:
+            return
+        problem = f"HTTP {upload.status_code}"
+        if upload.status_code < 500:
+            break  # refused or expired, so trying again can't help
+    raise UploadError(f"Broadcastify audio upload failed: {problem}")
 
 
 async def broadcastify_test(client: httpx.AsyncClient, server: str, system_id: int, api_key: str) -> str:

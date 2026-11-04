@@ -912,6 +912,8 @@ async def test_broadcastify_registers_then_puts_aac_audio(admin, ctx, tmp_path):
     fields = form_fields(post)
     assert fields["systemId"]["body"] == "4242" and fields["apiKey"]["body"] == BCFY_KEY
     assert fields["callDuration"]["body"] == "6.500"
+    assert fields["ts"]["body"] == "1800000000" and fields["tg"]["body"] == "3" and fields["src"]["body"] == "0"
+    assert fields["freq"]["body"] == "154.430000" and fields["enc"]["body"] == "m4a"
     assert 'filename="call_meta.json"' in fields["metadata"]["head"] and "application/json" in fields["metadata"]["head"]
     meta = json.loads(fields["metadata"]["body"])
     assert meta["talkgroup"] == 3 and meta["freq"] == 154_430_000 and meta["audio_type"] == "analog" and meta["encrypted"] == 0
@@ -944,7 +946,7 @@ async def test_broadcastify_rejected_fails_at_once_with_the_reason(admin, ctx, t
 
 
 @pytest.mark.parametrize("kwargs", [
-    {"reply": "100 NO-API-KEY-SPECIFIED"}, {"post_status": 500}, {"put_status": 403}, {"reply": "0 http://plain.example.com/x"}, {"reply": "0"},
+    {"reply": "7 SOMETHING-ELSE"}, {"post_status": 500}, {"put_status": 403}, {"reply": "0 http://plain.example.com/x"}, {"reply": "0"},
 ])
 async def test_broadcastify_other_failures_retry_later(admin, ctx, tmp_path, kwargs):
     _, target = bcfy_target(admin)
@@ -1310,3 +1312,86 @@ def test_a_database_from_before_volume_upgrades(tmp_path):
     connection.close()
     with make_session_factory(db)() as session:
         assert session.scalar(select(Target)).volume_db is None
+
+
+# --- from Broadcastify's published API --------------------------------------------
+async def test_broadcastify_form_and_metadata_agree_on_the_call(admin, ctx, tmp_path):
+    _, target = bcfy_target(admin, slot=7)
+    bcfy_recording(ctx, target, tmp_path, started=1_800_000_123.75, duration=6.5)
+    seen = []
+    await run_bcfy(ctx, seen)
+    fields = form_fields(seen[0])
+    meta = json.loads(fields["metadata"]["body"])
+    assert int(fields["ts"]["body"]) == meta["start_time"] == 1_800_000_123
+    assert fields["tg"]["body"] == str(meta["talkgroup"]) == "7"
+    assert float(fields["freq"]["body"]) * 1e6 == pytest.approx(meta["freq"])
+
+
+async def test_a_bad_api_key_is_not_retried(admin, ctx, tmp_path):
+    _, target = bcfy_target(admin)
+    call = bcfy_recording(ctx, target, tmp_path)
+    seen = []
+    await run_bcfy(ctx, seen, reply="100 NO-API-KEY-SPECIFIED")
+    job = bcfy_job(ctx, call)
+    assert job.status == "failed" and "API key" in job.last_error and "NO-API-KEY" in job.last_error
+    assert len(seen) == 1 and await run_bcfy(ctx, seen) == 0
+
+
+async def test_the_documented_duplicate_reply_counts_as_done(admin, ctx, tmp_path):
+    _, target = bcfy_target(admin)
+    call = bcfy_recording(ctx, target, tmp_path)
+    await run_bcfy(ctx, [], reply="1 SKIPPED---ALREADY-RECEIVED-THIS-CALL")
+    job = bcfy_job(ctx, call)
+    assert job.status == "done" and job.last_error.startswith("Skipped")
+
+
+def flaky_put(seen, failures):
+    answers = iter(failures)
+
+    def handler(request):
+        request.read()
+        seen.append(request)
+        if request.method == "POST":
+            return httpx.Response(200, text=f"0 {SIGNED}")
+        answer = next(answers, None)
+        if isinstance(answer, Exception):
+            raise answer
+        return httpx.Response(answer or 200)
+
+    return httpx.MockTransport(handler)
+
+
+@pytest.mark.parametrize("failures", [[503], [503, 503], [httpx.ConnectError("x")], [httpx.ReadTimeout("x"), 500]])
+async def test_audio_upload_retries_the_same_address_without_registering_again(admin, ctx, tmp_path, monkeypatch, failures):
+    monkeypatch.setattr(uploaders, "BROADCASTIFY_PUT_DELAY", 0)
+    _, target = bcfy_target(admin)
+    call = bcfy_recording(ctx, target, tmp_path)
+    seen = []
+    async with httpx.AsyncClient(transport=flaky_put(seen, failures)) as client:
+        await ctx.process_uploads(client)
+    assert [r.method for r in seen].count("POST") == 1
+    assert [r.method for r in seen].count("PUT") == len(failures) + 1
+    assert bcfy_job(ctx, call).status == "done"
+
+
+async def test_an_expired_address_is_not_retried_and_failures_hide_the_address(admin, ctx, tmp_path, monkeypatch):
+    monkeypatch.setattr(uploaders, "BROADCASTIFY_PUT_DELAY", 0)
+    _, target = bcfy_target(admin)
+    call = bcfy_recording(ctx, target, tmp_path)
+    seen = []
+    async with httpx.AsyncClient(transport=flaky_put(seen, [403])) as client:
+        await ctx.process_uploads(client)
+    assert [r.method for r in seen].count("PUT") == 1
+    job = bcfy_job(ctx, call)
+    assert job.status == "pending" and "403" in job.last_error
+
+    seen.clear()
+    with ctx.db() as session:
+        row = session.get(UploadJob, job.id)
+        row.next_attempt_at = 0
+        session.commit()
+    secret = httpx.ConnectError(f"could not reach {SIGNED}")
+    async with httpx.AsyncClient(transport=flaky_put(seen, [secret, secret, secret])) as client:
+        await ctx.process_uploads(client)
+    job = bcfy_job(ctx, call)
+    assert "signature" not in job.last_error and "ConnectError" in job.last_error
