@@ -5,18 +5,20 @@
   const blank = () => ({
     id: null, name: '', kind: 'audio', mhz: '', modulation: 'nfm', squelch: 50,
     clearcut_enabled: false, clearcut_system: '', clearcut_id: '', rdio_enabled: false, rdio_system: '', rdio_talkgroup: '',
+    broadcastify_enabled: false, broadcastify_system_ref: '', broadcastify_slot: '',
   });
   // These frequencies are the standard ones each decoder listens on.
   const FIXED = { adsb: { modulation: 'adsb', mhz: 1090 }, ais: { modulation: 'ais', mhz: 162 } };
 
   let targets = $state([]);
+  let systems = $state([]);
   let form = $state(blank());
   let error = $state('');
   let message = $state('');
 
   async function refresh() {
     try {
-      targets = await api('targets');
+      [targets, systems] = await Promise.all([api('targets'), api('broadcastify-systems').catch(() => [])]);
     } catch (failure) {
       error = failure.message;
     }
@@ -38,6 +40,7 @@
       squelch: Number(form.squelch),
       clearcut_enabled: form.clearcut_enabled, clearcut_system: form.clearcut_system || null, clearcut_id: optionalInt(form.clearcut_id),
       rdio_enabled: form.rdio_enabled, rdio_system: optionalInt(form.rdio_system), rdio_talkgroup: optionalInt(form.rdio_talkgroup),
+      broadcastify_enabled: Boolean(form.broadcastify_enabled), broadcastify_system_ref: optionalInt(form.broadcastify_system_ref), broadcastify_slot: optionalInt(form.broadcastify_slot),
     };
     try {
       const saved = form.id ? await api(`targets/${form.id}`, { method: 'PUT', body }) : await api('targets', { method: 'POST', body });
@@ -56,6 +59,7 @@
       ...blank(), ...target, mhz: target.frequency_hz / 1e6,
       clearcut_system: target.clearcut_system ?? '', clearcut_id: target.clearcut_id ?? '',
       rdio_system: target.rdio_system ?? '', rdio_talkgroup: target.rdio_talkgroup ?? '',
+      broadcastify_enabled: Boolean(target.broadcastify_enabled), broadcastify_system_ref: target.broadcastify_system_ref ?? '', broadcastify_slot: target.broadcastify_slot ?? '',
     };
     document.getElementById('target-form')?.scrollIntoView();
   }
@@ -86,7 +90,7 @@
           <td data-label="Frequency"><span class="mono">{formatMHz(target.frequency_hz)}</span></td>
           <td data-label="Mode"><span>{target.modulation.toUpperCase()}</span></td>
           <td data-label="Squelch"><span class="mono">{target.kind === 'audio' ? target.squelch || 'Off' : 'n/a'}</span></td>
-          <td data-label="Uploads to"><span>{[target.clearcut_enabled && 'ClearCut', target.rdio_enabled && 'RDIO'].filter(Boolean).join(', ') || 'None'}</span></td>
+          <td data-label="Uploads to"><span>{[target.clearcut_enabled && 'ClearCut', target.rdio_enabled && 'RDIO', target.broadcastify_enabled && 'Broadcastify'].filter(Boolean).join(', ') || 'None'}</span></td>
           <td>
             <div class="buttons" style="margin:0">
               <button onclick={() => edit(target)}>Edit</button>
@@ -132,6 +136,20 @@
       {#if form.rdio_enabled}
         <label class="field"><span>RDIO system</span><input type="number" inputmode="numeric" bind:value={form.rdio_system} required /></label>
         <label class="field"><span>RDIO talkgroup</span><input type="number" inputmode="numeric" bind:value={form.rdio_talkgroup} required /></label>
+      {/if}
+      <div class="field"><span>Broadcastify</span><label class="tick"><input type="checkbox" bind:checked={form.broadcastify_enabled} /> Upload calls to Broadcastify Calls</label></div>
+      {#if form.broadcastify_enabled}
+        <label class="field"><span>Broadcastify system</span>
+          <select bind:value={form.broadcastify_system_ref} required>
+            <option value="">Choose a system</option>
+            {#each systems as system (system.id)}<option value={system.id}>{system.name} (node {system.system_id})</option>{/each}
+          </select>
+          {#if !systems.length}<span class="hint">An administrator adds systems under Admin &gt; Settings.</span>{/if}
+        </label>
+        <label class="field"><span>Frequency slot</span>
+          <input type="number" inputmode="numeric" min="1" bind:value={form.broadcastify_slot} required />
+          <span class="hint">The Slot beside this frequency on Broadcastify's Manage Calls Systems page, under Node Frequencies.</span>
+        </label>
       {/if}
     {/if}
     <div class="buttons form-buttons">

@@ -21,7 +21,7 @@ from . import pipelines, schedule, uploaders
 from .config import Config
 from .engine import MeasureError, Supervisor
 from .live import LiveHub
-from .models import AuditLog, Node, Recorder, Recording, SdrProfile, Setting, Source, Target, UploadJob, make_session_factory
+from .models import AuditLog, BroadcastifySystem, Node, Recorder, Recording, SdrProfile, Setting, Source, Target, UploadJob, make_session_factory
 from .sdr import enumerate_serials
 from .security import RateLimiter, SecretBox
 
@@ -35,6 +35,7 @@ SETTING_DEFAULTS = {
     "rdio_server": "",
     "clearcut_server": "",
     "clearcut_page_url": "",
+    "broadcastify_server": "https://api.broadcastify.com/call-upload",
     "map_tile_url": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
 }
 SECRET_SETTINGS = {"rdio_api_key", "clearcut_api_key"}
@@ -283,6 +284,8 @@ class Context:
                     recording.clearcut_talkgroup = target.clearcut_id
                 if target.rdio_enabled and target.rdio_system is not None and target.rdio_talkgroup is not None:
                     session.add(UploadJob(recording_id=call_id, destination="rdio"))
+                if target.broadcastify_enabled and target.broadcastify_system_ref is not None and target.broadcastify_slot is not None:
+                    session.add(UploadJob(recording_id=call_id, destination="broadcastify"))
             session.commit()
         return True
 
@@ -366,15 +369,27 @@ class Context:
         if audio is None or target is None:
             job.status, job.last_error = "failed", "recording or target no longer exists"
             return
+        note = ""
         try:
             server = self.get_setting(f"{job.destination}_server")
-            key = self.get_secret(f"{job.destination}_api_key")
-            if not server or not key:
-                raise uploaders.UploadError(f"{job.destination} server or key is not configured")
-            if job.destination == "rdio":
-                await uploaders.send_rdio(client, server, key, recording, target, audio)
+            if job.destination == "broadcastify":
+                system = session.get(BroadcastifySystem, target.broadcastify_system_ref)
+                key = self.secrets.open(system.api_key_sealed) if system else ""
+                if not server or not key:
+                    raise uploaders.UploadError("broadcastify server or system is not configured")
+                note = await uploaders.send_broadcastify(self.cfg, client, server, system.system_id, key, recording, target, audio)
             else:
-                await uploaders.send_clearcut(self.cfg, client, server, key, recording, target, audio)
+                key = self.get_secret(f"{job.destination}_api_key")
+                if not server or not key:
+                    raise uploaders.UploadError(f"{job.destination} server or key is not configured")
+                if job.destination == "rdio":
+                    await uploaders.send_rdio(client, server, key, recording, target, audio)
+                else:
+                    await uploaders.send_clearcut(self.cfg, client, server, key, recording, target, audio)
+        except uploaders.UploadRejected as exc:
+            job.attempts += 1
+            job.status, job.last_error = "failed", str(exc)[:400]
+            log.warning("upload %s to %s rejected: %s", job.recording_id, job.destination, job.last_error)
         except (uploaders.UploadError, httpx.HTTPError, OSError) as exc:
             job.attempts += 1
             job.last_error = str(exc)[:400] or type(exc).__name__
@@ -384,7 +399,7 @@ class Context:
                 job.next_attempt_at = time.time() + min(30 * 2 ** job.attempts, 3600)
             log.warning("upload %s to %s failed: %s", job.recording_id, job.destination, job.last_error)
         else:
-            job.status, job.last_error = "done", ""
+            job.status, job.last_error = "done", note
 
     async def _transcript_loop(self) -> None:
         async with httpx.AsyncClient(timeout=uploaders.UPLOAD_TIMEOUT, follow_redirects=False) as client:

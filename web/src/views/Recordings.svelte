@@ -95,7 +95,7 @@
     }
   }
 
-  const UPLOAD_LABEL = { clearcut: 'ClearCut', rdio: 'RDIO' };
+  const UPLOAD_LABEL = { clearcut: 'ClearCut', rdio: 'RDIO', broadcastify: 'Broadcastify' };
   const uploadClass = (status) => ({ done: 'st-ok', failed: 'st-bad' }[status] ?? 'st-warn');
 </script>
 
@@ -131,7 +131,8 @@
         <div class="small flags">
           {#if call.protected}<span class="st-ok">Protected</span>{/if}
           {#each call.uploads as upload}
-            <span class={uploadClass(upload.status)}>{UPLOAD_LABEL[upload.destination]}: {upload.status}</span>
+            <span class={uploadClass(upload.status)} title={upload.detail || null}>{UPLOAD_LABEL[upload.destination]}: {upload.detail?.startsWith('Skipped') ? 'skipped' : upload.status}</span>
+            {#if upload.detail && upload.status === 'failed'}<span class="st-bad">{upload.detail}</span>{/if}
           {/each}
         </div>
       {/if}

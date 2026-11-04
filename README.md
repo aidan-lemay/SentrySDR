@@ -97,6 +97,15 @@ With nothing else running, `sentrysdr measure --serial <serial> --mhz 444.85 --m
 
 Set server URLs and keys in **Admin > Settings**, then enable uploads per target. Failed uploads retry with increasing delays, up to 12 attempts.
 
+### Broadcastify Calls
+
+Replaces trunk-recorder's `broadcastify_uploader` for conventional channels. Broadcastify must already have approved your node: apply at broadcastify.com/apply/calls, and each frequency needs a matching RadioReference entry.
+
+1. In **Admin > Settings > Broadcastify Calls systems**, add each node's name, system ID and API key, then select **Check credentials**. This sends no call.
+2. On each target, turn on **Upload calls to Broadcastify Calls**, then choose the system and the frequency's slot. Slots are on Broadcastify's Manage Calls Systems page, under Node Frequencies.
+
+All uploads go from the master, including calls recorded on slaves. A call Broadcastify skips counts as finished, and a call it rejects is not retried. The reason shows on the recording. Stop any other uploader on the same slot before you switch.
+
 ### ClearCut transcripts
 
 ClearCut makes the transcript itself after a call is uploaded, either automatically or on request, and adds it to its copy of the call.

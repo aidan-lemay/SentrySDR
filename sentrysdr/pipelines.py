@@ -208,6 +208,15 @@ def live_encoder_args(cfg: Config, rate: int) -> list[str]:
     ]
 
 
+def broadcastify_audio_args(cfg: Config, in_path: str, out_path: str) -> list[str]:
+    # The same encoding trunk-recorder sends to Broadcastify.
+    return [
+        cfg.binary("ffmpeg") or "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+        "-i", in_path, "-vn", "-c:a", "aac", "-ar", "16000", "-ac", "1", "-b:a", "32k",
+        "-movflags", "+faststart", out_path,
+    ]
+
+
 def m4a_args(cfg: Config, in_path: str, out_path: str) -> list[str]:
     # ClearCut's reference client (trunk-recorder) sends AAC in an m4a container.
     return [

@@ -112,6 +112,18 @@ class Target(Base):
     rdio_enabled: Mapped[bool] = mapped_column(default=False)
     rdio_system: Mapped[int | None] = mapped_column(nullable=True)
     rdio_talkgroup: Mapped[int | None] = mapped_column(nullable=True)
+    broadcastify_enabled: Mapped[bool | None] = mapped_column(nullable=True)
+    broadcastify_system_ref: Mapped[int | None] = mapped_column(nullable=True)  # BroadcastifySystem.id
+    broadcastify_slot: Mapped[int | None] = mapped_column(nullable=True)  # the node's frequency slot
+
+
+class BroadcastifySystem(Base):
+    """One Broadcastify Calls node. Its API key is sealed and never leaves the server."""
+    __tablename__ = "broadcastify_systems"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(120))
+    system_id: Mapped[int] = mapped_column()
+    api_key_sealed: Mapped[str] = mapped_column(String(2000))
 
 
 class SdrProfile(Base):

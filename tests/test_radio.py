@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import sqlite3
+import subprocess
 import time
 import uuid
 from array import array
@@ -14,7 +17,7 @@ from sqlalchemy import select
 
 from sentrysdr import pipelines, schedule, sdr, uploaders
 from sentrysdr.engine import MeasureError, merge_ais_message
-from sentrysdr.models import Recording, SdrProfile, UploadJob
+from sentrysdr.models import BroadcastifySystem, Recording, SdrProfile, Target, UploadJob, make_session_factory
 
 from .conftest import ADMIN_EMAIL, PASSWORD, add_user, client_for
 
@@ -835,3 +838,240 @@ def test_bad_measurement_replies_become_errors(ctx, message):
     ctx.finish_measure(7, {"id": "abc", **message})
     assert isinstance(future.exception(), MeasureError)
     loop.close()
+
+
+# --- Broadcastify Calls -------------------------------------------------------
+BCFY_KEY = "bcfy-secret-key-123"
+SIGNED = "https://uploads.example.com/call/abc?signature=xyz"
+
+
+def bcfy_target(admin, slot=3, **overrides):
+    system = admin.post("/api/admin/broadcastify", json={"name": "Home", "system_id": 4242, "api_key": BCFY_KEY})
+    assert system.status_code == 201
+    target = admin.post("/api/targets", json={
+        "name": "Fire Dispatch", "frequency_hz": 154_430_000, "modulation": "nfm",
+        "broadcastify_enabled": True, "broadcastify_system_ref": system.json()["id"], "broadcastify_slot": slot, **overrides,
+    })
+    assert target.status_code == 201, target.text
+    return system.json()["id"], target.json()["id"]
+
+
+def bcfy_recording(ctx, target_id, tmp_path, started=1_800_000_000.0, duration=6.5, modulation="nfm"):
+    """A recording stored as a real call, with audio ffmpeg can read."""
+    wav = tmp_path / f"{uuid.uuid4().hex}.mp3"
+    subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=1", "-ar", "16000", "-ac", "1", str(wav)], check=True)
+    meta = {
+        "id": uuid.uuid4().hex, "recorder_id": 1, "recorder_name": "r", "source_id": None, "source_name": "s", "target_id": target_id,
+        "target_name": "Fire Dispatch", "serial": "SER1", "frequency_hz": 154_430_000, "modulation": modulation,
+        "started_at": started, "ended_at": started + duration, "duration": duration,
+    }
+    assert ctx.store_call(meta, wav, "local")
+    return meta["id"]
+
+
+def bcfy_transport(seen, reply=f"0 {SIGNED}", put_status=200, post_status=200):
+    def handler(request):
+        seen.append(request)
+        request.read()
+        if request.method == "POST":
+            return httpx.Response(post_status, text=reply)
+        return httpx.Response(put_status)
+    return httpx.MockTransport(handler)
+
+
+async def run_bcfy(ctx, seen, **kwargs):
+    async with httpx.AsyncClient(transport=bcfy_transport(seen, **kwargs)) as client:
+        return await ctx.process_uploads(client)
+
+
+def bcfy_job(ctx, call_id):
+    with ctx.db() as session:
+        return session.scalar(select(UploadJob).where(UploadJob.recording_id == call_id, UploadJob.destination == "broadcastify"))
+
+
+def form_fields(request):
+    """The name, filename and content of each multipart part."""
+    boundary = request.headers["content-type"].split("boundary=")[1].encode()
+    parts = {}
+    for part in request.content.split(b"--" + boundary):
+        head, _, body = part.partition(b"\r\n\r\n")
+        if b"name=" in head:
+            name = head.split(b'name="')[1].split(b'"')[0].decode()
+            parts[name] = {"head": head.decode(), "body": body.rstrip(b"\r\n").decode()}
+    return parts
+
+
+async def test_broadcastify_registers_then_puts_aac_audio(admin, ctx, tmp_path):
+    _, target = bcfy_target(admin)
+    call = bcfy_recording(ctx, target, tmp_path)
+    seen = []
+    assert await run_bcfy(ctx, seen) == 1
+    post, put = seen
+    assert post.method == "POST" and str(post.url) == "https://api.broadcastify.com/call-upload"
+    fields = form_fields(post)
+    assert fields["systemId"]["body"] == "4242" and fields["apiKey"]["body"] == BCFY_KEY
+    assert fields["callDuration"]["body"] == "6.500"
+    assert 'filename="call_meta.json"' in fields["metadata"]["head"] and "application/json" in fields["metadata"]["head"]
+    meta = json.loads(fields["metadata"]["body"])
+    assert meta["talkgroup"] == 3 and meta["freq"] == 154_430_000 and meta["audio_type"] == "analog" and meta["encrypted"] == 0
+    assert meta["stop_time"] == 1_800_000_006 and meta["call_length_ms"] == 6500
+    assert meta["stop_time_ms"] - meta["start_time_ms"] == 6500 and meta["talkgroup_tag"] == "Fire Dispatch"
+    assert put.method == "PUT" and str(put.url) == SIGNED and put.headers["content-type"] == "audio/aac"
+    assert b"ftyp" in put.content[:32]  # an m4a file
+    assert "trunk" not in post.headers["user-agent"].lower()
+    job = bcfy_job(ctx, call)
+    assert job.status == "done" and job.last_error == ""
+
+
+async def test_broadcastify_skipped_counts_as_done_without_uploading(admin, ctx, tmp_path):
+    _, target = bcfy_target(admin)
+    call = bcfy_recording(ctx, target, tmp_path)
+    seen = []
+    await run_bcfy(ctx, seen, reply="1 SKIPPED-DUPLICATE")
+    job = bcfy_job(ctx, call)
+    assert len(seen) == 1 and job.status == "done" and "SKIPPED" in job.last_error
+
+
+async def test_broadcastify_rejected_fails_at_once_with_the_reason(admin, ctx, tmp_path):
+    _, target = bcfy_target(admin)
+    call = bcfy_recording(ctx, target, tmp_path)
+    await run_bcfy(ctx, [], reply="1 REJECTED-CALL-SKEW")
+    job = bcfy_job(ctx, call)
+    assert job.status == "failed" and "REJECTED-CALL-SKEW" in job.last_error and job.attempts == 1
+    assert await run_bcfy(ctx, []) == 0  # not tried again
+    assert "REJECTED-CALL-SKEW" in admin.get("/api/recordings").json()["items"][0]["uploads"][0]["detail"]
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"reply": "100 NO-API-KEY-SPECIFIED"}, {"post_status": 500}, {"put_status": 403}, {"reply": "0 http://plain.example.com/x"}, {"reply": "0"},
+])
+async def test_broadcastify_other_failures_retry_later(admin, ctx, tmp_path, kwargs):
+    _, target = bcfy_target(admin)
+    call = bcfy_recording(ctx, target, tmp_path)
+    await run_bcfy(ctx, [], **kwargs)
+    job = bcfy_job(ctx, call)
+    assert job.status == "pending" and job.attempts == 1 and job.next_attempt_at > time.time() and job.last_error
+
+
+async def test_broadcastify_never_stores_the_key_or_signed_address(admin, ctx, tmp_path):
+    _, target = bcfy_target(admin)
+    call = bcfy_recording(ctx, target, tmp_path)
+    await run_bcfy(ctx, [], reply=f"7 bad {BCFY_KEY} see {SIGNED}")
+    job = bcfy_job(ctx, call)
+    assert BCFY_KEY not in job.last_error and "signature" not in job.last_error and "[key]" in job.last_error
+
+
+async def test_broadcastify_only_uses_the_targets_system_and_slot(admin, ctx, tmp_path):
+    bcfy_target(admin, slot=3)
+    second = admin.post("/api/admin/broadcastify", json={"name": "Field", "system_id": 77, "api_key": "other-key"}).json()["id"]
+    target = admin.post("/api/targets", json={
+        "name": "Other", "frequency_hz": 441_000_000, "modulation": "nfm",
+        "broadcastify_enabled": True, "broadcastify_system_ref": second, "broadcastify_slot": 9,
+    }).json()["id"]
+    bcfy_recording(ctx, target, tmp_path)
+    seen = []
+    await run_bcfy(ctx, seen)
+    fields = form_fields(seen[0])
+    assert fields["systemId"]["body"] == "77" and fields["apiKey"]["body"] == "other-key"
+    assert json.loads(fields["metadata"]["body"])["talkgroup"] == 9
+
+
+def test_target_without_broadcastify_queues_no_job(admin, ctx, tmp_path):
+    target = admin.post("/api/targets", json={"name": "T", "frequency_hz": 441_000_000, "modulation": "nfm"}).json()["id"]
+    assert bcfy_job(ctx, bcfy_recording(ctx, target, tmp_path)) is None
+
+
+@pytest.mark.parametrize("bad", [
+    {"broadcastify_system_ref": None}, {"broadcastify_slot": None}, {"broadcastify_system_ref": 99}, {"broadcastify_slot": 0},
+])
+def test_broadcastify_target_settings_are_validated(admin, bad):
+    system = admin.post("/api/admin/broadcastify", json={"name": "H", "system_id": 1, "api_key": "k"}).json()["id"]
+    body = {"name": "T", "frequency_hz": 441_000_000, "modulation": "nfm", "broadcastify_enabled": True,
+            "broadcastify_system_ref": system, "broadcastify_slot": 1}
+    assert admin.post("/api/targets", json={**body, **bad}).status_code == 422
+
+
+def test_adsb_target_cannot_upload_to_broadcastify(admin):
+    system = admin.post("/api/admin/broadcastify", json={"name": "H", "system_id": 1, "api_key": "k"}).json()["id"]
+    assert admin.post("/api/targets", json={
+        "name": "A", "kind": "adsb", "frequency_hz": 1_090_000_000, "modulation": "adsb",
+        "broadcastify_enabled": True, "broadcastify_system_ref": system, "broadcastify_slot": 1,
+    }).status_code == 422
+
+
+def test_broadcastify_keys_are_sealed_and_never_returned(admin, ctx, app):
+    system, _ = bcfy_target(admin)
+    with ctx.db() as session:
+        assert BCFY_KEY not in session.get(BroadcastifySystem, system).api_key_sealed
+    add_user(ctx, "op@example.com", role="operator")
+    operator = client_for(app, "op@example.com")
+    for reply in (admin.get("/api/admin/broadcastify"), operator.get("/api/broadcastify-systems"), admin.get("/api/targets"), admin.get("/api/admin/audit")):
+        assert reply.status_code == 200 and BCFY_KEY not in reply.text
+    assert operator.get("/api/broadcastify-systems").json()[0]["system_id"] == 4242
+
+
+def test_only_admins_manage_broadcastify_systems(admin, ctx, app):
+    system, _ = bcfy_target(admin)
+    add_user(ctx, "op@example.com", role="operator")
+    add_user(ctx, "l@example.com")
+    operator, listener = client_for(app, "op@example.com"), client_for(app, "l@example.com")
+    for client in (operator, listener):
+        assert client.get("/api/admin/broadcastify").status_code == 403
+        assert client.post("/api/admin/broadcastify", json={"name": "x", "system_id": 1, "api_key": "k"}).status_code == 403
+        assert client.delete(f"/api/admin/broadcastify/{system}").status_code == 403
+        assert client.post(f"/api/admin/broadcastify/{system}/test").status_code == 403
+    assert listener.get("/api/broadcastify-systems").status_code == 403
+    assert client_for(app).get("/api/broadcastify-systems").status_code == 401
+
+
+def test_editing_a_system_keeps_its_key_unless_replaced(admin, ctx):
+    system, _ = bcfy_target(admin)
+    assert admin.put(f"/api/admin/broadcastify/{system}", json={"name": "New", "system_id": 5}).status_code == 200
+    with ctx.db() as session:
+        assert ctx.secrets.open(session.get(BroadcastifySystem, system).api_key_sealed) == BCFY_KEY
+    admin.put(f"/api/admin/broadcastify/{system}", json={"name": "New", "system_id": 5, "api_key": "replaced"})
+    with ctx.db() as session:
+        assert ctx.secrets.open(session.get(BroadcastifySystem, system).api_key_sealed) == "replaced"
+    assert admin.post("/api/admin/broadcastify", json={"name": "No key", "system_id": 1}).status_code == 422
+
+
+def test_a_system_in_use_cannot_be_deleted(admin):
+    system, target = bcfy_target(admin)
+    assert admin.delete(f"/api/admin/broadcastify/{system}").status_code == 409
+    admin.delete(f"/api/targets/{target}")
+    assert admin.delete(f"/api/admin/broadcastify/{system}").status_code == 200
+
+
+def test_credential_check_sends_no_call_and_hides_the_key(admin, ctx):
+    system, _ = bcfy_target(admin)
+    seen = []
+
+    def handler(request):
+        request.read()
+        seen.append(request)
+        return httpx.Response(200, text=f"100 bad key {BCFY_KEY} {SIGNED}")
+
+    ctx.http_transport = httpx.MockTransport(handler)
+    reply = admin.post(f"/api/admin/broadcastify/{system}/test")
+    assert reply.status_code == 200 and "100 bad key" in reply.json()["reply"]
+    assert BCFY_KEY not in reply.text and "signature" not in reply.text
+    fields = form_fields(seen[0])
+    assert fields["test"]["body"] == "1" and fields["systemId"]["body"] == "4242" and "metadata" not in fields
+    assert len(seen) == 1
+
+
+def test_a_database_from_before_broadcastify_upgrades_and_keeps_its_targets(tmp_path):
+    db = tmp_path / "old.db"
+    make_session_factory(db)
+    connection = sqlite3.connect(db)
+    connection.execute("INSERT INTO targets (name, kind, frequency_hz, modulation, squelch, clearcut_enabled, rdio_enabled) VALUES ('Old', 'audio', 441000000, 'nfm', 60, 0, 0)")
+    for column in ("broadcastify_enabled", "broadcastify_system_ref", "broadcastify_slot"):
+        connection.execute(f"ALTER TABLE targets DROP COLUMN {column}")
+    connection.execute("DROP TABLE broadcastify_systems")
+    connection.commit()
+    connection.close()
+    with make_session_factory(db)() as session:
+        target = session.scalar(select(Target))
+        assert target.name == "Old" and not target.broadcastify_enabled and target.broadcastify_slot is None
+        session.add(BroadcastifySystem(name="n", system_id=1, api_key_sealed="x"))
+        session.commit()

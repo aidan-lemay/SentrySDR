@@ -1,4 +1,8 @@
-"""Forward finished calls to rdio-scanner and ClearCut, with retries.
+"""Forward finished calls to rdio-scanner, ClearCut and Broadcastify Calls, with retries.
+
+The Broadcastify format mirrors trunk-recorder's broadcastify_uploader plugin, the client
+Broadcastify takes conventional calls from today. A conventional channel's talkgroup is
+its frequency slot on the node.
 
 ClearCut has no published docs. The upload format comes from the clearcut_uploader
 plugin in galenguyer/trunk-recorder (branch ``clearcut``). The read and transcribe
@@ -10,9 +14,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -28,6 +34,10 @@ MAX_TRANSCRIPT_CHARS = 20000
 
 class UploadError(Exception):
     pass
+
+
+class UploadRejected(UploadError):
+    """The destination refused this call for good, so retrying can't help."""
 
 
 def rdio_form(recording, target, api_key: str) -> dict[str, str]:
@@ -90,6 +100,81 @@ async def send_clearcut(cfg, client: httpx.AsyncClient, server: str, api_key: st
                 headers={"Expect": ""},
             )
     _check("ClearCut", response)
+
+
+def broadcastify_metadata(recording, target) -> dict:
+    """The same keys trunk-recorder's call JSON has. SDRs can't report the digital-only ones.
+
+    The start is worked back from the end, as trunk-recorder does, so it fits the audio.
+    """
+    length_ms = round(recording.duration * 1000)
+    stop_ms = int(recording.ended_at * 1000)
+    start_ms = stop_ms - length_ms
+    return {
+        "freq": int(recording.frequency_hz), "freq_error": 0, "signal": 0, "noise": 0,
+        "source_num": 0, "recorder_num": 0, "tdma_slot": -1, "phase2_tdma": 0,
+        "start_time": start_ms // 1000, "stop_time": stop_ms // 1000,
+        "start_time_ms": start_ms, "stop_time_ms": stop_ms,
+        "emergency": 0, "priority": 0, "mode": 0, "duplex": 0, "encrypted": 0,
+        "call_length": round(recording.duration), "call_length_ms": length_ms,
+        "talkgroup": int(target.broadcastify_slot), "talkgroup_tag": target.name,
+        "talkgroup_description": "", "talkgroup_group_tag": "", "talkgroup_group": "",
+        "color_code": -1,
+        "audio_type": "analog" if recording.modulation in pipelines.ANALOG else "digital",
+        "short_name": f"sentrysdr-{target.broadcastify_system_ref}",
+        "freqList": [{
+            "freq": int(recording.frequency_hz), "time": start_ms // 1000, "pos": 0.0,
+            "len": round(recording.duration, 2), "error_count": 0, "spike_count": 0,
+        }],
+    }
+
+
+def _clean_reply(text: str, api_key: str) -> str:
+    """Replies get stored and shown: remove the key and any signed upload address."""
+    if api_key:
+        text = text.replace(api_key, "[key]")
+    return re.sub(r"https?://\S+", "[address]", text).strip()[:200]
+
+
+async def send_broadcastify(cfg, client: httpx.AsyncClient, server: str, system_id: int, api_key: str, recording, target, audio: Path) -> str:
+    """Register the call, then upload its audio. Returns a note if the call was skipped."""
+    with tempfile.TemporaryDirectory(dir=audio.parent.parent) as tmp:
+        m4a = Path(tmp) / f"{recording.id}.m4a"
+        proc = await asyncio.create_subprocess_exec(
+            *pipelines.broadcastify_audio_args(cfg, str(audio), str(m4a)),
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        if await proc.wait() != 0:
+            raise UploadError("could not convert audio for Broadcastify")
+        response = await client.post(
+            server,
+            data={"callDuration": f"{recording.duration:.3f}", "systemId": str(system_id), "apiKey": api_key},
+            files={"metadata": ("call_meta.json", json.dumps(broadcastify_metadata(recording, target)), "application/json")},
+        )
+        _check("Broadcastify", response)
+        code, _, reply = response.text[:2000].strip().partition(" ")
+        if code == "1" and reply.startswith("SKIPPED"):
+            return f"Skipped by Broadcastify: {_clean_reply(reply, api_key)}"
+        if code == "1" and reply.startswith("REJECTED"):
+            raise UploadRejected(f"Rejected by Broadcastify: {_clean_reply(reply, api_key)}")
+        if code != "0":
+            raise UploadError(f"Broadcastify replied: {_clean_reply(f'{code} {reply}', api_key)}")
+        parts = urlsplit(reply.strip())
+        if parts.scheme != "https" or not parts.hostname:
+            raise UploadError("Broadcastify didn't return a usable upload address")
+        upload = await client.put(reply.strip(), content=m4a.read_bytes(), headers={"Content-Type": "audio/aac"})
+    if not 200 <= upload.status_code < 300:
+        raise UploadError(f"Broadcastify audio upload returned HTTP {upload.status_code}")
+    return ""
+
+
+async def broadcastify_test(client: httpx.AsyncClient, server: str, system_id: int, api_key: str) -> str:
+    """Broadcastify's credential check. It sends no call. Returns its reply as text."""
+    response = await client.post(server, files={
+        "test": (None, "1"), "apiKey": (None, api_key), "systemId": (None, str(system_id)),
+    })
+    _check("Broadcastify", response)
+    return _clean_reply(response.text[:2000], api_key) or "(an empty reply)"
 
 
 async def _json_request(client: httpx.AsyncClient, method: str, url: str, params: dict, timeout=UPLOAD_TIMEOUT):

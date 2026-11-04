@@ -16,7 +16,7 @@ from .. import pipelines, schedule, security
 from ..config import SERIAL_RE
 from ..context import Context
 from ..engine import MeasureError
-from ..models import Node, Recorder, SdrProfile, Source, Target, User, now
+from ..models import BroadcastifySystem, Node, Recorder, SdrProfile, Source, Target, User, now
 from .deps import admin_user, ctx_of, current_user, get_db, ip_of, require
 
 router = APIRouter(prefix="/api")
@@ -195,9 +195,12 @@ class TargetBody(BaseModel):
     rdio_enabled: bool = False
     rdio_system: int | None = None
     rdio_talkgroup: int | None = None
+    broadcastify_enabled: bool = False
+    broadcastify_system_ref: int | None = None
+    broadcastify_slot: int | None = Field(default=None, ge=1)
 
 
-def _validate_target(body: TargetBody) -> None:
+def _validate_target(body: TargetBody, db) -> None:
     allowed = {"audio": pipelines.ANALOG | set(pipelines.DIGITAL), "adsb": {"adsb"}, "ais": {"ais"}}
     if body.modulation not in allowed.get(body.kind, set()):
         raise HTTPException(422, f"Modulation {body.modulation} doesn't fit a {body.kind} target")
@@ -205,10 +208,24 @@ def _validate_target(body: TargetBody) -> None:
         raise HTTPException(422, "ClearCut upload needs a system ID and a talkgroup")
     if body.rdio_enabled and (body.rdio_system is None or body.rdio_talkgroup is None):
         raise HTTPException(422, "RDIO upload needs a system and a talkgroup")
+    if body.broadcastify_enabled:
+        if body.kind != "audio":
+            raise HTTPException(422, "Only audio targets can upload to Broadcastify")
+        if body.broadcastify_system_ref is None or body.broadcastify_slot is None:
+            raise HTTPException(422, "Broadcastify upload needs a system and a slot")
+        if db.get(BroadcastifySystem, body.broadcastify_system_ref) is None:
+            raise HTTPException(422, "That Broadcastify system doesn't exist")
 
 
 def _target_view(target: Target) -> dict:
     return {c.name: getattr(target, c.name) for c in Target.__table__.columns}
+
+
+@router.get("/broadcastify-systems")
+def broadcastify_choices(_user: User = Depends(require("manage_targets")), db=Depends(get_db)):
+    """What a target can upload to. Keys stay with administrators, and on the server."""
+    return [{"id": s.id, "name": s.name, "system_id": s.system_id}
+            for s in db.scalars(select(BroadcastifySystem).order_by(BroadcastifySystem.name))]
 
 
 @router.get("/targets")
@@ -219,7 +236,7 @@ def list_targets(_user: User = Depends(current_user), db=Depends(get_db)):
 @router.post("/targets", status_code=201)
 def create_target(body: TargetBody, request: Request, user: User = Depends(require("manage_targets")), db=Depends(get_db)):
     ctx = ctx_of(request)
-    _validate_target(body)
+    _validate_target(body, db)
     target = Target(**body.model_dump())
     db.add(target)
     db.commit()
@@ -240,7 +257,7 @@ def update_target(target_id: int, body: TargetBody, request: Request, user: User
     # Otherwise a locked recorder could be retuned by editing its target.
     if user.role != "admin" and _active_uses_locked(db, target_id):
         raise HTTPException(403, "A locked recorder uses this target. Ask an administrator.")
-    _validate_target(body)
+    _validate_target(body, db)
     # A measurement only describes the frequency and mode it was taken on.
     retuned = (body.frequency_hz, body.modulation) != (target.frequency_hz, target.modulation)
     cleared = list(db.scalars(select(SdrProfile).where(SdrProfile.target_id == target_id))) if retuned else []
