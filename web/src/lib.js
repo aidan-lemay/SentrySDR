@@ -80,5 +80,5 @@ export function formatSchedule(recorder) {
 }
 
 export const STATE_LABELS = {
-  listening: 'Listening', idle: 'Idle', error: 'Fault', offline: 'Offline',
+  listening: 'Listening', idle: 'Idle', error: 'Fault', offline: 'Offline', measuring: 'Measuring noise',
 };

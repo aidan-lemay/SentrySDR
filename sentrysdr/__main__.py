@@ -6,10 +6,22 @@ import asyncio
 import getpass
 import logging
 import os
+import signal
+import subprocess
 import sys
+import threading
 from pathlib import Path
 
 from .config import ConfigError, load_config
+from .pipelines import ANALOG, DIGITAL
+
+MEASURABLE_MODES = ANALOG | set(DIGITAL)
+
+
+async def run_slave(slave) -> None:
+    """Run until stopped. SIGTERM must unwind normally, or the call in progress is lost."""
+    asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, asyncio.current_task().cancel)
+    await slave.run()
 
 
 def cmd_run(cfg) -> int:
@@ -19,8 +31,8 @@ def cmd_run(cfg) -> int:
     if cfg.role == "slave":
         from .slave import Slave
         try:
-            asyncio.run(Slave(cfg).run())
-        except KeyboardInterrupt:
+            asyncio.run(run_slave(Slave(cfg)))
+        except (KeyboardInterrupt, asyncio.CancelledError):
             pass
         return 0
 
@@ -90,6 +102,45 @@ def cmd_list_sdrs(cfg) -> int:
     return 0
 
 
+def cmd_measure(cfg, serial: str, mhz: float, mode: str, gain: float | None, ppm: int, seconds: float) -> int:
+    from . import pipelines
+    from .sdr import enumerate_serials, index_for_serial
+
+    if serial not in cfg.serials:
+        print(f"{serial} isn't in sdr.serials, so it won't be opened.", file=sys.stderr)
+        return 2
+    if not pipelines.FREQ_MIN_HZ <= round(mhz * 1e6) <= pipelines.FREQ_MAX_HZ:
+        print("Frequency out of range.", file=sys.stderr)
+        return 2
+    index = index_for_serial(serial, enumerate_serials())
+    if index is None:
+        print(f"SDR {serial} isn't connected, or its serial is duplicated.", file=sys.stderr)
+        return 1
+    rate = pipelines.measure_rate(mode)
+    print(f"Measuring {mhz:.4f} MHz, {mode.upper()}, gain {'auto' if gain is None else gain} for {seconds:g} s...", flush=True)
+    args = pipelines.measure_args(cfg, index, round(mhz * 1e6), mode, gain, ppm)
+    proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    timer = threading.Timer(seconds + 1, proc.terminate)  # the first second is discarded
+    timer.start()
+    try:
+        pcm, stderr = proc.communicate()
+    finally:
+        timer.cancel()
+    levels = pipelines.signal_levels(pcm, rate)
+    if not levels:
+        detail = stderr.decode(errors="replace").strip().splitlines()
+        print("No samples read. If this SDR has a target, clear it or stop the service first.", file=sys.stderr)
+        print(detail[-1] if detail else "rtl_fm gave no error.", file=sys.stderr)
+        return 1
+    summary = pipelines.measure_summary(levels)
+    print(f"Level: lowest {summary['low']}, typical {summary['typical']}, highest {summary['high']}")
+    print(f"Suggested squelch: {summary['suggested']}")
+    if summary["moved"]:
+        print("The level moved a lot, so something may have transmitted. Measure again if this looks wrong.")
+    print("This is only valid for this frequency, mode and gain, and with this antenna.")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="sentrysdr")
     parser.add_argument("-c", "--config", default=os.environ.get("SENTRYSDR_CONFIG", "sentrysdr.toml"))
@@ -98,6 +149,13 @@ def main() -> int:
     admin = commands.add_parser("create-admin", help="create an administrator, or reset one's password")
     admin.add_argument("--email")
     commands.add_parser("list-sdrs", help="show connected SDRs without claiming them")
+    measure = commands.add_parser("measure", help="read a frequency's noise level and suggest a squelch")
+    measure.add_argument("--serial", required=True)
+    measure.add_argument("--mhz", type=float, required=True)
+    measure.add_argument("--mode", default="nfm", choices=sorted(MEASURABLE_MODES))
+    measure.add_argument("--gain", type=float, help="fixed gain in dB; leave out to match a target using AGC")
+    measure.add_argument("--ppm", type=int, default=0)
+    measure.add_argument("--seconds", type=float, default=10.0)
     args = parser.parse_args()
     try:
         cfg = load_config(args.config)
@@ -108,6 +166,8 @@ def main() -> int:
         return cmd_create_admin(cfg, args.email)
     if args.command == "list-sdrs":
         return cmd_list_sdrs(cfg)
+    if args.command == "measure":
+        return cmd_measure(cfg, args.serial, args.mhz, args.mode, args.gain, args.ppm, args.seconds)
     return cmd_run(cfg)
 
 

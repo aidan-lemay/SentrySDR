@@ -114,6 +114,24 @@ class Target(Base):
     rdio_talkgroup: Mapped[int | None] = mapped_column(nullable=True)
 
 
+class SdrProfile(Base):
+    """The squelch and gain measured for one stick on one target.
+
+    Noise depends on the stick, the frequency and the gain, so the two values are only
+    meaningful together. A profile replaces the target's squelch and the source's gain.
+    """
+    __tablename__ = "sdr_profiles"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source_id: Mapped[int] = mapped_column(ForeignKey("sources.id", ondelete="CASCADE"), index=True)
+    target_id: Mapped[int] = mapped_column(ForeignKey("targets.id", ondelete="CASCADE"), index=True)
+    squelch: Mapped[int] = mapped_column()
+    gain_db: Mapped[float | None] = mapped_column(nullable=True)  # None = tuner AGC
+    noise_level: Mapped[float | None] = mapped_column(nullable=True)
+    measured_at: Mapped[float | None] = mapped_column(nullable=True)
+    updated_by: Mapped[str] = mapped_column(String(320), default="")
+    __table_args__ = (Index("uq_profile_source_target", "source_id", "target_id", unique=True),)
+
+
 class Recorder(Base):
     """Pairs a target with a source. No schedule = the source's base assignment."""
     __tablename__ = "recorders"

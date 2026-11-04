@@ -75,9 +75,23 @@ This can run alongside a proxy. Requests through the proxy still get Secure cook
 | `AIS-catcher` | Run on a real RTL-SDR, and its output checked with a known message; no live ship received yet |
 | `dsd-fme` | DMR tested on air: a real simplex transmission recorded and played back clearly, with correct speed and call splitting, and live audio in step. P25, NXDN, D-STAR and YSF use the same pipeline but haven't been tested on air |
 
+Squelch, calls and noise measurement have been tested on air with NFM on three tuners: R820T (NESDR Mini), R828D and FC0012. Noise readings and squelch numbers differ between them, so measure each stick.
+
 ## Tuning call detection
 
-A call is whatever passes the target's **squelch level**. Raise it if noise keeps recording, or lower it if calls are missed. The right value depends on your antenna and site, so expect to adjust it. A squelch of `0` records continuously, split into `max_call_seconds` pieces.
+A call is whatever passes the target's **squelch level**. If the level is below the noise, the squelch never closes, and you get back-to-back `max_call_seconds` recordings of static. After 10 minutes open, the Sources page shows a warning. A squelch of `0` records continuously, split into `max_call_seconds` pieces.
+
+The noise level changes a lot with stick, frequency, mode, gain and antenna, so one number doesn't suit every target. On an R828D stick with AGC, for example, noise read about 64 at 444.85 MHz but about 540 at 154 MHz.
+
+**Squelch profiles** hold this per stick and target. On the Sources page, open **Squelch profiles** on an SDR, choose a target and gain, and select **Measure noise** while the channel is quiet. Measuring works for SDRs on slaves too, and pauses that SDR for about 10 seconds. Save the suggestion, then raise it if noise still records or lower it if weak calls are missed.
+
+- A profile replaces the target's squelch and the source's gain when that target runs on that SDR. Other SDRs and targets keep their own settings.
+- Changing a target's frequency or mode removes its profiles, because the readings no longer apply.
+- Saving a profile applies straight away if that target is running.
+- Measuring and saving need the `assign` permission. If a recorder on the SDR is locked, only an administrator can do either.
+- Master and slaves must run the same version for measuring to work on a slave.
+
+With nothing else running, `sentrysdr measure --serial <serial> --mhz 444.85 --mode nfm` takes the same reading from the terminal.
 
 ## Uploads
 

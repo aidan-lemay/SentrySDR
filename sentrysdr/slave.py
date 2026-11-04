@@ -20,7 +20,7 @@ import websockets
 
 from . import pipelines
 from .config import Config
-from .engine import Supervisor
+from .engine import MeasureError, Supervisor
 from .sdr import enumerate_serials
 
 log = logging.getLogger("sentrysdr.slave")
@@ -63,6 +63,7 @@ class Slave:
         self.live_on: set[str] = set()
         self.outgoing: asyncio.Queue | None = None
         self.spool_event: asyncio.Event | None = None
+        self.measure_tasks: set[asyncio.Task] = set()
         self.supervisor = Supervisor(
             cfg, self._spool_call, self._on_pcm, self._on_tracks, self._on_status, enumerate_fn,
         )
@@ -255,30 +256,56 @@ class Slave:
             serial = message.get("serial")
             if serial in self.cfg.serials:
                 (self.live_on.add if message.get("on") else self.live_on.discard)(serial)
+        elif kind == "measure":
+            # In its own task, so the link keeps working during the reading.
+            task = asyncio.create_task(self._measure(message))
+            self.measure_tasks.add(task)
+            task.add_done_callback(self.measure_tasks.discard)
         elif kind == "revoked":
             log.error("master revoked this node; removing the device key")
             self.key_file.unlink(missing_ok=True)
 
+    async def _measure(self, message: dict) -> None:
+        reply = {"t": "measure_result", "id": str(message.get("id", ""))[:64], "ok": False}
+        try:
+            request = pipelines.sanitize_measure(message)
+            reply["result"] = await self.supervisor.measure(str(message.get("serial", "")), **request)
+            reply["ok"] = True
+        except (pipelines.SpecError, MeasureError) as exc:
+            reply["error"] = str(exc)
+        except Exception:
+            log.exception("measurement failed")
+            reply["error"] = "The measurement failed on the node."
+        if self.outgoing is not None:
+            with contextlib.suppress(asyncio.QueueFull):
+                self.outgoing.put_nowait(json.dumps(reply))
+
     async def run(self) -> None:
         self.spool_event = asyncio.Event()
-        await self.supervisor.apply(self.load_assignments())  # keep recording while offline
-        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=15.0)) as client:
-            key = await self.ensure_enrolled(client)
-            spool_task = asyncio.create_task(self._spool_loop(client, key))
-            delay = RECONNECT_MIN
-            try:
-                while True:
-                    started = time.monotonic()
-                    try:
-                        await self._link_once(key)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:
-                        log.warning("master link lost: %s", exc)
-                    if time.monotonic() - started > RECONNECT_MAX:
-                        delay = RECONNECT_MIN
-                    await asyncio.sleep(delay)
-                    delay = min(delay * 2, RECONNECT_MAX)
-            finally:
-                spool_task.cancel()
-                await self.supervisor.shutdown()
+        try:
+            await self.supervisor.apply(self.load_assignments())  # keep recording while offline
+            async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=15.0)) as client:
+                key = await self.ensure_enrolled(client)
+                spool_task = asyncio.create_task(self._spool_loop(client, key))
+                delay = RECONNECT_MIN
+                try:
+                    while True:
+                        started = time.monotonic()
+                        try:
+                            await self._link_once(key)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            log.warning("master link lost: %s", exc)
+                        if time.monotonic() - started > RECONNECT_MAX:
+                            delay = RECONNECT_MIN
+                        await asyncio.sleep(delay)
+                        delay = min(delay * 2, RECONNECT_MAX)
+                finally:
+                    spool_task.cancel()
+        finally:
+            # Spools the call in progress. It uploads after the next start.
+            for task in list(self.measure_tasks):
+                task.cancel()
+            await asyncio.gather(*self.measure_tasks, return_exceptions=True)
+            await self.supervisor.shutdown()

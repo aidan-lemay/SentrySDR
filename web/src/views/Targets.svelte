@@ -40,9 +40,10 @@
       rdio_enabled: form.rdio_enabled, rdio_system: optionalInt(form.rdio_system), rdio_talkgroup: optionalInt(form.rdio_talkgroup),
     };
     try {
-      if (form.id) await api(`targets/${form.id}`, { method: 'PUT', body });
-      else await api('targets', { method: 'POST', body });
-      message = 'Target saved.';
+      const saved = form.id ? await api(`targets/${form.id}`, { method: 'PUT', body }) : await api('targets', { method: 'POST', body });
+      message = saved.profiles_cleared
+        ? `Target saved. Its frequency or mode changed, so ${saved.profiles_cleared} saved SDR profile(s) were removed. Measure again on the Sources page.`
+        : 'Target saved.';
       form = blank();
       await refresh();
     } catch (failure) {
@@ -120,7 +121,7 @@
       </label>
       <label class="field"><span>Squelch level</span>
         <input class="mono" type="number" inputmode="numeric" min="0" max="100000" bind:value={form.squelch} />
-        <span class="hint">Raise this if noise keeps recording. 0 records all the time.</span>
+        <span class="hint">Used on any SDR without a saved profile for this target. Must sit above the noise, so measure each SDR on the Sources page. 0 records all the time.</span>
       </label>
       <div class="field"><span>ClearCut</span><label class="tick"><input type="checkbox" bind:checked={form.clearcut_enabled} /> Upload calls to ClearCut</label></div>
       {#if form.clearcut_enabled}

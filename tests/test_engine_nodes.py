@@ -3,18 +3,23 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import signal
 import socket
 import stat
+import sys
 import textwrap
 import time
 import uuid
 from array import array
+from pathlib import Path
 
 import httpx
 import pytest
 import uvicorn
 
-from sentrysdr import pipelines
+from sentrysdr import engine, pipelines
+from sentrysdr.__main__ import cmd_measure
 from sentrysdr.config import Config
 from sentrysdr.context import Context
 from sentrysdr.engine import PcmFramer, Supervisor
@@ -515,3 +520,273 @@ async def test_kept_call_uploads_once_the_proxy_limit_is_raised(tmp_path):
     assert (slave.spool / "big.mp3").exists()
     await run_upload(slave, lambda request: httpx.Response(200, json={"ok": True}))
     assert not (slave.spool / "big.mp3").exists()
+
+
+# --- a squelch that never closes ----------------------------------------------
+# Writes steadily for a while, then goes quiet as if the squelch closed.
+FAKE_STUCK_OPEN = """\
+#!/usr/bin/env python3
+import sys, time
+for _ in range(30):
+    sys.stdout.buffer.write(b"\\x10\\x00" * 800); sys.stdout.flush(); time.sleep(0.05)
+time.sleep(60)
+"""
+
+
+async def run_stuck(tmp_path, monkeypatch, **spec_overrides):
+    monkeypatch.setattr(engine, "SQUELCH_STUCK_SECONDS", 0.3)
+    bins = tmp_path / "bin"
+    install_tool(bins, "rtl_fm", FAKE_STUCK_OPEN)
+    calls, statuses = [], {}
+    # A short maximum proves the warning spans the splits, which never close the squelch.
+    cfg = make_config(tmp_path, bin_dirs=[bins], max_call_seconds=0.2)
+    sup = supervisor(cfg, calls, statuses=statuses)
+    try:
+        await sup.apply({"SER1": spec(**spec_overrides)})
+        assert await wait_for(lambda: any(not s["in_call"] and len(calls) >= 2 for s in statuses.get("SER1", [])))
+        await wait_for(lambda: statuses["SER1"][-1]["error"] == "", timeout=3)
+    finally:
+        history = [s["error"] for s in statuses["SER1"]]
+        await sup.shutdown()
+    return history
+
+
+async def test_warns_when_squelch_stays_open_then_clears(tmp_path, monkeypatch):
+    history = await run_stuck(tmp_path, monkeypatch, squelch=60)
+    assert engine.SQUELCH_STUCK_WARNING in history
+    assert history[-1] == ""
+
+
+async def test_no_warning_for_continuous_recording(tmp_path, monkeypatch):
+    assert engine.SQUELCH_STUCK_WARNING not in await run_stuck(tmp_path, monkeypatch, squelch=0)
+
+
+# --- the measure command -------------------------------------------------------
+def measure_cfg(tmp_path, tool):
+    bins = tmp_path / "bin"
+    install_tool(bins, "rtl_fm", tool)
+    return make_config(tmp_path, bin_dirs=[bins], serials=["SER1"])
+
+
+FAKE_RAW = """\
+#!/usr/bin/env python3
+import sys, time
+for _ in range(100):
+    sys.stdout.buffer.write(b"\\x40\\x00\\xc0\\xff" * 800); sys.stdout.flush(); time.sleep(0.02)
+"""
+
+
+def test_measure_prints_a_suggestion(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr("sentrysdr.sdr.enumerate_serials", lambda: ["SER1"])
+    cfg = measure_cfg(tmp_path, FAKE_RAW)
+    assert cmd_measure(cfg, "SER1", 444.85, "nfm", None, 0, 1.0) == 0
+    out = capsys.readouterr().out
+    assert "typical 64" in out and "Suggested squelch: 103" in out
+
+
+def test_measure_refuses_an_unlisted_sdr(tmp_path, capsys):
+    assert cmd_measure(measure_cfg(tmp_path, FAKE_RAW), "OTHER", 444.85, "nfm", None, 0, 1.0) == 2
+    assert "sdr.serials" in capsys.readouterr().err
+
+
+def test_measure_explains_a_busy_sdr(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr("sentrysdr.sdr.enumerate_serials", lambda: ["SER1"])
+    cfg = measure_cfg(tmp_path, "#!/bin/sh\necho 'usb_claim_interface error -6' >&2\nexit 1\n")
+    assert cmd_measure(cfg, "SER1", 444.85, "nfm", None, 0, 1.0) == 1
+    err = capsys.readouterr().err
+    assert "clear it or stop the service" in err and "usb_claim_interface" in err
+
+
+# --- measuring pauses a worker and hands the SDR back ----------------------------
+# Raw mode gets constant noise. Anything else stays open, like a squelch on a live call.
+FAKE_MODES = """\
+#!/usr/bin/env python3
+import sys, time
+if "raw" in sys.argv:
+    for _ in range(200):
+        sys.stdout.buffer.write(b"\\x40\\x00\\xc0\\xff" * 800); sys.stdout.flush(); time.sleep(0.02)
+    sys.exit(0)
+for _ in range(1000):
+    sys.stdout.buffer.write(b"\\x10\\x00" * 800); sys.stdout.flush(); time.sleep(0.05)
+"""
+MEASURE = {"frequency_hz": 441_000_000, "modulation": "nfm", "gain_db": 19.2, "ppm": 0}
+
+
+def measuring_sup(tmp_path, monkeypatch, tool=FAKE_MODES):
+    monkeypatch.setattr(engine, "MEASURE_SECONDS", 1.2)
+    bins = tmp_path / "bin"
+    install_tool(bins, "rtl_fm", tool)
+    calls, statuses = [], {}
+    return supervisor(make_config(tmp_path, bin_dirs=[bins]), calls, statuses=statuses), calls, statuses
+
+
+async def test_measure_saves_the_call_then_resumes_the_assignment(tmp_path, monkeypatch):
+    sup, calls, statuses = measuring_sup(tmp_path, monkeypatch)
+    try:
+        await sup.apply({"SER1": spec()})
+        assert await wait_for(lambda: statuses.get("SER1") and statuses["SER1"][-1]["in_call"])
+        await asyncio.sleep(0.8)
+        result = await sup.measure("SER1", **MEASURE)
+        assert result["typical"] == 64 and result["suggested"] == 103 and result["moved"] is False
+        assert "measuring" in [s["state"] for s in statuses["SER1"]]
+        assert len(calls) == 1  # the interrupted call was kept
+        assert await wait_for(lambda: statuses["SER1"][-1]["state"] == "listening" and statuses["SER1"][-1]["in_call"])
+    finally:
+        await sup.shutdown()
+
+
+async def test_measure_leaves_an_unassigned_sdr_idle(tmp_path, monkeypatch):
+    sup, _, statuses = measuring_sup(tmp_path, monkeypatch)
+    try:
+        await sup.measure("SER1", **MEASURE)
+        assert statuses["SER1"][-1]["state"] == "idle" and sup.workers["SER1"].task is None
+    finally:
+        await sup.shutdown()
+
+
+async def test_assignment_changing_during_a_measurement_waits_for_it(tmp_path, monkeypatch):
+    sup, _, statuses = measuring_sup(tmp_path, monkeypatch)
+    try:
+        running = asyncio.create_task(sup.measure("SER1", **MEASURE))
+        assert await wait_for(lambda: sup.workers["SER1"].measuring)
+        await sup.apply({"SER1": spec(frequency_hz=444_850_000)})
+        assert sup.workers["SER1"].task is None  # nothing else may open the stick yet
+        await running
+        assert sup.workers["SER1"].spec["frequency_hz"] == 444_850_000
+        assert await wait_for(lambda: statuses["SER1"][-1]["state"] == "listening")
+    finally:
+        await sup.shutdown()
+
+
+async def test_measuring_twice_at_once_is_refused(tmp_path, monkeypatch):
+    sup, _, _ = measuring_sup(tmp_path, monkeypatch)
+    try:
+        running = asyncio.create_task(sup.measure("SER1", **MEASURE))
+        assert await wait_for(lambda: sup.workers["SER1"].measuring)
+        with pytest.raises(engine.MeasureError, match="already"):
+            await sup.measure("SER1", **MEASURE)
+        await running
+    finally:
+        await sup.shutdown()
+
+
+async def test_measure_retries_while_the_stick_is_released(tmp_path, monkeypatch):
+    marker = tmp_path / "tried"
+    tool = FAKE_MODES.replace('if "raw" in sys.argv:', f"""import os
+if not os.path.exists({str(marker)!r}):
+    open({str(marker)!r}, "w").close()
+    sys.stderr.write("usb_claim_interface error\\n")
+    sys.exit(1)
+if "raw" in sys.argv:""")
+    sup, _, _ = measuring_sup(tmp_path, monkeypatch, tool)
+    try:
+        assert (await sup.measure("SER1", **MEASURE))["typical"] == 64
+    finally:
+        await sup.shutdown()
+
+
+async def test_measure_reports_why_it_failed_and_recovers(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "MEASURE_ATTEMPTS", 2)
+    tool = "#!/bin/sh\nif echo \"$*\" | grep -q raw; then echo 'usb_claim_interface error -6' >&2; exit 1; fi\nsleep 60\n"
+    sup, _, statuses = measuring_sup(tmp_path, monkeypatch, tool)
+    try:
+        await sup.apply({"SER1": spec()})
+        assert await wait_for(lambda: statuses.get("SER1") and statuses["SER1"][-1]["state"] == "listening")
+        with pytest.raises(engine.MeasureError, match="usb_claim_interface"):
+            await sup.measure("SER1", **MEASURE)
+        assert await wait_for(lambda: statuses["SER1"][-1]["state"] == "listening")
+    finally:
+        await sup.shutdown()
+
+
+async def test_measure_refuses_a_serial_the_node_does_not_own(tmp_path, monkeypatch):
+    sup, _, _ = measuring_sup(tmp_path, monkeypatch)
+    with pytest.raises(engine.MeasureError, match="sdr.serials"):
+        await sup.measure("NOT-MINE", **MEASURE)
+
+
+async def test_slave_answers_a_measure_request_and_rejects_bad_ones(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "MEASURE_SECONDS", 1.2)
+    bins = tmp_path / "bin"
+    install_tool(bins, "rtl_fm", FAKE_MODES)
+    cfg = make_config(tmp_path, role="slave", master_url="https://sentry.example.com", bin_dirs=[bins], serials=["FIELD1"])
+    slave = Slave(cfg, enumerate_fn=lambda: ["FIELD1"])
+    slave.outgoing = asyncio.Queue()
+    try:
+        await slave.handle_message({"t": "measure", "id": "a1", "serial": "FIELD1", **MEASURE})
+        reply = json.loads(await asyncio.wait_for(slave.outgoing.get(), 15))
+        assert reply["t"] == "measure_result" and reply["id"] == "a1" and reply["ok"] and reply["result"]["typical"] == 64
+        for bad in ({"serial": "OTHER", **MEASURE}, {"serial": "FIELD1", **MEASURE, "modulation": "x; rm"}):
+            await slave.handle_message({"t": "measure", "id": "a2", **bad})
+            reply = json.loads(await asyncio.wait_for(slave.outgoing.get(), 15))
+            assert reply["ok"] is False and reply["error"]
+    finally:
+        await slave.supervisor.shutdown()
+
+
+# --- stopping a slave keeps the call in progress ---------------------------------
+RUN_SLAVE = """\
+import asyncio, sys
+from pathlib import Path
+from sentrysdr.config import Config
+from sentrysdr.__main__ import run_slave
+from sentrysdr.slave import Slave
+
+root = Path(sys.argv[1])
+cfg = Config(role="slave", master_url="http://127.0.0.1:9", enrollment_token="unused", serials=["FIELD1"],
+             data_dir=root / "data", recordings_dir=root / "rec", log_dir=root / "logs", bin_dirs=[root / "bin"])
+slave = Slave(cfg, enumerate_fn=lambda: ["FIELD1"])
+try:
+    asyncio.run(run_slave(slave))
+except asyncio.CancelledError:
+    pass
+"""
+FAKE_ON_AIR = """\
+#!/usr/bin/env python3
+import os, sys, time
+open(sys.argv[0] + ".pid", "w").write(str(os.getpid()))
+while True:
+    sys.stdout.buffer.write(b"\\x10\\x00" * 800); sys.stdout.flush(); time.sleep(0.05)
+"""
+
+
+async def test_sigterm_spools_the_call_in_progress_and_stops_the_tool(tmp_path):
+    install_tool(tmp_path / "bin", "rtl_fm", FAKE_ON_AIR)
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "assignments.json").write_text(json.dumps({"FIELD1": spec()}))
+    env = {**os.environ, "PYTHONPATH": str(Path(engine.__file__).parent.parent)}
+    process = await asyncio.create_subprocess_exec(sys.executable, "-c", RUN_SLAVE, str(tmp_path), env=env)
+    pid_file = tmp_path / "bin" / "rtl_fm.pid"
+    try:
+        assert await wait_for(pid_file.exists, timeout=20)
+        await asyncio.sleep(1.5)
+        process.send_signal(signal.SIGTERM)
+        assert await asyncio.wait_for(process.wait(), 30) == 0
+    finally:
+        if process.returncode is None:
+            process.kill()
+    spooled = list((data / "spool").glob("*.json"))
+    assert len(spooled) == 1 and spooled[0].with_suffix(".mp3").stat().st_size > 0
+    assert json.loads(spooled[0].read_text())["duration"] > 0.5
+    tool = int(pid_file.read_text())
+    assert await wait_for(lambda: not Path(f"/proc/{tool}").exists())
+
+
+async def test_stopping_a_slave_cancels_a_measurement_without_reopening_the_stick(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "MEASURE_SECONDS", 30)
+    bins = tmp_path / "bin"
+    install_tool(bins, "rtl_fm", FAKE_MODES)
+    cfg = make_config(tmp_path, role="slave", master_url="http://127.0.0.1:9", enrollment_token="unused",
+                      bin_dirs=[bins], serials=["FIELD1"])
+    slave = Slave(cfg, enumerate_fn=lambda: ["FIELD1"])
+    slave.save_assignments({"FIELD1": spec()})
+    running = asyncio.create_task(slave.run())
+    worker = slave.supervisor.workers["FIELD1"]
+    assert await wait_for(lambda: worker.task is not None)
+    await slave.handle_message({"t": "measure", "id": "a", "serial": "FIELD1", **MEASURE})
+    assert await wait_for(lambda: worker.measuring)
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+    assert not worker.measuring and worker.task is None

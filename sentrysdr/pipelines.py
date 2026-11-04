@@ -5,6 +5,9 @@ every value first, because on a slave the spec arrives over the network.
 """
 from __future__ import annotations
 
+import math
+import sys
+from array import array
 from dataclasses import dataclass
 
 from .config import Config
@@ -20,6 +23,8 @@ DIGITAL_INPUT_RATE = 48000
 DSD_OUTPUT_RATE = 8000
 FREQ_MIN_HZ = 500_000
 FREQ_MAX_HZ = 2_200_000_000
+# rtl_fm checks far shorter blocks than a measurement, so noise peaks above its average.
+SQUELCH_MARGIN = 1.6
 
 
 class SpecError(ValueError):
@@ -68,7 +73,7 @@ def rtl_fm_args(cfg: Config, index: int, spec: dict) -> list[str]:
     elif modulation == "am":
         args += ["-M", "am", "-s", str(PCM_RATE), "-l", str(spec["squelch"]), "-E", "dc"]
     elif modulation == "wfm":
-        args += ["-M", "fm", "-s", "170k", "-A", "fast", "-r", str(PCM_RATE), "-l", "0", "-E", "deemp"]
+        args += ["-M", "fm", "-s", "170k", "-A", "fast", "-r", str(PCM_RATE), "-l", str(spec["squelch"]), "-E", "deemp"]
     elif modulation in DIGITAL:
         # Decoders need the unfiltered discriminator signal at 48 kHz.
         args += ["-M", "fm", "-s", str(DIGITAL_INPUT_RATE), "-l", str(spec["squelch"])]
@@ -79,6 +84,77 @@ def rtl_fm_args(cfg: Config, index: int, spec: dict) -> list[str]:
     if spec.get("ppm"):
         args += ["-p", str(spec["ppm"])]
     return args + ["-"]
+
+
+def measure_rate(modulation: str) -> int:
+    """rtl_fm's sample rate for a mode. Its squelch scale differs between rates."""
+    if modulation == "wfm":
+        return 170_000
+    return DIGITAL_INPUT_RATE if modulation in DIGITAL else PCM_RATE
+
+
+def measure_args(cfg: Config, index: int, frequency_hz: int, modulation: str, gain_db: float | None, ppm: int = 0) -> list[str]:
+    # Raw mode outputs the same filtered samples that rtl_fm's squelch compares to -l.
+    args = [
+        cfg.binary("rtl_fm") or "rtl_fm", "-d", str(index), "-f", str(frequency_hz),
+        "-M", "raw", "-s", str(measure_rate(modulation)), "-l", "0",
+    ]
+    if gain_db is not None:
+        args += ["-g", f"{gain_db:g}"]
+    if ppm:
+        args += ["-p", str(ppm)]
+    return args + ["-"]
+
+
+def signal_levels(pcm: bytes, rate: int, settle_seconds: float = 1.0) -> list[float]:
+    """Sorted RMS of each 100 ms of interleaved I/Q, on the scale of rtl_fm's squelch."""
+    samples = array("h")
+    samples.frombytes(pcm[:len(pcm) & ~1])
+    if sys.byteorder == "big":
+        samples.byteswap()
+    block = 2 * rate // 10
+    levels = []
+    for start in range(int(2 * rate * settle_seconds), len(samples) - block + 1, block):
+        window = samples[start:start + block]
+        mean = sum(window) / block
+        levels.append(math.sqrt(sum((value - mean) ** 2 for value in window) / block))
+    return sorted(levels)
+
+
+def suggest_squelch(levels: list[float]) -> int:
+    """A level above the noise. Uses the quiet end so a brief call doesn't inflate it."""
+    return math.ceil(levels[len(levels) // 10] * SQUELCH_MARGIN)
+
+
+def measure_summary(levels: list[float]) -> dict:
+    low, typical, high = levels[len(levels) // 10], levels[len(levels) // 2], levels[-1]
+    return {
+        "low": round(low), "typical": round(typical), "high": round(high),
+        "suggested": suggest_squelch(levels),
+        "moved": high > low * 2,  # something probably transmitted during the reading
+    }
+
+
+def sanitize_measure(request: dict) -> dict:
+    """Validate a measure request. On a slave it arrives over the network."""
+    try:
+        clean = {
+            "frequency_hz": int(request["frequency_hz"]),
+            "modulation": str(request["modulation"]),
+            "gain_db": None if request.get("gain_db") is None else float(request["gain_db"]),
+            "ppm": int(request.get("ppm", 0)),
+        }
+    except (KeyError, TypeError, ValueError) as exc:
+        raise SpecError(f"bad measure request: {exc}") from exc
+    if clean["modulation"] not in ANALOG | set(DIGITAL):
+        raise SpecError("bad modulation")
+    if not FREQ_MIN_HZ <= clean["frequency_hz"] <= FREQ_MAX_HZ:
+        raise SpecError("frequency out of range")
+    if not -500 <= clean["ppm"] <= 500:
+        raise SpecError("ppm out of range")
+    if clean["gain_db"] is not None and not 0 <= clean["gain_db"] <= 60:
+        raise SpecError("gain out of range")
+    return clean
 
 
 def dsd_args(cfg: Config, spec: dict) -> list[str]:
