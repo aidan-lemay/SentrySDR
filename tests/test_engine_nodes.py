@@ -10,6 +10,7 @@ import stat
 import sys
 import textwrap
 import time
+import tomllib
 import uuid
 from array import array
 from pathlib import Path
@@ -19,7 +20,7 @@ import pytest
 import uvicorn
 
 from sentrysdr import engine, pipelines
-from sentrysdr.__main__ import cmd_measure
+from sentrysdr.__main__ import cmd_list_sdrs, cmd_measure
 from sentrysdr.config import Config
 from sentrysdr.context import Context
 from sentrysdr.engine import PcmFramer, Supervisor
@@ -810,3 +811,33 @@ async def test_changing_volume_applies_without_retuning(tmp_path):
         assert (tmp_path / "bin" / "rtl_fm.pid").read_text() == pid
     finally:
         await sup.shutdown()
+
+
+# --- list-sdrs ---------------------------------------------------------------------
+def listed_serials(output):
+    line = next(l for l in output.splitlines() if l.startswith("serials = "))
+    return tomllib.loads(line)["serials"]
+
+
+def test_list_sdrs_prints_a_line_to_paste_into_the_config(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr("sentrysdr.sdr.enumerate_serials", lambda: ["00000001", "18150304"])
+    assert cmd_list_sdrs(make_config(tmp_path, serials=["18150304"])) == 0
+    out = capsys.readouterr().out
+    assert "0: 00000001  [not configured, will not be used]" in out
+    assert "1: 18150304  [configured]" in out
+    assert "To add all of them" in out and "[sdr]" in out
+    assert listed_serials(out) == ["00000001", "18150304"]
+
+
+def test_list_sdrs_leaves_out_serials_the_app_would_refuse(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr("sentrysdr.sdr.enumerate_serials", lambda: ["DUP", "DUP", "", "GOOD"])
+    cmd_list_sdrs(make_config(tmp_path))
+    out = capsys.readouterr().out
+    assert listed_serials(out) == ["GOOD"] and "rtl_eeprom -s" in out
+
+
+def test_list_sdrs_with_nothing_usable_prints_no_line(tmp_path, monkeypatch, capsys):
+    for devices in ([], ["DUP", "DUP"]):
+        monkeypatch.setattr("sentrysdr.sdr.enumerate_serials", lambda: devices)
+        cmd_list_sdrs(make_config(tmp_path))
+        assert "serials = " not in capsys.readouterr().out

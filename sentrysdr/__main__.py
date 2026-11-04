@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import getpass
+import json
 import logging
 import os
 import signal
@@ -12,7 +13,7 @@ import sys
 import threading
 from pathlib import Path
 
-from .config import ConfigError, load_config
+from .config import SERIAL_RE, ConfigError, load_config
 from .pipelines import ANALOG, DIGITAL
 
 MEASURABLE_MODES = ANALOG | set(DIGITAL)
@@ -99,6 +100,12 @@ def cmd_list_sdrs(cfg) -> int:
         if devices.count(serial) > 1:
             note = "DUPLICATE SERIAL, fix with rtl_eeprom -s"
         print(f"{index}: {serial or '(no serial)'}  [{note}]")
+    usable = [s for s in devices if SERIAL_RE.match(s) and devices.count(s) == 1]
+    if usable:
+        print("\nTo add all of them, put this in the [sdr] section of your configuration file:")
+        print(f"serials = {json.dumps(usable)}")
+    if len(usable) < len(devices):
+        print("\nLeft out of that line: sticks with a blank or duplicate serial. Set unique serials with rtl_eeprom -s.")
     return 0
 
 
