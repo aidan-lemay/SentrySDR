@@ -23,6 +23,47 @@ The script prints the remaining steps: choose SDR serials, edit `/etc/sentrysdr/
 
 To add a slave, go to **Admin > Nodes** on the master to create a one-time token, then put the token in the slave's configuration. The token is swapped for a key that you can revoke per node.
 
+Before you rely on it, read [USB connections](#usb-connections), and [Storing recordings on another drive](#storing-recordings-on-another-drive) if recordings won't stay on the system disk.
+
+## Storing recordings on another drive
+
+Set `recordings_dir` in the master's `[storage]` section. Slaves only hold calls until the master has them, so the drive belongs on the master.
+
+The service runs as the `sentrysdr` user inside a sandbox, so a new location needs **both** of these, or the service won't start:
+
+1. **File ownership.** Create the folder yourself and give it to the service user. Do this before the first start, and again if you create or copy anything there as root or your own account:
+
+   ```sh
+   sudo install -d -o sentrysdr -g sentrysdr -m 750 /media/external/SentrySDR
+   sudo chown -R sentrysdr:sentrysdr /media/external/SentrySDR
+   sudo -u sentrysdr mkdir -p /media/external/SentrySDR/recordings/.tmp && echo OK
+   ```
+
+2. **Sandbox access.** Run `sudo systemctl edit sentrysdr` and add the lines below. An override survives re-running `install.sh`, while edits to the unit file itself don't.
+
+   ```ini
+   [Unit]
+   RequiresMountsFor=/media/external
+
+   [Service]
+   ReadWritePaths=/media/external/SentrySDR
+   ```
+
+The error tells you which one is missing:
+
+| Error | Cause | Fix |
+|---|---|---|
+| `Permission denied` | The `sentrysdr` user doesn't own the folder or can't reach it | Step 1. If it still fails, `namei -l <path>` shows which parent folder blocks it |
+| `Read-only file system` | The sandbox is blocking the path | Step 2 |
+
+`create-admin` and other commands run from a shell are outside the sandbox, so they can work while the service still fails. A traceback from `create-admin` means it stopped before saving anything, so run it again after the fix.
+
+- **Mount it first.** Check with `findmnt -T /media/external`. If it shows `/`, the drive isn't mounted, and files would go to the system disk. Mount it by UUID in `/etc/fstab` with `nofail`. With `RequiresMountsFor`, the master then won't start without the drive instead of quietly filling the system disk.
+- **Use ext4 if you can.** exFAT and NTFS don't store Linux ownership, so `chown` won't work on them. Set the owner when mounting instead, with `uid=sentrysdr,gid=sentrysdr,umask=027`. Keep `data_dir` off those filesystems, because the database can be unreliable there.
+- **Moving existing recordings.** Stop the service, copy them with `sudo rsync -a`, and update `recordings_dir`. Recordings are stored by relative path, so they keep working.
+- **If the drive disconnects while running,** saving and playing recordings fail until it's back and the service is restarted, and calls recorded in that time may be lost.
+- **Back up `data_dir` separately,** including `secret.key`. Recordings can't be found without the database.
+
 ## Publishing the master
 
 | Method | Example | Inbound ports |
@@ -63,7 +104,7 @@ This can run alongside a proxy. Requests through the proxy still get Secure cook
 - **Browser protections:** strict CSP, `HttpOnly` and `SameSite=Strict` cookies, and Host and Origin checks. tar1090 is the one exception: it needs inline scripts, so it gets a looser CSP on its own path.
 - **Radio tools:** run as argv lists, never through a shell, with all values validated first, including those arriving from the network. Decoders are started with no network options, so they open no ports.
 - **SDRs:** only serials in `sdr.serials` are ever opened. Other dongles stay free for other software. Duplicate serials are refused; fix them with `rtl_eeprom -s`.
-- **Service:** runs unprivileged under a systemd sandbox, with only its data and log folders writable. If you move `recordings_dir` or `log_dir`, add the new folder to `ReadWritePaths` in the unit.
+- **Service:** runs unprivileged under a systemd sandbox, with only its data and log folders writable. If you move `recordings_dir` or `log_dir`, see [Storing recordings on another drive](#storing-recordings-on-another-drive).
 - **Encryption on the air:** encrypted digital traffic isn't decoded. Check the rules on recording and sharing radio traffic where you operate.
 
 ## Decoder status
@@ -79,13 +120,26 @@ Squelch, calls and noise measurement have been tested on air with NFM on three t
 
 ## USB connections
 
-RTL-SDRs are USB 2.0 devices and can be sensitive to how they're connected. Three sticks behind a stacked, powered USB 3.0 hub repeatedly failed USB resets, took about four times as long to start, gave wrong noise readings, and eventually dropped off the bus. Plugged straight into the computer they ran with no errors. Use the computer's own ports or a powered USB 2.0 hub, and look for trouble with:
+> **Warning: avoid USB 3.0 hubs and stacked hubs.** Use the computer's own ports or a powered USB 2.0 hub, with one hub between the computer and the stick.
+
+RTL-SDRs are USB 2.0 devices, and a bad connection can look like a radio problem. With three sticks behind a powered USB 3.0 hub and two further levels of hub, we saw:
+
+- failed USB resets, and a stick dropping off the bus
+- `rtl_fm` taking about 4 seconds to start instead of about 1, or failing with `Failed to set center freq`
+- `rtl_fm` not responding when told to stop
+- noise readings around 60 times too high, which would suggest a squelch that misses real calls (this one lined up with the reset errors, but we couldn't reproduce it)
+
+The same sticks ran with no USB errors when plugged straight into the computer. We didn't separate USB 3.0 from the stacked hubs as the cause, so avoid both. Short extension cables were fine.
+
+To check for trouble, including on a slave:
 
 ```sh
 journalctl -k | grep -i -E "cannot reset|not accepting address|descriptor read"
 ```
 
-If a stick is unplugged, its source shows a fault, and recording resumes by itself when it's back. Other SDRs are not affected. Calls in progress are saved.
+Any of those lines means the connection needs attention, so fix it before you measure noise or trust a squelch setting. `USB disconnect` on its own is normal when you unplug something.
+
+If a stick is unplugged, its source shows a fault, and recording resumes by itself when it's back. Other SDRs keep running, and a call in progress is saved. A stick that stays connected but stops working may not show a fault, because it looks the same as a closed squelch.
 
 ## Tuning call detection
 
