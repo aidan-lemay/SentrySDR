@@ -41,6 +41,7 @@ SETTING_DEFAULTS = {
 SECRET_SETTINGS = {"rdio_api_key", "clearcut_api_key"}
 TRACK_EXPIRY_SECONDS = 60
 UPLOAD_MAX_ATTEMPTS = 12
+BROADCASTIFY_RETRY_SECONDS = 10
 DUPLICATE_UPLOAD_NOTE = "Skipped: another SDR on this channel already recorded this call."
 # ClearCut only lists recent calls, so there's no point looking for much longer.
 TRANSCRIPT_WINDOW_SECONDS = 86400
@@ -389,6 +390,9 @@ class Context:
         job.last_error = reason[:400]
         if job.attempts >= UPLOAD_MAX_ATTEMPTS:
             job.status = "failed"
+        elif job.destination == "broadcastify":
+            # Broadcastify refuses calls that arrive late: 64 seconds was already too long.
+            job.next_attempt_at = time.time() + BROADCASTIFY_RETRY_SECONDS
         else:
             job.next_attempt_at = time.time() + min(30 * 2 ** job.attempts, 3600)
 

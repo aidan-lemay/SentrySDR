@@ -178,7 +178,9 @@ Replaces trunk-recorder's `broadcastify_uploader` for conventional channels. Bro
 1. In **Admin > Settings > Broadcastify Calls systems**, add each node's name, system ID and API key, then select **Check credentials**. This sends no call.
 2. On each target, turn on **Upload calls to Broadcastify Calls**, then choose the system and the frequency's slot. Slots are on Broadcastify's Manage Calls Systems page, under Node Frequencies.
 
-All uploads go from the master, including calls recorded on slaves. A call Broadcastify skips counts as finished, and a call it rejects, or refuses for a bad API key, is not retried. The reason shows on the recording, and other calls keep uploading. Stop any other uploader on the same slot before you switch.
+All uploads go from the master, including calls recorded on slaves. A call Broadcastify skips counts as finished, and a call it rejects, or refuses for a bad API key, is not retried. The reason shows on the recording, and other calls keep uploading. Broadcastify refuses calls that arrive late (64 seconds was too late in testing), so other failures retry every 10 seconds, and calls held during an outage will probably be rejected. They stay in SentrySDR.
+
+`No-Freq-Table-Entry-For-Upload` means Broadcastify can't match the call to a frequency on that node. Check the system, the target's slot and its frequency against **Node Frequencies** on the Manage Calls Systems page. Stop any other uploader on the same slot before you switch.
 
 ### Duplicate channels
 

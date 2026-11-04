@@ -16,7 +16,7 @@ import pytest
 from sqlalchemy import select
 
 from sentrysdr import pipelines, schedule, sdr, uploaders
-from sentrysdr.context import UPLOAD_MAX_ATTEMPTS
+from sentrysdr.context import BROADCASTIFY_RETRY_SECONDS, UPLOAD_MAX_ATTEMPTS
 from sentrysdr.engine import MeasureError, VolumeControl, merge_ais_message
 from sentrysdr.models import BroadcastifySystem, Node, Recorder, Recording, SdrProfile, Source, Target, UploadJob, make_session_factory
 
@@ -1447,3 +1447,48 @@ async def test_an_expired_address_is_not_retried_and_failures_hide_the_address(a
         await ctx.process_uploads(client)
     job = bcfy_job(ctx, call)
     assert "signature" not in job.last_error and "ConnectError" in job.last_error
+
+
+async def test_no_frequency_entry_is_final_and_keeps_its_reason(admin, ctx, tmp_path):
+    _, target = bcfy_target(admin)
+    call = bcfy_recording(ctx, target, tmp_path)
+    seen = []
+    await run_bcfy(ctx, seen, reply="1 No-Freq-Table-Entry-For-Upload")
+    job = bcfy_job(ctx, call)
+    assert job.status == "failed" and "No-Freq-Table-Entry" in job.last_error and "slot" in job.last_error
+    assert len(seen) == 1 and await run_bcfy(ctx, seen) == 0
+    detail = admin.get("/api/recordings").json()["items"][0]["uploads"][0]["detail"]
+    assert "No-Freq-Table-Entry" in detail and "SKEW" not in detail
+
+
+async def test_any_other_code_1_reply_is_final(admin, ctx, tmp_path):
+    _, target = bcfy_target(admin)
+    call = bcfy_recording(ctx, target, tmp_path)
+    await run_bcfy(ctx, [], reply="1 Something-New")
+    job = bcfy_job(ctx, call)
+    assert job.status == "failed" and "Something-New" in job.last_error
+
+
+async def test_broadcastify_retries_inside_its_time_window(admin, ctx, tmp_path):
+    _, target = bcfy_target(admin)
+    call = bcfy_recording(ctx, target, tmp_path)
+    for attempt in range(1, 4):
+        with ctx.db() as session:
+            row = session.get(UploadJob, bcfy_job(ctx, call).id)
+            row.next_attempt_at = 0
+            session.commit()
+        await run_bcfy(ctx, [], post_status=500)
+        job = bcfy_job(ctx, call)
+        assert job.attempts == attempt and job.next_attempt_at - time.time() <= BROADCASTIFY_RETRY_SECONDS
+
+
+async def test_other_uploads_still_back_off_slowly(admin, ctx, tmp_path):
+    target = admin.post("/api/targets", json={"name": "T", "frequency_hz": 441_000_000, "modulation": "nfm",
+                                              "rdio_enabled": True, "rdio_system": 1, "rdio_talkgroup": 1}).json()["id"]
+    call = bcfy_recording(ctx, target, tmp_path)
+    ctx.set_setting("rdio_server", "https://rdio.example.com")
+    ctx.set_setting("rdio_api_key", ctx.secrets.seal("k"))
+    await run_bcfy(ctx, [], post_status=500)
+    with ctx.db() as session:
+        job = session.scalar(select(UploadJob).where(UploadJob.recording_id == call))
+    assert job.destination == "rdio" and job.next_attempt_at - time.time() > 30

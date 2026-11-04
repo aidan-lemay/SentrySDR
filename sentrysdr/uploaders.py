@@ -172,7 +172,12 @@ async def send_broadcastify(cfg, client: httpx.AsyncClient, server: str, system_
         code, _, reply = response.text[:2000].strip().partition(" ")
         if code == "1" and reply.startswith("SKIPPED"):
             return f"Skipped by Broadcastify: {_clean_reply(reply, api_key)}"
-        if code == "1" and reply.startswith("REJECTED"):
+        if code == "1" and reply.startswith("No-Freq-Table-Entry"):
+            raise UploadRejected(
+                f"Broadcastify has no such frequency on this node, so check the target's system, slot and frequency: {_clean_reply(reply, api_key)}"
+            )
+        if code == "1":
+            # Code 1 is a final answer about this call, so a retry can't change it.
             raise UploadRejected(f"Rejected by Broadcastify: {_clean_reply(reply, api_key)}")
         if code == "100":
             raise UploadRejected(f"Broadcastify refused the API key, so correct it under Admin > Settings: {_clean_reply(reply, api_key)}")
