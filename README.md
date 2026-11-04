@@ -10,6 +10,7 @@ It supervises existing tools instead of reimplementing them: `rtl_fm`, `ffmpeg`,
 - **Master:** holds users and recordings, serves the web UI, runs schedules, and forwards calls to RDIO and ClearCut. By default it listens on loopback only, so publish it through a tunnel or reverse proxy. Direct access by local IP is opt-in.
 - **Slave:** opens no listening ports. It dials out to the master, takes its configuration from the master's UI, and sends everything back. If the link drops, it keeps recording its last assignment and uploads the calls when the link returns.
 - **One target per SDR at a time.** A schedule takes over its source for the window, then the source returns to its assigned target.
+- **Locks.** An administrator can tick **Lock this assignment** on the Sources page. Other users then can't change that SDR's assignment or schedules, its target, or its squelch profiles, and can't measure it. There's no password. Locks set with a password in an older version stay locked, and their passwords are deleted on upgrade.
 - **Recordings stand alone.** Each keeps its own copy of the source and target names, so it stays searchable after that setup is deleted.
 
 ## Install
@@ -22,6 +23,47 @@ sudo ./scripts/install.sh master --with-decoders   # also builds readsb, tar1090
 The script prints the remaining steps: choose SDR serials, edit `/etc/sentrysdr/sentrysdr.toml`, create the first admin, and start the service. There are no default credentials. Example configurations are in [config/](config/).
 
 To add a slave, go to **Admin > Nodes** on the master to create a one-time token, then put the token in the slave's configuration. The token is swapped for a key that you can revoke per node.
+
+Before you rely on it, read [USB connections](#usb-connections), and [Storing recordings on another drive](#storing-recordings-on-another-drive) if recordings won't stay on the system disk.
+
+## Storing recordings on another drive
+
+Set `recordings_dir` in the master's `[storage]` section. Slaves only hold calls until the master has them, so the drive belongs on the master.
+
+The service runs as the `sentrysdr` user inside a sandbox, so a new location needs **both** of these, or the service won't start:
+
+1. **File ownership.** Create the folder yourself and give it to the service user. Do this before the first start, and again if you create or copy anything there as root or your own account:
+
+   ```sh
+   sudo install -d -o sentrysdr -g sentrysdr -m 750 /media/external/SentrySDR
+   sudo chown -R sentrysdr:sentrysdr /media/external/SentrySDR
+   sudo -u sentrysdr mkdir -p /media/external/SentrySDR/recordings/.tmp && echo OK
+   ```
+
+2. **Sandbox access.** Run `sudo systemctl edit sentrysdr` and add the lines below. An override survives re-running `install.sh`, while edits to the unit file itself don't.
+
+   ```ini
+   [Unit]
+   RequiresMountsFor=/media/external
+
+   [Service]
+   ReadWritePaths=/media/external/SentrySDR
+   ```
+
+The error tells you which one is missing:
+
+| Error | Cause | Fix |
+|---|---|---|
+| `Permission denied` | The `sentrysdr` user doesn't own the folder or can't reach it | Step 1. If it still fails, `namei -l <path>` shows which parent folder blocks it |
+| `Read-only file system` | The sandbox is blocking the path | Step 2 |
+
+`create-admin` and other commands run from a shell are outside the sandbox, so they can work while the service still fails. A traceback from `create-admin` means it stopped before saving anything, so run it again after the fix.
+
+- **Mount it first.** Check with `findmnt -T /media/external`. If it shows `/`, the drive isn't mounted, and files would go to the system disk. Mount it by UUID in `/etc/fstab` with `nofail`. With `RequiresMountsFor`, the master then won't start without the drive instead of quietly filling the system disk.
+- **Use ext4 if you can.** exFAT and NTFS don't store Linux ownership, so `chown` won't work on them. Set the owner when mounting instead, with `uid=sentrysdr,gid=sentrysdr,umask=027`. Keep `data_dir` off those filesystems, because the database can be unreliable there.
+- **Moving existing recordings.** Stop the service, copy them with `sudo rsync -a`, and update `recordings_dir`. Recordings are stored by relative path, so they keep working.
+- **If the drive disconnects while running,** saving and playing recordings fail until it's back and the service is restarted, and calls recorded in that time may be lost.
+- **Back up `data_dir` separately,** including `secret.key`. Recordings can't be found without the database.
 
 ## Publishing the master
 
@@ -63,7 +105,7 @@ This can run alongside a proxy. Requests through the proxy still get Secure cook
 - **Browser protections:** strict CSP, `HttpOnly` and `SameSite=Strict` cookies, and Host and Origin checks. tar1090 is the one exception: it needs inline scripts, so it gets a looser CSP on its own path.
 - **Radio tools:** run as argv lists, never through a shell, with all values validated first, including those arriving from the network. Decoders are started with no network options, so they open no ports.
 - **SDRs:** only serials in `sdr.serials` are ever opened. Other dongles stay free for other software. Duplicate serials are refused; fix them with `rtl_eeprom -s`.
-- **Service:** runs unprivileged under a systemd sandbox, with only its data and log folders writable. If you move `recordings_dir` or `log_dir`, add the new folder to `ReadWritePaths` in the unit.
+- **Service:** runs unprivileged under a systemd sandbox, with only its data and log folders writable. If you move `recordings_dir` or `log_dir`, see [Storing recordings on another drive](#storing-recordings-on-another-drive).
 - **Encryption on the air:** encrypted digital traffic isn't decoded. Check the rules on recording and sharing radio traffic where you operate.
 
 ## Decoder status
@@ -77,6 +119,29 @@ This can run alongside a proxy. Requests through the proxy still get Secure cook
 
 Squelch, calls and noise measurement have been tested on air with NFM on three tuners: R820T (NESDR Mini), R828D and FC0012. Noise readings and squelch numbers differ between them, so measure each stick.
 
+## USB connections
+
+> **Warning: avoid USB 3.0 hubs and stacked hubs.** Use the computer's own ports or a powered USB 2.0 hub, with one hub between the computer and the stick.
+
+RTL-SDRs are USB 2.0 devices, and a bad connection can look like a radio problem. With three sticks behind a powered USB 3.0 hub and two further levels of hub, we saw:
+
+- failed USB resets, and a stick dropping off the bus
+- `rtl_fm` taking about 4 seconds to start instead of about 1, or failing with `Failed to set center freq`
+- `rtl_fm` not responding when told to stop
+- noise readings around 60 times too high, which would suggest a squelch that misses real calls (this one lined up with the reset errors, but we couldn't reproduce it)
+
+The same sticks ran with no USB errors when plugged straight into the computer. We didn't separate USB 3.0 from the stacked hubs as the cause, so avoid both. Short extension cables were fine.
+
+To check for trouble, including on a slave:
+
+```sh
+journalctl -k | grep -i -E "cannot reset|not accepting address|descriptor read"
+```
+
+Any of those lines means the connection needs attention, so fix it before you measure noise or trust a squelch setting. `USB disconnect` on its own is normal when you unplug something.
+
+If a stick is unplugged, its source shows a fault, and recording resumes by itself when it's back. Other SDRs keep running, and a call in progress is saved. A stick that stays connected but stops working may not show a fault, because it looks the same as a closed squelch.
+
 ## Tuning call detection
 
 A call is whatever passes the target's **squelch level**. If the level is below the noise, the squelch never closes, and you get back-to-back `max_call_seconds` recordings of static. After 10 minutes open, the Sources page shows a warning. A squelch of `0` records continuously, split into `max_call_seconds` pieces.
@@ -88,14 +153,40 @@ The noise level changes a lot with stick, frequency, mode, gain and antenna, so 
 - A profile replaces the target's squelch and the source's gain when that target runs on that SDR. Other SDRs and targets keep their own settings.
 - Changing a target's frequency or mode removes its profiles, because the readings no longer apply.
 - Saving a profile applies straight away if that target is running.
-- Measuring and saving need the `assign` permission. If a recorder on the SDR is locked, only an administrator can do either.
+- Measuring and saving need the `assign` permission. If the SDR's assignment is locked, only an administrator can do either.
 - Master and slaves must run the same version for measuring to work on a slave.
+
+A new source's gain box starts at 40.2 dB. Leave it empty for automatic gain (AGC). 0 is a real 0 dB, not automatic, and may miss most calls. Existing sources keep their setting.
+
+Noise also changes with how a stick is connected, and rises when other sticks run nearby. Measure each SDR in its final position with the others running, and measure again if it records noise by itself.
 
 With nothing else running, `sentrysdr measure --serial <serial> --mhz 444.85 --mode nfm` takes the same reading from the terminal.
 
 ## Uploads
 
 Set server URLs and keys in **Admin > Settings**, then enable uploads per target. Failed uploads retry with increasing delays, up to 12 attempts.
+
+A target's **Volume** setting applies to its recordings, uploads and live audio. It doesn't affect squelch. Any setting other than 0 dB also removes DC, which stops a tuning offset from clipping the start of a call.
+
+### Broadcastify Calls
+
+Replaces trunk-recorder's `broadcastify_uploader` for conventional channels. Broadcastify must already have approved your node: apply at broadcastify.com/apply/calls, and each frequency needs a matching RadioReference entry. See Broadcastify's [upload API](https://support.broadcastify.com/hc/en-us/articles/360049971311-Broadcastify-Calls-Ingest-Upload-API) and [production status page](https://www.broadcastify.com/calls/status/).
+
+- **Keep the clock right.** Broadcastify requires accurate time, and it rejects or wrongly deduplicates calls with bad timestamps. Each call's time comes from the machine that recorded it, so check the master and every slave with `timedatectl`, which should say `System clock synchronized: yes`. A Pi usually has no battery-backed clock, so it needs network time.
+- **Credentials are separate per environment.** Production credentials only work on `https://api.broadcastify.com/call-upload`. Development credentials are issued separately and only work on `https://api.broadcastify.com/call-upload-dev`. Don't try one on the other.
+
+1. In **Admin > Settings > Broadcastify Calls systems**, add each node's name, system ID and API key, then select **Check credentials**. This sends no call.
+2. On each target, turn on **Upload calls to Broadcastify Calls**, then choose the system and the frequency's slot. Slots are on Broadcastify's Manage Calls Systems page, under Node Frequencies.
+
+All uploads go from the master, including calls recorded on slaves. A call Broadcastify skips counts as finished, and a call it rejects, or refuses for a bad API key, is not retried. The reason shows on the recording, and other calls keep uploading. Broadcastify refuses calls that arrive late (64 seconds was too late in testing), so other failures retry every 10 seconds, and calls held during an outage will probably be rejected. They stay in SentrySDR.
+
+`No-Freq-Table-Entry-For-Upload` means Broadcastify can't match the call to a frequency on that node. Check the system, the target's slot and its frequency against **Node Frequencies** on the Manage Calls Systems page. Stop any other uploader on the same slot before you switch.
+
+### Duplicate channels
+
+- A Broadcastify slot can only belong to one target, and saving a second is refused.
+- Saving a target with the same frequency and mode as another, or giving an SDR a channel that another SDR can also record, shows a warning.
+- If two SDRs do record the same target at once, both recordings are kept, but only the first copy of each call is uploaded. The other shows as skipped.
 
 ### ClearCut transcripts
 

@@ -79,6 +79,9 @@ export function formatSchedule(recorder) {
   return `${days} · ${recorder.schedule_start}–${recorder.schedule_end}`;
 }
 
+// Where new gain boxes start. Tested on air on R820T and R828D sticks. Empty means AGC.
+export const DEFAULT_GAIN_DB = 40.2;
+
 export const STATE_LABELS = {
   listening: 'Listening', idle: 'Idle', error: 'Fault', offline: 'Offline', measuring: 'Measuring noise',
 };

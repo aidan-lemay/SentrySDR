@@ -10,6 +10,7 @@ import stat
 import sys
 import textwrap
 import time
+import tomllib
 import uuid
 from array import array
 from pathlib import Path
@@ -19,7 +20,7 @@ import pytest
 import uvicorn
 
 from sentrysdr import engine, pipelines
-from sentrysdr.__main__ import cmd_measure
+from sentrysdr.__main__ import cmd_list_sdrs, cmd_measure
 from sentrysdr.config import Config
 from sentrysdr.context import Context
 from sentrysdr.engine import PcmFramer, Supervisor
@@ -581,7 +582,7 @@ def test_measure_prints_a_suggestion(tmp_path, monkeypatch, capsys):
     cfg = measure_cfg(tmp_path, FAKE_RAW)
     assert cmd_measure(cfg, "SER1", 444.85, "nfm", None, 0, 1.0) == 0
     out = capsys.readouterr().out
-    assert "typical 64" in out and "Suggested squelch: 103" in out
+    assert "typical 64" in out and "Suggested squelch: 128" in out
 
 
 def test_measure_refuses_an_unlisted_sdr(tmp_path, capsys):
@@ -627,7 +628,7 @@ async def test_measure_saves_the_call_then_resumes_the_assignment(tmp_path, monk
         assert await wait_for(lambda: statuses.get("SER1") and statuses["SER1"][-1]["in_call"])
         await asyncio.sleep(0.8)
         result = await sup.measure("SER1", **MEASURE)
-        assert result["typical"] == 64 and result["suggested"] == 103 and result["moved"] is False
+        assert result["typical"] == 64 and result["suggested"] == 128 and result["moved"] is False
         assert "measuring" in [s["state"] for s in statuses["SER1"]]
         assert len(calls) == 1  # the interrupted call was kept
         assert await wait_for(lambda: statuses["SER1"][-1]["state"] == "listening" and statuses["SER1"][-1]["in_call"])
@@ -790,3 +791,53 @@ async def test_stopping_a_slave_cancels_a_measurement_without_reopening_the_stic
     with pytest.raises(asyncio.CancelledError):
         await running
     assert not worker.measuring and worker.task is None
+
+
+# --- changing volume keeps the same radio session ---------------------------------
+async def test_changing_volume_applies_without_retuning(tmp_path):
+    install_tool(tmp_path / "bin", "rtl_fm", FAKE_ON_AIR)
+    chunks, calls, statuses = [], [], {}
+    cfg = make_config(tmp_path, bin_dirs=[tmp_path / "bin"])
+    sup = supervisor(cfg, calls, pcm=lambda serial, data, rate: chunks.append(data), statuses=statuses)
+    try:
+        await sup.apply({"SER1": spec()})
+        assert await wait_for(lambda: len(chunks) > 2)
+        pid = (tmp_path / "bin" / "rtl_fm.pid").read_text()
+        assert chunks[-1][:2] == b"\x10\x00"
+        await sup.apply({"SER1": spec(volume_db=12)})
+        chunks.clear()
+        assert await wait_for(lambda: len(chunks) > 40)
+        assert chunks[-1][:2] != b"\x10\x00"  # DC is removed once boosted
+        assert (tmp_path / "bin" / "rtl_fm.pid").read_text() == pid
+    finally:
+        await sup.shutdown()
+
+
+# --- list-sdrs ---------------------------------------------------------------------
+def listed_serials(output):
+    line = next(l for l in output.splitlines() if l.startswith("serials = "))
+    return tomllib.loads(line)["serials"]
+
+
+def test_list_sdrs_prints_a_line_to_paste_into_the_config(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr("sentrysdr.sdr.enumerate_serials", lambda: ["00000001", "18150304"])
+    assert cmd_list_sdrs(make_config(tmp_path, serials=["18150304"])) == 0
+    out = capsys.readouterr().out
+    assert "0: 00000001  [not configured, will not be used]" in out
+    assert "1: 18150304  [configured]" in out
+    assert "To add all of them" in out and "[sdr]" in out
+    assert listed_serials(out) == ["00000001", "18150304"]
+
+
+def test_list_sdrs_leaves_out_serials_the_app_would_refuse(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr("sentrysdr.sdr.enumerate_serials", lambda: ["DUP", "DUP", "", "GOOD"])
+    cmd_list_sdrs(make_config(tmp_path))
+    out = capsys.readouterr().out
+    assert listed_serials(out) == ["GOOD"] and "rtl_eeprom -s" in out
+
+
+def test_list_sdrs_with_nothing_usable_prints_no_line(tmp_path, monkeypatch, capsys):
+    for devices in ([], ["DUP", "DUP"]):
+        monkeypatch.setattr("sentrysdr.sdr.enumerate_serials", lambda: devices)
+        cmd_list_sdrs(make_config(tmp_path))
+        assert "serials = " not in capsys.readouterr().out

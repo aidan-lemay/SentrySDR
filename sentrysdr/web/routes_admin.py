@@ -5,13 +5,14 @@ import ipaddress
 import secrets as pysecrets
 from urllib.parse import urlsplit
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import or_, select
 
-from .. import security
+from .. import security, uploaders
 from ..context import SECRET_SETTINGS, SETTING_DEFAULTS
-from ..models import AuditLog, Ban, User, UserSession
+from ..models import AuditLog, Ban, BroadcastifySystem, Target, User, UserSession
 from .deps import ALL_PERMISSIONS, admin_user, ctx_of, effective_permissions, get_db, ip_of
 from .routes_account import check_new_password, normalize_email, revoke_sessions
 
@@ -206,6 +207,83 @@ def remove_ban(ban_id: int, request: Request, admin: User = Depends(admin_user),
     return {"detail": "Removed"}
 
 
+# --- Broadcastify Calls nodes -------------------------------------------------
+def _system_view(system: BroadcastifySystem) -> dict:
+    return {"id": system.id, "name": system.name, "system_id": system.system_id, "key_set": bool(system.api_key_sealed)}
+
+
+class BroadcastifyBody(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    system_id: int = Field(ge=1)
+    api_key: str | None = Field(default=None, max_length=500)  # leave out to keep the saved key
+
+
+@router.get("/broadcastify")
+def list_broadcastify(db=Depends(get_db)):
+    return [_system_view(s) for s in db.scalars(select(BroadcastifySystem).order_by(BroadcastifySystem.name))]
+
+
+@router.post("/broadcastify", status_code=201)
+def create_broadcastify(body: BroadcastifyBody, request: Request, admin: User = Depends(admin_user), db=Depends(get_db)):
+    ctx = ctx_of(request)
+    if not body.api_key:
+        raise HTTPException(422, "An API key is required")
+    system = BroadcastifySystem(name=body.name, system_id=body.system_id, api_key_sealed=ctx.secrets.seal(body.api_key))
+    db.add(system)
+    db.commit()
+    ctx.audit("broadcastify.created", user=admin, ip=ip_of(request), target=system.name)
+    return _system_view(system)
+
+
+@router.put("/broadcastify/{system_ref}")
+def update_broadcastify(system_ref: int, body: BroadcastifyBody, request: Request, admin: User = Depends(admin_user), db=Depends(get_db)):
+    ctx = ctx_of(request)
+    system = db.get(BroadcastifySystem, system_ref)
+    if system is None:
+        raise HTTPException(404, "System not found")
+    system.name, system.system_id = body.name, body.system_id
+    if body.api_key:
+        system.api_key_sealed = ctx.secrets.seal(body.api_key)
+    db.commit()
+    ctx.audit("broadcastify.updated", user=admin, ip=ip_of(request), target=system.name,
+              details={"key_changed": bool(body.api_key)})
+    return _system_view(system)
+
+
+@router.delete("/broadcastify/{system_ref}")
+def delete_broadcastify(system_ref: int, request: Request, admin: User = Depends(admin_user), db=Depends(get_db)):
+    ctx = ctx_of(request)
+    system = db.get(BroadcastifySystem, system_ref)
+    if system is None:
+        raise HTTPException(404, "System not found")
+    if db.scalar(select(Target.id).where(Target.broadcastify_system_ref == system_ref, Target.broadcastify_enabled.is_(True))):
+        raise HTTPException(409, "A target still uploads to this system. Change that target first.")
+    name = system.name
+    db.delete(system)
+    db.commit()
+    ctx.audit("broadcastify.deleted", user=admin, ip=ip_of(request), target=name)
+    return {"detail": "Deleted"}
+
+
+@router.post("/broadcastify/{system_ref}/test")
+async def test_broadcastify(system_ref: int, request: Request, admin: User = Depends(admin_user), db=Depends(get_db)):
+    """Check saved credentials with Broadcastify. Sends no call."""
+    ctx = ctx_of(request)
+    system = db.get(BroadcastifySystem, system_ref)
+    if system is None:
+        raise HTTPException(404, "System not found")
+    server, key, number, name = ctx.get_setting("broadcastify_server"), ctx.secrets.open(system.api_key_sealed), system.system_id, system.name
+    db.commit()
+    if not server or not key:
+        raise HTTPException(409, "The Broadcastify server or this system's key isn't set")
+    ctx.audit("broadcastify.tested", user=admin, ip=ip_of(request), target=name)
+    try:
+        async with httpx.AsyncClient(transport=ctx.http_transport, timeout=uploaders.UPLOAD_TIMEOUT, follow_redirects=False) as client:
+            return {"reply": await uploaders.broadcastify_test(client, server, number, key)}
+    except (uploaders.UploadError, httpx.HTTPError) as exc:
+        raise HTTPException(502, str(exc)[:200] or "Couldn't reach Broadcastify") from None
+
+
 @router.get("/settings")
 def get_settings(request: Request):
     ctx = ctx_of(request)
@@ -226,6 +304,7 @@ class SettingsBody(BaseModel):
     clearcut_server: str | None = Field(default=None, max_length=500)
     clearcut_api_key: str | None = Field(default=None, max_length=500)
     clearcut_page_url: str | None = Field(default=None, max_length=500)
+    broadcastify_server: str | None = Field(default=None, max_length=500)
     map_tile_url: str | None = Field(default=None, max_length=500)
 
 

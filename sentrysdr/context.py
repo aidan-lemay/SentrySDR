@@ -15,13 +15,13 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import httpx
-from sqlalchemy import delete, select
+from sqlalchemy import delete, or_, select
 
 from . import pipelines, schedule, uploaders
 from .config import Config
 from .engine import MeasureError, Supervisor
 from .live import LiveHub
-from .models import AuditLog, Node, Recorder, Recording, SdrProfile, Setting, Source, Target, UploadJob, make_session_factory
+from .models import AuditLog, BroadcastifySystem, Node, Recorder, Recording, SdrProfile, Setting, Source, Target, UploadJob, make_session_factory
 from .sdr import enumerate_serials
 from .security import RateLimiter, SecretBox
 
@@ -35,11 +35,14 @@ SETTING_DEFAULTS = {
     "rdio_server": "",
     "clearcut_server": "",
     "clearcut_page_url": "",
+    "broadcastify_server": "https://api.broadcastify.com/call-upload",
     "map_tile_url": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
 }
 SECRET_SETTINGS = {"rdio_api_key", "clearcut_api_key"}
 TRACK_EXPIRY_SECONDS = 60
 UPLOAD_MAX_ATTEMPTS = 12
+BROADCASTIFY_RETRY_SECONDS = 10
+DUPLICATE_UPLOAD_NOTE = "Skipped: another SDR on this channel already recorded this call."
 # ClearCut only lists recent calls, so there's no point looking for much longer.
 TRANSCRIPT_WINDOW_SECONDS = 86400
 TRANSCRIPT_POLL_SECONDS = 60
@@ -203,7 +206,7 @@ class Context:
                         "modulation": target.modulation,
                         "squelch": profile.squelch if profile else target.squelch,
                         "gain_db": profile.gain_db if profile else source.gain_db,
-                        "ppm": source.ppm,
+                        "ppm": source.ppm, "volume_db": target.volume_db or 0,
                     })
                 except pipelines.SpecError as exc:
                     log.error("recorder %s has an invalid configuration: %s", recorder.id, exc)
@@ -277,14 +280,31 @@ class Context:
             session.add(recording)
             target = session.get(Target, meta["target_id"]) if meta.get("target_id") else None
             if target is not None:
+                # The recording stays, but a feed should only get one copy of a call.
+                duplicate = self._heard_on_another_sdr(session, recording)
+                extra = {"status": "done", "last_error": DUPLICATE_UPLOAD_NOTE} if duplicate else {}
                 if target.clearcut_enabled and target.clearcut_id is not None:
-                    session.add(UploadJob(recording_id=call_id, destination="clearcut"))
-                    recording.clearcut_system = target.clearcut_system
-                    recording.clearcut_talkgroup = target.clearcut_id
+                    session.add(UploadJob(recording_id=call_id, destination="clearcut", **extra))
+                    if not duplicate:
+                        recording.clearcut_system = target.clearcut_system
+                        recording.clearcut_talkgroup = target.clearcut_id
                 if target.rdio_enabled and target.rdio_system is not None and target.rdio_talkgroup is not None:
-                    session.add(UploadJob(recording_id=call_id, destination="rdio"))
+                    session.add(UploadJob(recording_id=call_id, destination="rdio", **extra))
+                if target.broadcastify_enabled and target.broadcastify_system_ref is not None and target.broadcastify_slot is not None:
+                    session.add(UploadJob(recording_id=call_id, destination="broadcastify", **extra))
             session.commit()
         return True
+
+    @staticmethod
+    def _heard_on_another_sdr(session, recording: Recording) -> bool:
+        """True if a different SDR on the same target already has an overlapping call."""
+        return session.scalar(select(Recording.id).where(
+            Recording.id != recording.id,
+            Recording.target_id == recording.target_id,
+            Recording.started_at < recording.ended_at,
+            Recording.ended_at > recording.started_at,
+            or_(Recording.node_name != recording.node_name, Recording.serial != recording.serial),
+        ).limit(1)) is not None
 
     def recording_path(self, recording: Recording) -> Path | None:
         """Resolve a stored path, refusing anything outside the recordings folder."""
@@ -355,9 +375,26 @@ class Context:
                 select(UploadJob).where(UploadJob.status == "pending", UploadJob.next_attempt_at <= time.time()).limit(10)
             ))
             for job in jobs:
-                await self._attempt_upload(session, client, job)
+                try:
+                    await self._attempt_upload(session, client, job)
+                except Exception as exc:
+                    # One bad call must never hold up the calls queued behind it.
+                    log.exception("upload %s to %s hit an unexpected error", job.recording_id, job.destination)
+                    session.rollback()
+                    self._retry_later(job, f"Unexpected error: {type(exc).__name__}")
                 session.commit()
             return len(jobs)
+
+    def _retry_later(self, job: UploadJob, reason: str) -> None:
+        job.attempts += 1
+        job.last_error = reason[:400]
+        if job.attempts >= UPLOAD_MAX_ATTEMPTS:
+            job.status = "failed"
+        elif job.destination == "broadcastify":
+            # Broadcastify refuses calls that arrive late: 64 seconds was already too long.
+            job.next_attempt_at = time.time() + BROADCASTIFY_RETRY_SECONDS
+        else:
+            job.next_attempt_at = time.time() + min(30 * 2 ** job.attempts, 3600)
 
     async def _attempt_upload(self, session, client: httpx.AsyncClient, job: UploadJob) -> None:
         recording = session.get(Recording, job.recording_id)
@@ -366,25 +403,32 @@ class Context:
         if audio is None or target is None:
             job.status, job.last_error = "failed", "recording or target no longer exists"
             return
+        note = ""
         try:
             server = self.get_setting(f"{job.destination}_server")
-            key = self.get_secret(f"{job.destination}_api_key")
-            if not server or not key:
-                raise uploaders.UploadError(f"{job.destination} server or key is not configured")
-            if job.destination == "rdio":
-                await uploaders.send_rdio(client, server, key, recording, target, audio)
+            if job.destination == "broadcastify":
+                system = session.get(BroadcastifySystem, target.broadcastify_system_ref)
+                key = self.secrets.open(system.api_key_sealed) if system else ""
+                if not server or not key:
+                    raise uploaders.UploadError("broadcastify server or system is not configured")
+                note = await uploaders.send_broadcastify(self.cfg, client, server, system.system_id, key, recording, target, audio)
             else:
-                await uploaders.send_clearcut(self.cfg, client, server, key, recording, target, audio)
-        except (uploaders.UploadError, httpx.HTTPError, OSError) as exc:
+                key = self.get_secret(f"{job.destination}_api_key")
+                if not server or not key:
+                    raise uploaders.UploadError(f"{job.destination} server or key is not configured")
+                if job.destination == "rdio":
+                    await uploaders.send_rdio(client, server, key, recording, target, audio)
+                else:
+                    await uploaders.send_clearcut(self.cfg, client, server, key, recording, target, audio)
+        except uploaders.UploadRejected as exc:
             job.attempts += 1
-            job.last_error = str(exc)[:400] or type(exc).__name__
-            if job.attempts >= UPLOAD_MAX_ATTEMPTS:
-                job.status = "failed"
-            else:
-                job.next_attempt_at = time.time() + min(30 * 2 ** job.attempts, 3600)
+            job.status, job.last_error = "failed", str(exc)[:400]
+            log.warning("upload %s to %s rejected: %s", job.recording_id, job.destination, job.last_error)
+        except (uploaders.UploadError, httpx.HTTPError, OSError) as exc:
+            self._retry_later(job, str(exc) or type(exc).__name__)
             log.warning("upload %s to %s failed: %s", job.recording_id, job.destination, job.last_error)
         else:
-            job.status, job.last_error = "done", ""
+            job.status, job.last_error = "done", note
 
     async def _transcript_loop(self) -> None:
         async with httpx.AsyncClient(timeout=uploaders.UPLOAD_TIMEOUT, follow_redirects=False) as client:

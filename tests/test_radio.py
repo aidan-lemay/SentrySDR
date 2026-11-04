@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import sqlite3
+import subprocess
 import time
 import uuid
 from array import array
@@ -13,8 +16,9 @@ import pytest
 from sqlalchemy import select
 
 from sentrysdr import pipelines, schedule, sdr, uploaders
-from sentrysdr.engine import MeasureError, merge_ais_message
-from sentrysdr.models import Recording, SdrProfile, UploadJob
+from sentrysdr.context import BROADCASTIFY_RETRY_SECONDS, UPLOAD_MAX_ATTEMPTS
+from sentrysdr.engine import MeasureError, VolumeControl, merge_ais_message
+from sentrysdr.models import BroadcastifySystem, Node, Recorder, Recording, SdrProfile, Source, Target, UploadJob, make_session_factory
 
 from .conftest import ADMIN_EMAIL, PASSWORD, add_user, client_for
 
@@ -125,62 +129,114 @@ def test_permission_override_grants_listener_assign(ctx, app, admin):
     assert "download" not in client.get("/api/me").json()["permissions"]
 
 
-def test_lock_requires_password_for_users(ctx, admin, operator):
-    source, first, second = make_source(admin), make_target(admin), make_target(admin, "Other", 145_000_000)
-    admin.post(f"/api/sources/{source}/assign", json={"target_id": first})
-    assert admin.post(f"/api/sources/{source}/lock", json={"password": "open-sesame"}).status_code == 200
+def lock(admin, source):
+    assert admin.post(f"/api/sources/{source}/lock").status_code == 200
 
+
+def test_a_locked_assignment_is_admin_only(ctx, admin, operator):
+    source, first, second = make_source(admin), make_target(admin), make_target(admin, "Other", 145_000_000)
     url = f"/api/sources/{source}/assign"
-    assert operator.post(url, json={"target_id": second}).json()["detail"] == "locked"
-    assert operator.post(url, json={"target_id": second, "lock_password": "wrong"}).status_code == 403
+    admin.post(url, json={"target_id": first})
+    lock(admin, source)
+    assert source_row(operator, source)["locked"] is True
+    for body in ({"target_id": second}, {"target_id": None}):
+        reply = operator.post(url, json=body)
+        assert reply.status_code == 403 and "administrator" in reply.json()["detail"]
     assert ctx.assignments()[ctx.local_node_id]["SER1"]["target_id"] == first
-    assert operator.post(url, json={"target_id": second, "lock_password": "open-sesame"}).status_code == 200
+    assert any(e["action"] == "recorder.lock_denied" for e in admin.get("/api/admin/audit").json())
+    assert admin.post(url, json={"target_id": second}).status_code == 200
     assert ctx.assignments()[ctx.local_node_id]["SER1"]["target_id"] == second
+    assert source_row(operator, source)["locked"] is True  # reassigning keeps the lock
 
 
-def test_admin_overrides_lock_without_password(ctx, admin):
+def test_old_clients_cannot_use_a_password_to_get_past_a_lock(admin, operator):
     source, first, second = make_source(admin), make_target(admin), make_target(admin, "Other", 145_000_000)
     admin.post(f"/api/sources/{source}/assign", json={"target_id": first})
-    admin.post(f"/api/sources/{source}/lock", json={"password": "open-sesame"})
-    assert admin.post(f"/api/sources/{source}/assign", json={"target_id": second}).status_code == 200
+    lock(admin, source)
+    reply = operator.post(f"/api/sources/{source}/assign", json={"target_id": second, "lock_password": "anything"})
+    assert reply.status_code == 403
 
 
-def test_lock_password_guessing_rate_limited(admin, operator):
+def test_unlocking_lets_users_change_it_again(ctx, admin, operator):
+    source, first, second = make_source(admin), make_target(admin), make_target(admin, "Other", 145_000_000)
+    url = f"/api/sources/{source}/assign"
+    admin.post(url, json={"target_id": first})
+    lock(admin, source)
+    assert admin.delete(f"/api/sources/{source}/lock").status_code == 200
+    assert source_row(operator, source)["locked"] is False
+    assert operator.post(url, json={"target_id": second}).status_code == 200
+
+
+def test_only_admins_can_lock_or_unlock(admin, operator, listener, app):
     source, target = make_source(admin), make_target(admin)
     admin.post(f"/api/sources/{source}/assign", json={"target_id": target})
-    admin.post(f"/api/sources/{source}/lock", json={"password": "open-sesame"})
-    url = f"/api/sources/{source}/assign"
-    codes = [operator.post(url, json={"target_id": target, "lock_password": f"guess{i}"}).status_code for i in range(9)]
-    assert codes[:8] == [403] * 8 and codes[8] == 429
+    for client in (operator, listener):
+        assert client.post(f"/api/sources/{source}/lock").status_code == 403
+    lock(admin, source)
+    for client in (operator, listener):
+        assert client.delete(f"/api/sources/{source}/lock").status_code == 403
+    assert client_for(app).post(f"/api/sources/{source}/lock").status_code == 401
+    assert source_row(admin, source)["locked"] is True
 
 
-def test_schedule_cannot_bypass_a_lock(admin, operator):
+def test_nothing_to_lock_without_an_assignment(admin):
+    assert admin.post(f"/api/sources/{make_source(admin)}/lock").status_code == 409
+
+
+def test_schedules_cannot_bypass_a_lock(admin, operator):
     source, first, second = make_source(admin), make_target(admin), make_target(admin, "Other", 145_000_000)
+    other = make_source(admin, "SER2", "Other stick")
     admin.post(f"/api/sources/{source}/assign", json={"target_id": first})
-    admin.post(f"/api/sources/{source}/lock", json={"password": "open-sesame"})
     body = {"name": "sneak", "source_id": source, "target_id": second, "schedule_days": [1],
             "schedule_start": "22:00", "schedule_end": "23:00"}
+    existing = admin.post("/api/recorders", json=body).json()["id"]
+    elsewhere = admin.post("/api/recorders", json={**body, "name": "free", "source_id": other}).json()["id"]
+    lock(admin, source)
     assert operator.post("/api/recorders", json=body).status_code == 403
-    assert operator.post("/api/recorders", json={**body, "lock_password": "open-sesame"}).status_code == 201
+    assert operator.put(f"/api/recorders/{existing}", json=body).status_code == 403
+    assert operator.delete(f"/api/recorders/{existing}").status_code == 403
+    assert operator.put(f"/api/recorders/{elsewhere}", json={**body, "source_id": source}).status_code == 403  # moving one in
+    assert operator.put(f"/api/recorders/{existing}", json={**body, "source_id": other}).status_code == 403  # moving one out
+    assert admin.delete(f"/api/recorders/{existing}").status_code == 200
 
 
 def test_editing_target_cannot_retune_a_locked_recorder(admin, operator):
     source, target = make_source(admin), make_target(admin)
     admin.post(f"/api/sources/{source}/assign", json={"target_id": target})
-    admin.post(f"/api/sources/{source}/lock", json={"password": "open-sesame"})
+    lock(admin, source)
     body = {"name": "K1ABC", "frequency_hz": 146_520_000}
     assert operator.put(f"/api/targets/{target}", json=body).status_code == 403
     assert operator.delete(f"/api/targets/{target}").status_code == 403
     assert admin.put(f"/api/targets/{target}", json=body).status_code == 200
 
 
-def test_lock_hash_never_exposed(admin, listener):
-    source, target = make_source(admin), make_target(admin)
-    admin.post(f"/api/sources/{source}/assign", json={"target_id": target})
-    admin.post(f"/api/sources/{source}/lock", json={"password": "open-sesame"})
-    for path in ("/api/sources", "/api/recorders"):
-        assert "argon2" not in listener.get(path).text
-    assert source_row(listener, source)["locked"] is True
+def test_old_lock_passwords_become_plain_locks_and_are_deleted(tmp_path):
+    db = tmp_path / "old.db"
+    with make_session_factory(db)() as session:
+        session.add(Node(name="n"))
+        session.flush()
+        node = session.scalar(select(Node)).id
+        session.add(Source(node_id=node, serial="S", name="S"))
+        session.add(Target(name="T", frequency_hz=441_000_000))
+        session.commit()
+    connection = sqlite3.connect(db)
+    connection.execute("ALTER TABLE recorders DROP COLUMN locked")
+    connection.execute("ALTER TABLE recorders ADD COLUMN lock_hash VARCHAR(255)")
+    for name, lock_hash in (("locked", "$argon2id$secret-hash"), ("open", None)):
+        connection.execute(
+            "INSERT INTO recorders (name, source_id, target_id, enabled, assigned_by, assigned_at, lock_hash) VALUES (?, 1, 1, 1, '', 0, ?)",
+            (name, lock_hash),
+        )
+    connection.commit()
+    connection.close()
+    for _ in range(2):  # a second start must change nothing
+        with make_session_factory(db)() as session:
+            found = {r.name: bool(r.locked) for r in session.scalars(select(Recorder))}
+        assert found == {"locked": True, "open": False}
+    connection = sqlite3.connect(db)
+    columns = [row[1] for row in connection.execute("PRAGMA table_info(recorders)")]
+    connection.close()
+    assert "lock_hash" not in columns and "locked" in columns
 
 
 def test_out_of_range_target_warns(admin):
@@ -384,7 +440,7 @@ def test_signal_levels_skip_settling_and_match_rms():
 
 def test_suggested_squelch_ignores_a_brief_transmission():
     pcm = iq(0, 1) + iq(64, 9) + iq(3000, 1)
-    assert pipelines.suggest_squelch(pipelines.signal_levels(pcm, 16000)) == 103
+    assert pipelines.suggest_squelch(pipelines.signal_levels(pcm, 16000)) == 128
 
 
 def test_signal_levels_ignore_a_partial_sample_and_too_little_audio():
@@ -777,7 +833,7 @@ def test_a_lock_covers_measuring_and_profiles_for_everyone_but_admins(admin, ctx
     source, target = local_setup(admin, ctx)
     admin.post(f"/api/sources/{source}/assign", json={"target_id": target})
     admin.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": 98})
-    admin.post(f"/api/sources/{source}/lock", json={"password": "secret-lock"})
+    lock(admin, source)
     calls = fake_supervisor(ctx)
     add_user(ctx, "op@example.com", role="operator")
     operator = client_for(app, "op@example.com")
@@ -835,3 +891,604 @@ def test_bad_measurement_replies_become_errors(ctx, message):
     ctx.finish_measure(7, {"id": "abc", **message})
     assert isinstance(future.exception(), MeasureError)
     loop.close()
+
+
+# --- Broadcastify Calls -------------------------------------------------------
+BCFY_KEY = "bcfy-secret-key-123"
+SIGNED = "https://uploads.example.com/call/abc?signature=xyz"
+
+
+def bcfy_target(admin, slot=3, **overrides):
+    system = admin.post("/api/admin/broadcastify", json={"name": "Home", "system_id": 4242, "api_key": BCFY_KEY})
+    assert system.status_code == 201
+    target = admin.post("/api/targets", json={
+        "name": "Fire Dispatch", "frequency_hz": 154_430_000, "modulation": "nfm",
+        "broadcastify_enabled": True, "broadcastify_system_ref": system.json()["id"], "broadcastify_slot": slot, **overrides,
+    })
+    assert target.status_code == 201, target.text
+    return system.json()["id"], target.json()["id"]
+
+
+def bcfy_recording(ctx, target_id, tmp_path, started=1_800_000_000.0, duration=6.5, modulation="nfm"):
+    """A recording stored as a real call, with audio ffmpeg can read."""
+    wav = tmp_path / f"{uuid.uuid4().hex}.mp3"
+    subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=1", "-ar", "16000", "-ac", "1", str(wav)], check=True)
+    meta = {
+        "id": uuid.uuid4().hex, "recorder_id": 1, "recorder_name": "r", "source_id": None, "source_name": "s", "target_id": target_id,
+        "target_name": "Fire Dispatch", "serial": "SER1", "frequency_hz": 154_430_000, "modulation": modulation,
+        "started_at": started, "ended_at": started + duration, "duration": duration,
+    }
+    assert ctx.store_call(meta, wav, "local")
+    return meta["id"]
+
+
+def bcfy_transport(seen, reply=f"0 {SIGNED}", put_status=200, post_status=200):
+    def handler(request):
+        seen.append(request)
+        request.read()
+        if request.method == "POST":
+            return httpx.Response(post_status, text=reply)
+        return httpx.Response(put_status)
+    return httpx.MockTransport(handler)
+
+
+async def run_bcfy(ctx, seen, **kwargs):
+    async with httpx.AsyncClient(transport=bcfy_transport(seen, **kwargs)) as client:
+        return await ctx.process_uploads(client)
+
+
+def bcfy_job(ctx, call_id):
+    with ctx.db() as session:
+        return session.scalar(select(UploadJob).where(UploadJob.recording_id == call_id, UploadJob.destination == "broadcastify"))
+
+
+def form_fields(request):
+    """The name, filename and content of each multipart part."""
+    boundary = request.headers["content-type"].split("boundary=")[1].encode()
+    parts = {}
+    for part in request.content.split(b"--" + boundary):
+        head, _, body = part.partition(b"\r\n\r\n")
+        if b"name=" in head:
+            name = head.split(b'name="')[1].split(b'"')[0].decode()
+            parts[name] = {"head": head.decode(), "body": body.rstrip(b"\r\n").decode()}
+    return parts
+
+
+async def test_broadcastify_registers_then_puts_aac_audio(admin, ctx, tmp_path):
+    _, target = bcfy_target(admin)
+    call = bcfy_recording(ctx, target, tmp_path)
+    seen = []
+    assert await run_bcfy(ctx, seen) == 1
+    post, put = seen
+    assert post.method == "POST" and str(post.url) == "https://api.broadcastify.com/call-upload"
+    fields = form_fields(post)
+    assert fields["systemId"]["body"] == "4242" and fields["apiKey"]["body"] == BCFY_KEY
+    assert fields["callDuration"]["body"] == "6.500"
+    assert fields["ts"]["body"] == "1800000000" and fields["tg"]["body"] == "3" and fields["src"]["body"] == "0"
+    assert fields["freq"]["body"] == "154.430000" and fields["enc"]["body"] == "m4a"
+    assert 'filename="call_meta.json"' in fields["metadata"]["head"] and "application/json" in fields["metadata"]["head"]
+    meta = json.loads(fields["metadata"]["body"])
+    assert meta["talkgroup"] == 3 and meta["freq"] == 154_430_000 and meta["audio_type"] == "analog" and meta["encrypted"] == 0
+    assert meta["stop_time"] == 1_800_000_006 and meta["call_length_ms"] == 6500
+    assert meta["stop_time_ms"] - meta["start_time_ms"] == 6500 and meta["talkgroup_tag"] == "Fire Dispatch"
+    assert put.method == "PUT" and str(put.url) == SIGNED and put.headers["content-type"] == "audio/aac"
+    assert b"ftyp" in put.content[:32]  # an m4a file
+    assert "trunk" not in post.headers["user-agent"].lower()
+    job = bcfy_job(ctx, call)
+    assert job.status == "done" and job.last_error == ""
+
+
+async def test_broadcastify_skipped_counts_as_done_without_uploading(admin, ctx, tmp_path):
+    _, target = bcfy_target(admin)
+    call = bcfy_recording(ctx, target, tmp_path)
+    seen = []
+    await run_bcfy(ctx, seen, reply="1 SKIPPED-DUPLICATE")
+    job = bcfy_job(ctx, call)
+    assert len(seen) == 1 and job.status == "done" and "SKIPPED" in job.last_error
+
+
+async def test_broadcastify_rejected_fails_at_once_with_the_reason(admin, ctx, tmp_path):
+    _, target = bcfy_target(admin)
+    call = bcfy_recording(ctx, target, tmp_path)
+    await run_bcfy(ctx, [], reply="1 REJECTED-CALL-SKEW")
+    job = bcfy_job(ctx, call)
+    assert job.status == "failed" and "REJECTED-CALL-SKEW" in job.last_error and job.attempts == 1
+    assert await run_bcfy(ctx, []) == 0  # not tried again
+    assert "REJECTED-CALL-SKEW" in admin.get("/api/recordings").json()["items"][0]["uploads"][0]["detail"]
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"reply": "7 SOMETHING-ELSE"}, {"post_status": 500}, {"put_status": 403}, {"reply": "0 http://plain.example.com/x"}, {"reply": "0"},
+])
+async def test_broadcastify_other_failures_retry_later(admin, ctx, tmp_path, kwargs):
+    _, target = bcfy_target(admin)
+    call = bcfy_recording(ctx, target, tmp_path)
+    await run_bcfy(ctx, [], **kwargs)
+    job = bcfy_job(ctx, call)
+    assert job.status == "pending" and job.attempts == 1 and job.next_attempt_at > time.time() and job.last_error
+
+
+async def test_broadcastify_never_stores_the_key_or_signed_address(admin, ctx, tmp_path):
+    _, target = bcfy_target(admin)
+    call = bcfy_recording(ctx, target, tmp_path)
+    await run_bcfy(ctx, [], reply=f"7 bad {BCFY_KEY} see {SIGNED}")
+    job = bcfy_job(ctx, call)
+    assert BCFY_KEY not in job.last_error and "signature" not in job.last_error and "[key]" in job.last_error
+
+
+async def test_broadcastify_only_uses_the_targets_system_and_slot(admin, ctx, tmp_path):
+    bcfy_target(admin, slot=3)
+    second = admin.post("/api/admin/broadcastify", json={"name": "Field", "system_id": 77, "api_key": "other-key"}).json()["id"]
+    target = admin.post("/api/targets", json={
+        "name": "Other", "frequency_hz": 441_000_000, "modulation": "nfm",
+        "broadcastify_enabled": True, "broadcastify_system_ref": second, "broadcastify_slot": 9,
+    }).json()["id"]
+    bcfy_recording(ctx, target, tmp_path)
+    seen = []
+    await run_bcfy(ctx, seen)
+    fields = form_fields(seen[0])
+    assert fields["systemId"]["body"] == "77" and fields["apiKey"]["body"] == "other-key"
+    assert json.loads(fields["metadata"]["body"])["talkgroup"] == 9
+
+
+def test_target_without_broadcastify_queues_no_job(admin, ctx, tmp_path):
+    target = admin.post("/api/targets", json={"name": "T", "frequency_hz": 441_000_000, "modulation": "nfm"}).json()["id"]
+    assert bcfy_job(ctx, bcfy_recording(ctx, target, tmp_path)) is None
+
+
+@pytest.mark.parametrize("bad", [
+    {"broadcastify_system_ref": None}, {"broadcastify_slot": None}, {"broadcastify_system_ref": 99}, {"broadcastify_slot": 0},
+])
+def test_broadcastify_target_settings_are_validated(admin, bad):
+    system = admin.post("/api/admin/broadcastify", json={"name": "H", "system_id": 1, "api_key": "k"}).json()["id"]
+    body = {"name": "T", "frequency_hz": 441_000_000, "modulation": "nfm", "broadcastify_enabled": True,
+            "broadcastify_system_ref": system, "broadcastify_slot": 1}
+    assert admin.post("/api/targets", json={**body, **bad}).status_code == 422
+
+
+def test_adsb_target_cannot_upload_to_broadcastify(admin):
+    system = admin.post("/api/admin/broadcastify", json={"name": "H", "system_id": 1, "api_key": "k"}).json()["id"]
+    assert admin.post("/api/targets", json={
+        "name": "A", "kind": "adsb", "frequency_hz": 1_090_000_000, "modulation": "adsb",
+        "broadcastify_enabled": True, "broadcastify_system_ref": system, "broadcastify_slot": 1,
+    }).status_code == 422
+
+
+def test_broadcastify_keys_are_sealed_and_never_returned(admin, ctx, app):
+    system, _ = bcfy_target(admin)
+    with ctx.db() as session:
+        assert BCFY_KEY not in session.get(BroadcastifySystem, system).api_key_sealed
+    add_user(ctx, "op@example.com", role="operator")
+    operator = client_for(app, "op@example.com")
+    for reply in (admin.get("/api/admin/broadcastify"), operator.get("/api/broadcastify-systems"), admin.get("/api/targets"), admin.get("/api/admin/audit")):
+        assert reply.status_code == 200 and BCFY_KEY not in reply.text
+    assert operator.get("/api/broadcastify-systems").json()[0]["system_id"] == 4242
+
+
+def test_only_admins_manage_broadcastify_systems(admin, ctx, app):
+    system, _ = bcfy_target(admin)
+    add_user(ctx, "op@example.com", role="operator")
+    add_user(ctx, "l@example.com")
+    operator, listener = client_for(app, "op@example.com"), client_for(app, "l@example.com")
+    for client in (operator, listener):
+        assert client.get("/api/admin/broadcastify").status_code == 403
+        assert client.post("/api/admin/broadcastify", json={"name": "x", "system_id": 1, "api_key": "k"}).status_code == 403
+        assert client.delete(f"/api/admin/broadcastify/{system}").status_code == 403
+        assert client.post(f"/api/admin/broadcastify/{system}/test").status_code == 403
+    assert listener.get("/api/broadcastify-systems").status_code == 403
+    assert client_for(app).get("/api/broadcastify-systems").status_code == 401
+
+
+def test_editing_a_system_keeps_its_key_unless_replaced(admin, ctx):
+    system, _ = bcfy_target(admin)
+    assert admin.put(f"/api/admin/broadcastify/{system}", json={"name": "New", "system_id": 5}).status_code == 200
+    with ctx.db() as session:
+        assert ctx.secrets.open(session.get(BroadcastifySystem, system).api_key_sealed) == BCFY_KEY
+    admin.put(f"/api/admin/broadcastify/{system}", json={"name": "New", "system_id": 5, "api_key": "replaced"})
+    with ctx.db() as session:
+        assert ctx.secrets.open(session.get(BroadcastifySystem, system).api_key_sealed) == "replaced"
+    assert admin.post("/api/admin/broadcastify", json={"name": "No key", "system_id": 1}).status_code == 422
+
+
+def test_a_system_in_use_cannot_be_deleted(admin):
+    system, target = bcfy_target(admin)
+    assert admin.delete(f"/api/admin/broadcastify/{system}").status_code == 409
+    admin.delete(f"/api/targets/{target}")
+    assert admin.delete(f"/api/admin/broadcastify/{system}").status_code == 200
+
+
+def test_credential_check_sends_no_call_and_hides_the_key(admin, ctx):
+    system, _ = bcfy_target(admin)
+    seen = []
+
+    def handler(request):
+        request.read()
+        seen.append(request)
+        return httpx.Response(200, text=f"100 bad key {BCFY_KEY} {SIGNED}")
+
+    ctx.http_transport = httpx.MockTransport(handler)
+    reply = admin.post(f"/api/admin/broadcastify/{system}/test")
+    assert reply.status_code == 200 and "100 bad key" in reply.json()["reply"]
+    assert BCFY_KEY not in reply.text and "signature" not in reply.text
+    fields = form_fields(seen[0])
+    assert fields["test"]["body"] == "1" and fields["systemId"]["body"] == "4242" and "metadata" not in fields
+    assert len(seen) == 1
+
+
+def test_a_database_from_before_broadcastify_upgrades_and_keeps_its_targets(tmp_path):
+    db = tmp_path / "old.db"
+    make_session_factory(db)
+    connection = sqlite3.connect(db)
+    connection.execute("INSERT INTO targets (name, kind, frequency_hz, modulation, squelch, clearcut_enabled, rdio_enabled) VALUES ('Old', 'audio', 441000000, 'nfm', 60, 0, 0)")
+    for column in ("broadcastify_enabled", "broadcastify_system_ref", "broadcastify_slot"):
+        connection.execute(f"ALTER TABLE targets DROP COLUMN {column}")
+    connection.execute("DROP TABLE broadcastify_systems")
+    connection.commit()
+    connection.close()
+    with make_session_factory(db)() as session:
+        target = session.scalar(select(Target))
+        assert target.name == "Old" and not target.broadcastify_enabled and target.broadcastify_slot is None
+        session.add(BroadcastifySystem(name="n", system_id=1, api_key_sealed="x"))
+        session.commit()
+
+
+# --- one bad call must not stop the others -----------------------------------
+async def run_replies(ctx, replies):
+    answers = iter(replies)
+
+    def handler(request):
+        request.read()
+        if request.method == "PUT":
+            return httpx.Response(200)
+        reply = next(answers)
+        if isinstance(reply, Exception):
+            raise reply
+        return httpx.Response(200, text=reply)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        return await ctx.process_uploads(client)
+
+
+@pytest.mark.parametrize("bad", [
+    "1 REJECTED-CALL-SKEW", "0 https://[bad-address", "garbage", "", "\x00\xff", RuntimeError("anything"), ValueError("anything"),
+])
+async def test_a_bad_reply_never_holds_up_the_next_call(admin, ctx, tmp_path, bad):
+    _, target = bcfy_target(admin)
+    first = bcfy_recording(ctx, target, tmp_path, started=1_800_000_000.0)
+    second = bcfy_recording(ctx, target, tmp_path, started=1_800_000_100.0)
+    await run_replies(ctx, [bad, f"0 {SIGNED}"])
+    assert bcfy_job(ctx, second).status == "done"
+    job = bcfy_job(ctx, first)
+    assert job.status in ("failed", "pending") and job.last_error and job.attempts == 1
+
+
+async def test_unexpected_errors_stop_retrying_after_the_limit(admin, ctx, tmp_path, monkeypatch):
+    _, target = bcfy_target(admin)
+    call = bcfy_recording(ctx, target, tmp_path)
+
+    async def explode(*args, **kwargs):
+        raise RuntimeError("secret detail https://signed.example.com")
+
+    monkeypatch.setattr(ctx, "_attempt_upload", explode)
+    async with httpx.AsyncClient(transport=bcfy_transport([])) as client:
+        for _ in range(UPLOAD_MAX_ATTEMPTS):
+            with ctx.db() as session:
+                session.get(UploadJob, bcfy_job(ctx, call).id).next_attempt_at = 0
+                session.commit()
+            await ctx.process_uploads(client)
+    job = bcfy_job(ctx, call)
+    assert job.status == "failed" and job.last_error == "Unexpected error: RuntimeError"
+
+
+async def test_a_rejected_call_leaves_the_recording_usable(admin, ctx, tmp_path):
+    _, target = bcfy_target(admin)
+    call = bcfy_recording(ctx, target, tmp_path)
+    await run_replies(ctx, ["1 REJECTED"])
+    assert admin.get(f"/api/recordings/{call}/audio").status_code == 200
+    assert admin.get("/api/recordings").json()["items"][0]["id"] == call
+
+
+# --- duplicate channels -------------------------------------------------------
+def second_slot_body(system, slot=3, frequency=155_000_000, name="Other"):
+    return {"name": name, "frequency_hz": frequency, "modulation": "nfm", "broadcastify_enabled": True,
+            "broadcastify_system_ref": system, "broadcastify_slot": slot}
+
+
+def test_a_slot_can_only_belong_to_one_target(admin):
+    system, target = bcfy_target(admin, slot=3)
+    reply = admin.post("/api/targets", json=second_slot_body(system))
+    assert reply.status_code == 409 and "Fire Dispatch" in reply.json()["detail"]
+    assert admin.post("/api/targets", json=second_slot_body(system, slot=4)).status_code == 201
+    other = admin.post("/api/admin/broadcastify", json={"name": "B", "system_id": 2, "api_key": "k"}).json()["id"]
+    assert admin.post("/api/targets", json=second_slot_body(other, slot=3)).status_code == 201
+
+
+def test_a_target_can_keep_its_own_slot_but_not_take_another(admin):
+    system, target = bcfy_target(admin, slot=3)
+    keep = second_slot_body(system, frequency=154_430_000, name="Fire Dispatch")
+    assert admin.put(f"/api/targets/{target}", json=keep).status_code == 200
+    other = admin.post("/api/targets", json=second_slot_body(system, slot=4)).json()["id"]
+    assert admin.put(f"/api/targets/{other}", json=second_slot_body(system, slot=3)).status_code == 409
+
+
+def test_a_disabled_target_does_not_hold_its_slot(admin):
+    system, target = bcfy_target(admin, slot=3)
+    assert admin.put(f"/api/targets/{target}", json={**second_slot_body(system, frequency=154_430_000), "broadcastify_enabled": False}).status_code == 200
+    assert admin.post("/api/targets", json=second_slot_body(system, name="New")).status_code == 201
+
+
+def test_same_frequency_and_mode_warns_but_saves(admin):
+    body = {"name": "A", "frequency_hz": 441_000_000, "modulation": "nfm"}
+    first = admin.post("/api/targets", json=body).json()
+    assert first["warning"] is None
+    second = admin.post("/api/targets", json={**body, "name": "B"})
+    assert second.status_code == 201 and "A" in second.json()["warning"]
+    assert admin.post("/api/targets", json={**body, "name": "C", "modulation": "am"}).json()["warning"] is None
+    assert admin.put(f"/api/targets/{first['id']}", json={**body, "name": "A", "frequency_hz": 442_000_000}).json()["warning"] is None
+
+
+def test_assigning_a_channel_another_sdr_records_warns(admin, ctx):
+    one = make_source(admin, "SER1", "Stick one")
+    two = make_source(admin, "SER2", "Stick two")
+    target = admin.post("/api/targets", json={"name": "T", "frequency_hz": 441_000_000, "modulation": "nfm"}).json()["id"]
+    assert admin.post(f"/api/sources/{one}/assign", json={"target_id": target}).json()["warning"] is None
+    reply = admin.post(f"/api/sources/{two}/assign", json={"target_id": target})
+    assert reply.status_code == 200 and "Stick one" in reply.json()["warning"]
+    assert admin.post(f"/api/sources/{one}/assign", json={"target_id": target}).json()["warning"]  # names the other stick
+    assert ctx.assignments()[ctx.local_node_id]["SER2"]["target_id"] == target
+
+
+def overlap_call(ctx, target, tmp_path, serial, started, node="local", duration=6.0):
+    wav = tmp_path / f"{uuid.uuid4().hex}.mp3"
+    subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=1", "-ar", "16000", "-ac", "1", str(wav)], check=True)
+    call = uuid.uuid4().hex
+    assert ctx.store_call({
+        "id": call, "target_id": target, "target_name": "T", "serial": serial, "frequency_hz": 154_430_000, "modulation": "nfm",
+        "started_at": started, "ended_at": started + duration, "duration": duration,
+    }, wav, node)
+    return call
+
+
+async def test_only_the_first_sdrs_copy_of_a_call_is_uploaded(admin, ctx, tmp_path):
+    _, target = bcfy_target(admin)
+    first = overlap_call(ctx, target, tmp_path, "SER1", 1_800_000_000.0)
+    second = overlap_call(ctx, target, tmp_path, "SER2", 1_800_000_000.4)
+    from_slave = overlap_call(ctx, target, tmp_path, "SER1", 1_800_000_001.0, node="pi")
+    seen = []
+    await run_bcfy(ctx, seen)
+    assert len([r for r in seen if r.method == "POST"]) == 1
+    assert bcfy_job(ctx, first).last_error == ""
+    for call in (second, from_slave):
+        job = bcfy_job(ctx, call)
+        assert job.status == "done" and job.last_error.startswith("Skipped")
+    assert len(admin.get("/api/recordings").json()["items"]) == 3  # every recording is kept
+
+
+def test_separate_calls_and_the_same_stick_are_never_treated_as_duplicates(admin, ctx, tmp_path):
+    _, target = bcfy_target(admin)
+    calls = [
+        overlap_call(ctx, target, tmp_path, "SER1", 1_800_000_000.0),
+        overlap_call(ctx, target, tmp_path, "SER2", 1_800_000_006.0),  # starts as the last one ends
+        overlap_call(ctx, target, tmp_path, "SER2", 1_800_000_009.0),  # same stick, overlapping
+    ]
+    assert all(bcfy_job(ctx, call).status == "pending" for call in calls)
+
+
+def test_a_different_channel_at_the_same_time_is_not_a_duplicate(admin, ctx, tmp_path):
+    system, one = bcfy_target(admin)
+    two = admin.post("/api/targets", json=second_slot_body(system, slot=4)).json()["id"]
+    overlap_call(ctx, one, tmp_path, "SER1", 1_800_000_000.0)
+    assert bcfy_job(ctx, overlap_call(ctx, two, tmp_path, "SER2", 1_800_000_000.0)).status == "pending"
+
+
+def test_a_skipped_clearcut_copy_is_not_matched_for_a_transcript(admin, ctx, tmp_path):
+    target = admin.post("/api/targets", json={
+        "name": "T", "frequency_hz": 154_430_000, "modulation": "nfm", "clearcut_enabled": True, "clearcut_system": "s", "clearcut_id": 5,
+    }).json()["id"]
+    overlap_call(ctx, target, tmp_path, "SER1", 1_800_000_000.0)
+    second = overlap_call(ctx, target, tmp_path, "SER2", 1_800_000_000.0)
+    with ctx.db() as session:
+        assert session.get(Recording, second).clearcut_system is None
+
+
+# --- volume -------------------------------------------------------------------
+def tone(level, count=8000):
+    return array("h", [level if i % 40 < 20 else -level for i in range(count)])
+
+
+def test_zero_db_leaves_audio_byte_for_byte():
+    chunk = tone(1000).tobytes()
+    assert VolumeControl()(chunk, 0) is chunk
+    assert VolumeControl()(chunk, 0.0) is chunk
+
+
+@pytest.mark.parametrize("db,factor", [(6.0206, 2.0), (12.0412, 4.0), (-6.0206, 0.5)])
+def test_volume_scales_audio(db, factor):
+    out = array("h")
+    out.frombytes(VolumeControl()(tone(1000).tobytes(), db))
+    rms = lambda a: (sum(x * x for x in a) / len(a)) ** 0.5
+    assert rms(out[4000:]) == pytest.approx(rms(tone(1000)[4000:]) * factor, rel=0.05)
+
+
+def test_boost_removes_a_dc_step_instead_of_clipping_it():
+    samples = array("h", [8000 + (500 if i % 40 < 20 else -500) for i in range(16000)])
+    out = array("h")
+    out.frombytes(VolumeControl()(samples.tobytes(), 12))
+    settled = out[2000:]
+    assert abs(sum(settled) / len(settled)) < 100
+    assert max(settled) < 32767 and min(settled) > -32768
+
+
+def test_boost_limits_at_full_scale_without_wrapping():
+    out = array("h")
+    out.frombytes(VolumeControl()(tone(30000).tobytes(), 30))
+    assert max(out) == 32767 and min(out) == -32768
+    assert all(a * b >= 0 or abs(a - b) > 30000 for a, b in zip(out[2000:2019], out[2001:2020]))
+
+
+def test_the_filter_carries_across_chunks():
+    data = tone(1000, 8000).tobytes()
+    whole = VolumeControl()(data, 6)
+    control = VolumeControl()
+    split = control(data[:6000], 6) + control(data[6000:], 6)
+    assert whole == split
+
+
+def test_volume_is_sent_to_the_radio_and_validated(admin, ctx):
+    source = make_source(admin)
+    target = admin.post("/api/targets", json={"name": "T", "frequency_hz": 441_000_000, "modulation": "nfm", "volume_db": 12}).json()
+    admin.post(f"/api/sources/{source}/assign", json={"target_id": target["id"]})
+    assert target["volume_db"] == 12 and ctx.assignments()[ctx.local_node_id]["SER1"]["volume_db"] == 12
+    for bad in (-21, 31):
+        assert admin.post("/api/targets", json={"name": "B", "frequency_hz": 441_000_000, "modulation": "nfm", "volume_db": bad}).status_code == 422
+
+
+@pytest.mark.parametrize("bad", [{"volume_db": 31}, {"volume_db": -21}, {"volume_db": "loud"}, {"volume_db": float("nan")}])
+def test_volume_from_the_network_is_validated(bad):
+    with pytest.raises(pipelines.SpecError):
+        spec(**bad)
+
+
+def test_a_slave_without_volume_in_its_saved_assignment_still_loads():
+    assert spec()["volume_db"] == 0
+    assert spec(volume_db=None)["volume_db"] == 0
+
+
+def test_a_database_from_before_volume_upgrades(tmp_path):
+    db = tmp_path / "old.db"
+    make_session_factory(db)
+    connection = sqlite3.connect(db)
+    connection.execute("INSERT INTO targets (name, kind, frequency_hz, modulation, squelch, clearcut_enabled, rdio_enabled) VALUES ('Old', 'audio', 441000000, 'nfm', 60, 0, 0)")
+    connection.execute("ALTER TABLE targets DROP COLUMN volume_db")
+    connection.commit()
+    connection.close()
+    with make_session_factory(db)() as session:
+        assert session.scalar(select(Target)).volume_db is None
+
+
+# --- from Broadcastify's published API --------------------------------------------
+async def test_broadcastify_form_and_metadata_agree_on_the_call(admin, ctx, tmp_path):
+    _, target = bcfy_target(admin, slot=7)
+    bcfy_recording(ctx, target, tmp_path, started=1_800_000_123.75, duration=6.5)
+    seen = []
+    await run_bcfy(ctx, seen)
+    fields = form_fields(seen[0])
+    meta = json.loads(fields["metadata"]["body"])
+    assert int(fields["ts"]["body"]) == meta["start_time"] == 1_800_000_123
+    assert fields["tg"]["body"] == str(meta["talkgroup"]) == "7"
+    assert float(fields["freq"]["body"]) * 1e6 == pytest.approx(meta["freq"])
+
+
+async def test_a_bad_api_key_is_not_retried(admin, ctx, tmp_path):
+    _, target = bcfy_target(admin)
+    call = bcfy_recording(ctx, target, tmp_path)
+    seen = []
+    await run_bcfy(ctx, seen, reply="100 NO-API-KEY-SPECIFIED")
+    job = bcfy_job(ctx, call)
+    assert job.status == "failed" and "API key" in job.last_error and "NO-API-KEY" in job.last_error
+    assert len(seen) == 1 and await run_bcfy(ctx, seen) == 0
+
+
+async def test_the_documented_duplicate_reply_counts_as_done(admin, ctx, tmp_path):
+    _, target = bcfy_target(admin)
+    call = bcfy_recording(ctx, target, tmp_path)
+    await run_bcfy(ctx, [], reply="1 SKIPPED---ALREADY-RECEIVED-THIS-CALL")
+    job = bcfy_job(ctx, call)
+    assert job.status == "done" and job.last_error.startswith("Skipped")
+
+
+def flaky_put(seen, failures):
+    answers = iter(failures)
+
+    def handler(request):
+        request.read()
+        seen.append(request)
+        if request.method == "POST":
+            return httpx.Response(200, text=f"0 {SIGNED}")
+        answer = next(answers, None)
+        if isinstance(answer, Exception):
+            raise answer
+        return httpx.Response(answer or 200)
+
+    return httpx.MockTransport(handler)
+
+
+@pytest.mark.parametrize("failures", [[503], [503, 503], [httpx.ConnectError("x")], [httpx.ReadTimeout("x"), 500]])
+async def test_audio_upload_retries_the_same_address_without_registering_again(admin, ctx, tmp_path, monkeypatch, failures):
+    monkeypatch.setattr(uploaders, "BROADCASTIFY_PUT_DELAY", 0)
+    _, target = bcfy_target(admin)
+    call = bcfy_recording(ctx, target, tmp_path)
+    seen = []
+    async with httpx.AsyncClient(transport=flaky_put(seen, failures)) as client:
+        await ctx.process_uploads(client)
+    assert [r.method for r in seen].count("POST") == 1
+    assert [r.method for r in seen].count("PUT") == len(failures) + 1
+    assert bcfy_job(ctx, call).status == "done"
+
+
+async def test_an_expired_address_is_not_retried_and_failures_hide_the_address(admin, ctx, tmp_path, monkeypatch):
+    monkeypatch.setattr(uploaders, "BROADCASTIFY_PUT_DELAY", 0)
+    _, target = bcfy_target(admin)
+    call = bcfy_recording(ctx, target, tmp_path)
+    seen = []
+    async with httpx.AsyncClient(transport=flaky_put(seen, [403])) as client:
+        await ctx.process_uploads(client)
+    assert [r.method for r in seen].count("PUT") == 1
+    job = bcfy_job(ctx, call)
+    assert job.status == "pending" and "403" in job.last_error
+
+    seen.clear()
+    with ctx.db() as session:
+        row = session.get(UploadJob, job.id)
+        row.next_attempt_at = 0
+        session.commit()
+    secret = httpx.ConnectError(f"could not reach {SIGNED}")
+    async with httpx.AsyncClient(transport=flaky_put(seen, [secret, secret, secret])) as client:
+        await ctx.process_uploads(client)
+    job = bcfy_job(ctx, call)
+    assert "signature" not in job.last_error and "ConnectError" in job.last_error
+
+
+async def test_no_frequency_entry_is_final_and_keeps_its_reason(admin, ctx, tmp_path):
+    _, target = bcfy_target(admin)
+    call = bcfy_recording(ctx, target, tmp_path)
+    seen = []
+    await run_bcfy(ctx, seen, reply="1 No-Freq-Table-Entry-For-Upload")
+    job = bcfy_job(ctx, call)
+    assert job.status == "failed" and "No-Freq-Table-Entry" in job.last_error and "slot" in job.last_error
+    assert len(seen) == 1 and await run_bcfy(ctx, seen) == 0
+    detail = admin.get("/api/recordings").json()["items"][0]["uploads"][0]["detail"]
+    assert "No-Freq-Table-Entry" in detail and "SKEW" not in detail
+
+
+async def test_any_other_code_1_reply_is_final(admin, ctx, tmp_path):
+    _, target = bcfy_target(admin)
+    call = bcfy_recording(ctx, target, tmp_path)
+    await run_bcfy(ctx, [], reply="1 Something-New")
+    job = bcfy_job(ctx, call)
+    assert job.status == "failed" and "Something-New" in job.last_error
+
+
+async def test_broadcastify_retries_inside_its_time_window(admin, ctx, tmp_path):
+    _, target = bcfy_target(admin)
+    call = bcfy_recording(ctx, target, tmp_path)
+    for attempt in range(1, 4):
+        with ctx.db() as session:
+            row = session.get(UploadJob, bcfy_job(ctx, call).id)
+            row.next_attempt_at = 0
+            session.commit()
+        await run_bcfy(ctx, [], post_status=500)
+        job = bcfy_job(ctx, call)
+        assert job.attempts == attempt and job.next_attempt_at - time.time() <= BROADCASTIFY_RETRY_SECONDS
+
+
+async def test_other_uploads_still_back_off_slowly(admin, ctx, tmp_path):
+    target = admin.post("/api/targets", json={"name": "T", "frequency_hz": 441_000_000, "modulation": "nfm",
+                                              "rdio_enabled": True, "rdio_system": 1, "rdio_talkgroup": 1}).json()["id"]
+    call = bcfy_recording(ctx, target, tmp_path)
+    ctx.set_setting("rdio_server", "https://rdio.example.com")
+    ctx.set_setting("rdio_api_key", ctx.secrets.seal("k"))
+    await run_bcfy(ctx, [], post_status=500)
+    with ctx.db() as session:
+        job = session.scalar(select(UploadJob).where(UploadJob.recording_id == call))
+    assert job.destination == "rdio" and job.next_attempt_at - time.time() > 30

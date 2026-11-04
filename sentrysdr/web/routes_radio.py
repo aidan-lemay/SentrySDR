@@ -12,17 +12,15 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 
-from .. import pipelines, schedule, security
+from .. import pipelines, schedule
 from ..config import SERIAL_RE
 from ..context import Context
 from ..engine import MeasureError
-from ..models import Node, Recorder, SdrProfile, Source, Target, User, now
+from ..models import BroadcastifySystem, Node, Recorder, SdrProfile, Source, Target, User, now
 from .deps import admin_user, ctx_of, current_user, get_db, ip_of, require
 
 router = APIRouter(prefix="/api")
 
-LOCK_WINDOW = 900
-LOCK_LIMIT = 8
 MEASURE_LIMIT = 30
 MEASURE_WINDOW = 3600
 LIVE_MAX_TOTAL = 50
@@ -68,7 +66,7 @@ def _source_view(ctx: Context, db, source: Source, winners: dict, recorders: lis
         "state": status.get("state", "offline" if not online else "idle"),
         "error": status.get("error", ""), "in_call": status.get("in_call", False),
         "call_started": status.get("call_started"), "last_call_at": status.get("last_call_at"),
-        "locked": bool(base and base.lock_hash),
+        "locked": bool(base and base.locked),
         "base_recorder_id": base.id if base else None,
         "base_target_id": base.target_id if base else None,
         "assigned_by": base.assigned_by if base else "",
@@ -189,15 +187,19 @@ class TargetBody(BaseModel):
     frequency_hz: int = Field(ge=pipelines.FREQ_MIN_HZ, le=pipelines.FREQ_MAX_HZ)
     modulation: str = "nfm"
     squelch: int = Field(default=50, ge=0, le=100000)
+    volume_db: float = Field(default=0, ge=pipelines.VOLUME_MIN_DB, le=pipelines.VOLUME_MAX_DB)
     clearcut_enabled: bool = False
     clearcut_system: str | None = Field(default=None, max_length=64, pattern=r"^[A-Za-z0-9_.-]+$")
     clearcut_id: int | None = None
     rdio_enabled: bool = False
     rdio_system: int | None = None
     rdio_talkgroup: int | None = None
+    broadcastify_enabled: bool = False
+    broadcastify_system_ref: int | None = None
+    broadcastify_slot: int | None = Field(default=None, ge=1)
 
 
-def _validate_target(body: TargetBody) -> None:
+def _validate_target(body: TargetBody, db, target_id: int | None = None) -> None:
     allowed = {"audio": pipelines.ANALOG | set(pipelines.DIGITAL), "adsb": {"adsb"}, "ais": {"ais"}}
     if body.modulation not in allowed.get(body.kind, set()):
         raise HTTPException(422, f"Modulation {body.modulation} doesn't fit a {body.kind} target")
@@ -205,10 +207,39 @@ def _validate_target(body: TargetBody) -> None:
         raise HTTPException(422, "ClearCut upload needs a system ID and a talkgroup")
     if body.rdio_enabled and (body.rdio_system is None or body.rdio_talkgroup is None):
         raise HTTPException(422, "RDIO upload needs a system and a talkgroup")
+    if body.broadcastify_enabled:
+        if body.kind != "audio":
+            raise HTTPException(422, "Only audio targets can upload to Broadcastify")
+        if body.broadcastify_system_ref is None or body.broadcastify_slot is None:
+            raise HTTPException(422, "Broadcastify upload needs a system and a slot")
+        if db.get(BroadcastifySystem, body.broadcastify_system_ref) is None:
+            raise HTTPException(422, "That Broadcastify system doesn't exist")
+        taken = db.scalar(select(Target).where(
+            Target.broadcastify_enabled.is_(True), Target.broadcastify_system_ref == body.broadcastify_system_ref,
+            Target.broadcastify_slot == body.broadcastify_slot, Target.id != (target_id or 0),
+        ))
+        if taken:
+            raise HTTPException(409, f"Slot {body.broadcastify_slot} on that system is already used by {taken.name}")
+
+
+def _same_channel_warning(db, body: TargetBody, target_id: int | None = None) -> str | None:
+    others = db.scalars(select(Target.name).where(
+        Target.frequency_hz == body.frequency_hz, Target.modulation == body.modulation, Target.id != (target_id or 0),
+    )).all()
+    if others and body.kind == "audio":
+        return f"Same frequency and mode as {', '.join(others)}. If both run, this channel is recorded twice."
+    return None
 
 
 def _target_view(target: Target) -> dict:
     return {c.name: getattr(target, c.name) for c in Target.__table__.columns}
+
+
+@router.get("/broadcastify-systems")
+def broadcastify_choices(_user: User = Depends(require("manage_targets")), db=Depends(get_db)):
+    """What a target can upload to. Keys stay with administrators, and on the server."""
+    return [{"id": s.id, "name": s.name, "system_id": s.system_id}
+            for s in db.scalars(select(BroadcastifySystem).order_by(BroadcastifySystem.name))]
 
 
 @router.get("/targets")
@@ -219,16 +250,17 @@ def list_targets(_user: User = Depends(current_user), db=Depends(get_db)):
 @router.post("/targets", status_code=201)
 def create_target(body: TargetBody, request: Request, user: User = Depends(require("manage_targets")), db=Depends(get_db)):
     ctx = ctx_of(request)
-    _validate_target(body)
+    _validate_target(body, db)
+    warning = _same_channel_warning(db, body)
     target = Target(**body.model_dump())
     db.add(target)
     db.commit()
     ctx.audit("target.created", user=user, ip=ip_of(request), target=target.name)
-    return _target_view(target)
+    return {**_target_view(target), "warning": warning}
 
 
 def _active_uses_locked(db, target_id: int) -> bool:
-    return bool(db.scalar(select(Recorder.id).where(Recorder.target_id == target_id, Recorder.lock_hash.is_not(None))))
+    return bool(db.scalar(select(Recorder.id).where(Recorder.target_id == target_id, Recorder.locked.is_(True))))
 
 
 @router.put("/targets/{target_id}")
@@ -240,7 +272,8 @@ def update_target(target_id: int, body: TargetBody, request: Request, user: User
     # Otherwise a locked recorder could be retuned by editing its target.
     if user.role != "admin" and _active_uses_locked(db, target_id):
         raise HTTPException(403, "A locked recorder uses this target. Ask an administrator.")
-    _validate_target(body)
+    _validate_target(body, db, target_id)
+    warning = _same_channel_warning(db, body, target_id)
     # A measurement only describes the frequency and mode it was taken on.
     retuned = (body.frequency_hz, body.modulation) != (target.frequency_hz, target.modulation)
     cleared = list(db.scalars(select(SdrProfile).where(SdrProfile.target_id == target_id))) if retuned else []
@@ -252,7 +285,7 @@ def update_target(target_id: int, body: TargetBody, request: Request, user: User
     ctx.audit("target.updated", user=user, ip=ip_of(request), target=target.name,
               details={"profiles_cleared": len(cleared)} if cleared else None)
     ctx.kick()
-    return {**_target_view(target), "profiles_cleared": len(cleared)}
+    return {**_target_view(target), "profiles_cleared": len(cleared), "warning": warning}
 
 
 @router.delete("/targets/{target_id}")
@@ -272,17 +305,15 @@ def delete_target(target_id: int, request: Request, user: User = Depends(require
 
 
 # --- locks -----------------------------------------------------------------
-def _check_lock(ctx: Context, request: Request, user: User, recorder: Recorder | None, password: str | None) -> None:
-    """Admins bypass locks. Everyone else needs the password, rate limited."""
-    if recorder is None or not recorder.lock_hash or user.role == "admin":
+LOCKED_MESSAGE = "This assignment is locked. Only an administrator can change it."
+
+
+def _check_lock(ctx: Context, request: Request, user: User, recorder: Recorder | None) -> None:
+    """Only administrators can change a locked assignment."""
+    if recorder is None or not recorder.locked or user.role == "admin":
         return
-    key = f"lock:{user.id}"
-    if ctx.limiter.blocked(key, LOCK_LIMIT, LOCK_WINDOW):
-        raise HTTPException(429, "Too many attempts. Try again later.")
-    if not password or not security.verify_password(recorder.lock_hash, password):
-        ctx.limiter.hit(key, LOCK_WINDOW)
-        ctx.audit("recorder.lock_denied", user=user, ip=ip_of(request), target=recorder.name)
-        raise HTTPException(403, "locked")
+    ctx.audit("recorder.lock_denied", user=user, ip=ip_of(request), target=recorder.name)
+    raise HTTPException(403, LOCKED_MESSAGE)
 
 
 def _base_for(db, source_id: int) -> Recorder | None:
@@ -301,9 +332,28 @@ def _range_warning(source: Source, target: Target) -> str | None:
     return None
 
 
+def _other_sdr_warning(db, source: Source, target: Target) -> str | None:
+    """Two SDRs on one channel can be deliberate, so this warns. Uploads are guarded separately."""
+    recorders = db.scalars(select(Recorder).where(Recorder.source_id != source.id, Recorder.enabled.is_(True))).all()
+    names = []
+    for recorder in recorders:
+        other = db.get(Target, recorder.target_id)
+        if other and other.kind == "audio" and (other.frequency_hz, other.modulation) == (target.frequency_hz, target.modulation):
+            other_source = db.get(Source, recorder.source_id)
+            if other_source and other_source.name not in names:
+                names.append(other_source.name)
+    if not names or target.kind != "audio":
+        return None
+    return f"{', '.join(names)} can also record this channel. If both run together, only the first copy of each call is uploaded."
+
+
+def _warnings(db, source: Source, target: Target) -> str | None:
+    found = [w for w in (_range_warning(source, target), _other_sdr_warning(db, source, target)) if w]
+    return " ".join(found) or None
+
+
 class AssignBody(BaseModel):
     target_id: int | None = None
-    lock_password: str | None = Field(default=None, max_length=256)
 
 
 @router.post("/sources/{source_id}/assign")
@@ -314,7 +364,7 @@ def assign(source_id: int, body: AssignBody, request: Request, user: User = Depe
     if source is None:
         raise HTTPException(404, "Source not found")
     base = _base_for(db, source_id)
-    _check_lock(ctx, request, user, base, body.lock_password)
+    _check_lock(ctx, request, user, base)
     warning = None
     if body.target_id is None:
         if base:
@@ -324,7 +374,7 @@ def assign(source_id: int, body: AssignBody, request: Request, user: User = Depe
         target = db.get(Target, body.target_id)
         if target is None:
             raise HTTPException(404, "Target not found")
-        warning = _range_warning(source, target)
+        warning = _warnings(db, source, target)
         target_name = target.name
         if base is None:
             db.add(Recorder(name=f"{source.name}: {target.name}", source_id=source.id, target_id=target.id,
@@ -337,18 +387,14 @@ def assign(source_id: int, body: AssignBody, request: Request, user: User = Depe
     return {"detail": "Assigned", "warning": warning}
 
 
-class LockBody(BaseModel):
-    password: str = Field(min_length=4, max_length=256)
-
-
 @router.post("/sources/{source_id}/lock")
-def lock_source(source_id: int, body: LockBody, request: Request, admin: User = Depends(admin_user), db=Depends(get_db)):
+def lock_source(source_id: int, request: Request, admin: User = Depends(admin_user), db=Depends(get_db)):
     ctx = ctx_of(request)
     source = db.get(Source, source_id)
     base = _base_for(db, source_id)
     if source is None or base is None:
         raise HTTPException(409, "Assign a target before locking this source")
-    base.lock_hash = security.hash_password(body.password)
+    base.locked = True
     db.commit()
     ctx.audit("source.locked", user=admin, ip=ip_of(request), target=source.name)
     return {"detail": "Locked"}
@@ -359,7 +405,7 @@ def unlock_source(source_id: int, request: Request, admin: User = Depends(admin_
     ctx = ctx_of(request)
     base = _base_for(db, source_id)
     if base is not None:
-        base.lock_hash = None
+        base.locked = False
         db.commit()
     ctx.audit("source.unlocked", user=admin, ip=ip_of(request), target=str(source_id))
     return {"detail": "Unlocked"}
@@ -377,7 +423,7 @@ def _source_and_audio_target(db, source_id: int, target_id: int) -> tuple[Source
 
 def _refuse_if_locked(db, user: User, source_id: int) -> None:
     """Measuring interrupts recording and a profile changes it, so a lock must cover both."""
-    locked = db.scalar(select(Recorder.id).where(Recorder.source_id == source_id, Recorder.lock_hash.is_not(None)))
+    locked = db.scalar(select(Recorder.id).where(Recorder.source_id == source_id, Recorder.locked.is_(True)))
     if locked and user.role != "admin":
         raise HTTPException(403, "A locked recorder uses this source. Ask an administrator.")
 
@@ -462,7 +508,6 @@ class RecorderBody(BaseModel):
     schedule_days: list[int] = Field(min_length=1, max_length=7)
     schedule_start: str
     schedule_end: str
-    lock_password: str | None = Field(default=None, max_length=256)
 
 
 def _validate_schedule(body: RecorderBody) -> None:
@@ -495,7 +540,7 @@ def _save_recorder(ctx, request, user, db, body: RecorderBody, recorder: Recorde
     if source is None or target is None:
         raise HTTPException(404, "Source or target not found")
     # A schedule overrides the base assignment, so it must honour that lock too.
-    _check_lock(ctx, request, user, _base_for(db, body.source_id), body.lock_password)
+    _check_lock(ctx, request, user, _base_for(db, body.source_id))
     if recorder is None:
         recorder = Recorder(name=body.name, source_id=source.id, target_id=target.id)
         db.add(recorder)
@@ -507,7 +552,7 @@ def _save_recorder(ctx, request, user, db, body: RecorderBody, recorder: Recorde
     db.commit()
     ctx.audit("recorder.saved", user=user, ip=ip_of(request), target=recorder.name)
     ctx.kick()
-    return {**_recorder_view(db, recorder), "warning": _range_warning(source, target)}
+    return {**_recorder_view(db, recorder), "warning": _warnings(db, source, target)}
 
 
 @router.post("/recorders", status_code=201)
@@ -526,7 +571,7 @@ def _scheduled_recorder(db, recorder_id: int) -> Recorder:
 def update_recorder(recorder_id: int, body: RecorderBody, request: Request, user: User = Depends(require("assign")), db=Depends(get_db)):
     ctx = ctx_of(request)
     recorder = _scheduled_recorder(db, recorder_id)
-    _check_lock(ctx, request, user, _base_for(db, recorder.source_id), body.lock_password)
+    _check_lock(ctx, request, user, _base_for(db, recorder.source_id))
     return _save_recorder(ctx, request, user, db, body, recorder)
 
 
@@ -535,7 +580,7 @@ def delete_recorder(recorder_id: int, request: Request,
                     user: User = Depends(require("assign")), db=Depends(get_db)):
     ctx = ctx_of(request)
     recorder = _scheduled_recorder(db, recorder_id)
-    _check_lock(ctx, request, user, _base_for(db, recorder.source_id), request.headers.get("x-lock-password"))
+    _check_lock(ctx, request, user, _base_for(db, recorder.source_id))
     name = recorder.name
     db.delete(recorder)
     db.commit()

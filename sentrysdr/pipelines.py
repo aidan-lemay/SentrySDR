@@ -23,8 +23,11 @@ DIGITAL_INPUT_RATE = 48000
 DSD_OUTPUT_RATE = 8000
 FREQ_MIN_HZ = 500_000
 FREQ_MAX_HZ = 2_200_000_000
-# rtl_fm checks far shorter blocks than a measurement, so noise peaks above its average.
-SQUELCH_MARGIN = 1.6
+# Noise peaks above its average and drifts as a stick warms up. In testing, quiet readings
+# stayed under 1.3x within a run, but 1.6x still let one stick open by itself.
+SQUELCH_MARGIN = 2.0
+VOLUME_MIN_DB = -20.0
+VOLUME_MAX_DB = 30.0
 
 
 class SpecError(ValueError):
@@ -47,9 +50,12 @@ def sanitize_spec(spec: dict) -> dict:
             "squelch": int(spec.get("squelch", 0)),
             "gain_db": None if spec.get("gain_db") is None else float(spec["gain_db"]),
             "ppm": int(spec.get("ppm", 0)),
+            "volume_db": float(spec.get("volume_db") or 0),
         }
     except (KeyError, TypeError, ValueError) as exc:
         raise SpecError(f"bad assignment: {exc}") from exc
+    if not VOLUME_MIN_DB <= clean["volume_db"] <= VOLUME_MAX_DB:
+        raise SpecError("volume out of range")
     if clean["kind"] not in ("audio", "adsb", "ais"):
         raise SpecError("bad kind")
     if clean["modulation"] not in MODULATIONS:
@@ -205,6 +211,15 @@ def live_encoder_args(cfg: Config, rate: int) -> list[str]:
         cfg.binary("ffmpeg") or "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
         "-f", "s16le", "-ar", str(rate), "-ac", "1", "-i", "pipe:0",
         "-codec:a", "libmp3lame", "-b:a", "32k", "-flush_packets", "1", "-f", "mp3", "pipe:1",
+    ]
+
+
+def broadcastify_audio_args(cfg: Config, in_path: str, out_path: str) -> list[str]:
+    # The same encoding trunk-recorder sends to Broadcastify.
+    return [
+        cfg.binary("ffmpeg") or "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+        "-i", in_path, "-vn", "-c:a", "aac", "-ar", "16000", "-ac", "1", "-b:a", "32k",
+        "-movflags", "+faststart", out_path,
     ]
 
 

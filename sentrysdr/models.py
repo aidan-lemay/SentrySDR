@@ -5,6 +5,7 @@ import time
 from pathlib import Path
 
 from sqlalchemy import JSON, ForeignKey, Index, String, create_engine, event, inspect, text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 
@@ -106,12 +107,25 @@ class Target(Base):
     frequency_hz: Mapped[int] = mapped_column()
     modulation: Mapped[str] = mapped_column(String(12), default="nfm")
     squelch: Mapped[int] = mapped_column(default=50)  # 0 = continuous recording
+    volume_db: Mapped[float | None] = mapped_column(nullable=True)  # applied to the audio
     clearcut_enabled: Mapped[bool] = mapped_column(default=False)
     clearcut_system: Mapped[str | None] = mapped_column(String(64), nullable=True)
     clearcut_id: Mapped[int | None] = mapped_column(nullable=True)  # talkgroup number
     rdio_enabled: Mapped[bool] = mapped_column(default=False)
     rdio_system: Mapped[int | None] = mapped_column(nullable=True)
     rdio_talkgroup: Mapped[int | None] = mapped_column(nullable=True)
+    broadcastify_enabled: Mapped[bool | None] = mapped_column(nullable=True)
+    broadcastify_system_ref: Mapped[int | None] = mapped_column(nullable=True)  # BroadcastifySystem.id
+    broadcastify_slot: Mapped[int | None] = mapped_column(nullable=True)  # the node's frequency slot
+
+
+class BroadcastifySystem(Base):
+    """One Broadcastify Calls node. Its API key is sealed and never leaves the server."""
+    __tablename__ = "broadcastify_systems"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(120))
+    system_id: Mapped[int] = mapped_column()
+    api_key_sealed: Mapped[str] = mapped_column(String(2000))
 
 
 class SdrProfile(Base):
@@ -143,7 +157,7 @@ class Recorder(Base):
     schedule_days: Mapped[list | None] = mapped_column(JSON, nullable=True)  # 0=Mon..6=Sun
     schedule_start: Mapped[str | None] = mapped_column(String(5), nullable=True)  # HH:MM
     schedule_end: Mapped[str | None] = mapped_column(String(5), nullable=True)
-    lock_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    locked: Mapped[bool | None] = mapped_column(nullable=True)  # only admins may change it
     assigned_by: Mapped[str] = mapped_column(String(254), default="")
     assigned_at: Mapped[float] = mapped_column(default=now)
 
@@ -203,6 +217,20 @@ def _add_missing_columns(engine) -> None:
                     connection.execute(text(f'ALTER TABLE "{table.name}" ADD COLUMN "{column.name}" {kind}'))
 
 
+def _retire_lock_passwords(engine) -> None:
+    """Locks used to have passwords. Keep what's locked, but don't keep the hashes."""
+    if "lock_hash" not in {column["name"] for column in inspect(engine).get_columns("recorders")}:
+        return
+    with engine.begin() as connection:
+        connection.execute(text("UPDATE recorders SET locked = 1 WHERE lock_hash IS NOT NULL"))
+        connection.execute(text("UPDATE recorders SET lock_hash = NULL"))
+    try:
+        with engine.begin() as connection:
+            connection.execute(text('ALTER TABLE recorders DROP COLUMN lock_hash'))
+    except OperationalError:
+        pass  # an older SQLite: the column stays, empty and unused
+
+
 def make_session_factory(db_path: Path):
     db_path.parent.mkdir(parents=True, exist_ok=True)
     engine = create_engine(
@@ -220,6 +248,7 @@ def make_session_factory(db_path: Path):
 
     Base.metadata.create_all(engine)
     _add_missing_columns(engine)
+    _retire_lock_passwords(engine)
     try:
         db_path.chmod(0o600)
     except OSError:

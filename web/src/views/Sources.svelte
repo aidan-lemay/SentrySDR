@@ -1,6 +1,6 @@
 <script>
   import { onMount } from 'svelte';
-  import { api, formatMHz, formatTime, formatDuration, STATE_LABELS } from '../lib.js';
+  import { api, DEFAULT_GAIN_DB, formatMHz, formatTime, formatDuration, STATE_LABELS } from '../lib.js';
 
   let { user } = $props();
   let sources = $state([]);
@@ -21,7 +21,7 @@
     try {
       [sources, targets, recorders] = await Promise.all([api('sources'), api('targets'), api('recorders')]);
       for (const source of sources) {
-        drafts[source.id] ??= { target: '', password: '', lock: '', editing: false };
+        drafts[source.id] ??= { target: '', editing: false };
         // Follow changes made elsewhere, unless this user is mid-selection.
         if (!drafts[source.id].editing) drafts[source.id].target = source.base_target_id ?? '';
         if (!measures[source.id]) {
@@ -51,8 +51,7 @@
       await refresh();
       return true;
     } catch (failure) {
-      const text = failure.detail === 'locked' ? 'This source is locked. Enter its lock password.' : failure.message;
-      notices[source.id] = { kind: 'err', text };
+      notices[source.id] = { kind: 'err', text: failure.message };
       return false;
     }
   }
@@ -61,23 +60,18 @@
     const draft = drafts[source.id];
     const done = await act(source, `sources/${source.id}/assign`, {
       method: 'POST',
-      body: { target_id: draft.target === '' ? null : Number(draft.target), lock_password: draft.password || null },
+      body: { target_id: draft.target === '' ? null : Number(draft.target) },
     }, draft.target === '' ? 'Target cleared.' : 'Target assigned.');
     if (done) {
-      draft.password = '';
       draft.editing = false;
       await refresh();
     }
   }
 
-  async function lock(source) {
-    const draft = drafts[source.id];
-    if (await act(source, `sources/${source.id}/lock`, { method: 'POST', body: { password: draft.lock } }, 'Locked.')) {
-      draft.lock = '';
-    }
+  async function setLocked(source, box) {
+    const done = await act(source, `sources/${source.id}/lock`, { method: box.checked ? 'POST' : 'DELETE' }, box.checked ? 'Locked.' : 'Unlocked.');
+    if (!done) box.checked = source.locked;
   }
-
-  const unlock = (source) => act(source, `sources/${source.id}/lock`, { method: 'DELETE' }, 'Unlocked.');
 
   const audioTargets = () => targets.filter((t) => t.kind === 'audio');
   const profileFor = (source, targetId) => source.profiles.find((p) => p.target_id === Number(targetId));
@@ -89,7 +83,7 @@
   function chooseTarget(source) {
     const m = measures[source.id];
     const saved = profileFor(source, m.target);
-    m.gain = saved ? (saved.gain_db ?? '') : (source.gain_db ?? '');
+    m.gain = saved ? (saved.gain_db ?? '') : (source.gain_db ?? DEFAULT_GAIN_DB);
     m.squelch = saved ? saved.squelch : '';
     m.result = null;
   }
@@ -226,17 +220,13 @@
                       {/each}
                     </select>
                   </label>
-                  {#if source.locked && !isAdmin}
-                    <label class="field"><span>Lock password</span><input type="password" bind:value={draft.password} autocomplete="off" /></label>
-                  {/if}
-                  <div class="buttons form-buttons"><button class="main" onclick={() => assign(source)}>{source.locked && isAdmin ? 'Override lock and assign' : 'Assign'}</button></div>
-                  {#if isAdmin && source.base_recorder_id}
-                    {#if source.locked}
-                      <div class="buttons form-buttons"><button onclick={() => unlock(source)}>Remove lock</button></div>
-                    {:else}
-                      <label class="field"><span>Set a lock password</span><input type="password" bind:value={draft.lock} minlength="4" autocomplete="new-password" /></label>
-                      <div class="buttons form-buttons"><button disabled={draft.lock.length < 4} onclick={() => lock(source)}>Lock</button></div>
-                    {/if}
+                  <div class="buttons form-buttons"><button class="main" disabled={source.locked && !isAdmin} onclick={() => assign(source)}>Assign</button></div>
+                  {#if source.locked && !isAdmin}<p class="small st-warn">This assignment is locked. Only an administrator can change it.</p>{/if}
+                  {#if isAdmin}
+                    <div class="field">
+                      <label class="tick"><input type="checkbox" checked={source.locked} disabled={!source.base_recorder_id} onchange={(event) => setLocked(source, event.target)} /> Lock this assignment, so only administrators can change it</label>
+                      {#if !source.base_recorder_id}<span class="hint">Assign a target first.</span>{/if}
+                    </div>
                   {/if}
                 </details>
                 {@const m = measures[source.id]}
@@ -259,7 +249,7 @@
                   </label>
                   <label class="field"><span>Gain (dB)</span>
                     <input class="mono" type="number" inputmode="decimal" min="0" max="60" step="0.1" placeholder="AGC" bind:value={m.gain} />
-                    <span class="hint">Leave empty for AGC. A fixed gain usually gives a steadier noise level.</span>
+                    <span class="hint">Leave empty for automatic gain (AGC). A fixed gain usually gives a steadier noise level. 0 means a real 0 dB, which may miss most calls.</span>
                   </label>
                   <p class="small dim">Measure while nothing is transmitting on this frequency.</p>
                   <div class="buttons form-buttons"><button disabled={m.target === '' || m.busy} onclick={() => measure(source)}>{m.busy ? 'Measuring, about 10 seconds...' : 'Measure noise'}</button></div>

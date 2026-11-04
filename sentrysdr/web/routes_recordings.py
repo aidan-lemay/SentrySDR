@@ -33,7 +33,7 @@ def _view(recording: Recording, uploads: list[UploadJob] | None = None) -> dict:
         "size_bytes": recording.size_bytes, "protected": recording.protected,
         "transcript": recording.transcript,
         "clearcut_system": recording.clearcut_system,
-        "uploads": [{"destination": u.destination, "status": u.status} for u in uploads or []],
+        "uploads": [{"destination": u.destination, "status": u.status, "detail": u.last_error} for u in uploads or []],
     }
 
 
