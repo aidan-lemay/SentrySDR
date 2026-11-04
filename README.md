@@ -155,6 +155,8 @@ The noise level changes a lot with stick, frequency, mode, gain and antenna, so 
 - Measuring and saving need the `assign` permission. If a recorder on the SDR is locked, only an administrator can do either.
 - Master and slaves must run the same version for measuring to work on a slave.
 
+A new source's gain box starts at 40.2 dB. Leave it empty for automatic gain (AGC). 0 is a real 0 dB, not automatic, and may miss most calls. Existing sources keep their setting.
+
 Noise also changes with how a stick is connected, and rises when other sticks run nearby. Measure each SDR in its final position with the others running, and measure again if it records noise by itself.
 
 With nothing else running, `sentrysdr measure --serial <serial> --mhz 444.85 --mode nfm` takes the same reading from the terminal.

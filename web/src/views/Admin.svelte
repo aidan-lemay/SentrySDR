@@ -1,6 +1,6 @@
 <script>
   import { onMount, tick } from 'svelte';
-  import { api, formatMHz, formatTime } from '../lib.js';
+  import { DEFAULT_GAIN_DB, api, formatMHz, formatTime } from '../lib.js';
 
   const TABS = [['users', 'Users'], ['sources', 'SDR sources'], ['nodes', 'Nodes'], ['bans', 'Bans'], ['audit', 'Audit log'], ['settings', 'Settings']];
   const PERMISSIONS = [
@@ -21,7 +21,7 @@
   let sources = $state([]);
   let available = $state([]);
   let nodes = $state([]);
-  const blankSource = () => ({ id: null, key: '', name: '', description: '', antenna: '', min: '', max: '', gain: '', ppm: 0 });
+  const blankSource = () => ({ id: null, key: '', name: '', description: '', antenna: '', min: '', max: '', gain: DEFAULT_GAIN_DB, ppm: 0 });
   let sourceForm = $state(blankSource());
 
   let nodeName = $state('');
@@ -133,7 +133,7 @@
     const body = {
       node_id: Number(nodeId), serial: serial.join('|'), name: sourceForm.name, description: sourceForm.description,
       antenna: sourceForm.antenna, freq_min_hz: toHz(sourceForm.min), freq_max_hz: toHz(sourceForm.max),
-      gain_db: sourceForm.gain === '' ? null : Number(sourceForm.gain), ppm: Number(sourceForm.ppm),
+      gain_db: sourceForm.gain === '' || sourceForm.gain === null ? null : Number(sourceForm.gain), ppm: Number(sourceForm.ppm),
     };
     const done = await run(() => (sourceForm.id
       ? api(`sources/${sourceForm.id}`, { method: 'PUT', body })
@@ -432,8 +432,8 @@
       <label class="field"><span>Antenna low end (MHz)</span><input type="number" inputmode="decimal" step="0.001" min="0" bind:value={sourceForm.min} /></label>
       <label class="field"><span>Antenna high end (MHz)</span><input type="number" inputmode="decimal" step="0.001" min="0" bind:value={sourceForm.max} /></label>
       <label class="field"><span>Gain (dB)</span>
-        <input type="number" inputmode="decimal" step="0.1" min="0" max="60" bind:value={sourceForm.gain} />
-        <span class="hint">Leave blank for automatic gain.</span>
+        <input type="number" inputmode="decimal" step="0.1" min="0" max="60" placeholder="AGC" bind:value={sourceForm.gain} />
+        <span class="hint">Starts at {DEFAULT_GAIN_DB} dB. Leave empty for automatic gain (AGC). 0 means a real 0 dB, which may miss most calls.</span>
       </label>
       <label class="field"><span>Frequency correction (ppm)</span><input type="number" min="-500" max="500" bind:value={sourceForm.ppm} /></label>
       <div class="buttons form-buttons">

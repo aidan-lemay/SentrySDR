@@ -1,6 +1,6 @@
 <script>
   import { onMount } from 'svelte';
-  import { api, formatMHz, formatTime, formatDuration, STATE_LABELS } from '../lib.js';
+  import { api, DEFAULT_GAIN_DB, formatMHz, formatTime, formatDuration, STATE_LABELS } from '../lib.js';
 
   let { user } = $props();
   let sources = $state([]);
@@ -89,7 +89,7 @@
   function chooseTarget(source) {
     const m = measures[source.id];
     const saved = profileFor(source, m.target);
-    m.gain = saved ? (saved.gain_db ?? '') : (source.gain_db ?? '');
+    m.gain = saved ? (saved.gain_db ?? '') : (source.gain_db ?? DEFAULT_GAIN_DB);
     m.squelch = saved ? saved.squelch : '';
     m.result = null;
   }
@@ -259,7 +259,7 @@
                   </label>
                   <label class="field"><span>Gain (dB)</span>
                     <input class="mono" type="number" inputmode="decimal" min="0" max="60" step="0.1" placeholder="AGC" bind:value={m.gain} />
-                    <span class="hint">Leave empty for AGC. A fixed gain usually gives a steadier noise level.</span>
+                    <span class="hint">Leave empty for automatic gain (AGC). A fixed gain usually gives a steadier noise level. 0 means a real 0 dB, which may miss most calls.</span>
                   </label>
                   <p class="small dim">Measure while nothing is transmitting on this frequency.</p>
                   <div class="buttons form-buttons"><button disabled={m.target === '' || m.busy} onclick={() => measure(source)}>{m.busy ? 'Measuring, about 10 seconds...' : 'Measure noise'}</button></div>
