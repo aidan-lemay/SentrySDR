@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import QRCode from 'qrcode';
   import { api, formatTime } from '../lib.js';
+  import { clearAfter } from '../notice.svelte.js';
 
   let { user, onChange, forced = false } = $props();
   let name = $state(user.name);
@@ -16,6 +17,7 @@
   let activity = $state([]);
   let error = $state('');
   let message = $state('');
+  clearAfter(() => message, () => (message = ''));
 
   const emailChanged = $derived(email.trim().toLowerCase() !== user.email);
 

@@ -1,6 +1,7 @@
 <script>
   import { onMount } from 'svelte';
   import { antennaCovers, api, DAYS, formatMHz, formatSchedule } from '../lib.js';
+  import { clearAfter } from '../notice.svelte.js';
 
   let { user } = $props();
   const canEdit = user.permissions.includes('assign');
@@ -12,6 +13,7 @@
   let form = $state(blank());
   let error = $state('');
   let message = $state('');
+  clearAfter(() => message, () => (message = ''));
   let tz = $state('');
 
   const chosenSource = $derived(sources.find((s) => s.id === Number(form.source_id)));

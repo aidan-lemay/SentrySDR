@@ -1,6 +1,7 @@
 <script>
   import { onMount, tick } from 'svelte';
   import { ANTENNA_UNITS, DEFAULT_GAIN_DB, api, formatRanges, formatTime } from '../lib.js';
+  import { clearAfter, NOTICE_MS } from '../notice.svelte.js';
 
   const TABS = [['users', 'Users'], ['sources', 'SDR sources'], ['antennas', 'Antennas'], ['nodes', 'Nodes'], ['bans', 'Bans'], ['audit', 'Audit log'], ['settings', 'Settings']];
   const PERMISSIONS = [
@@ -12,6 +13,7 @@
   let tab = $state('users');
   let error = $state('');
   let message = $state('');
+  clearAfter(() => message, () => (message = ''));
 
   let users = $state([]);
   let selected = $state(null);
@@ -311,7 +313,9 @@
   async function testSystem(system) {
     systemReplies[system.id] = 'Asking Broadcastify...';
     try {
-      systemReplies[system.id] = `Broadcastify replied: ${(await api(`admin/broadcastify/${system.id}/test`, { method: 'POST' })).reply}`;
+      const text = `Broadcastify replied: ${(await api(`admin/broadcastify/${system.id}/test`, { method: 'POST' })).reply}`;
+      systemReplies[system.id] = text;
+      setTimeout(() => { if (systemReplies[system.id] === text) delete systemReplies[system.id]; }, NOTICE_MS);
     } catch (failure) {
       systemReplies[system.id] = failure.message;
     }

@@ -1,5 +1,6 @@
 <script>
   import { api } from '../lib.js';
+  import { clearAfter } from '../notice.svelte.js';
 
   let { onSignedIn } = $props();
   let mode = $state('login');
@@ -10,6 +11,7 @@
   let needTotp = $state(false);
   let error = $state('');
   let message = $state('');
+  clearAfter(() => message, () => (message = ''));
   let busy = $state(false);
 
   async function submit(event) {

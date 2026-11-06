@@ -1,5 +1,5 @@
 <script>
-  import { untrack } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import { api, formatMHz, formatTime, formatDuration, formatSize } from '../lib.js';
 
   let { user, route } = $props();
@@ -20,20 +20,30 @@
 
   const sourceFilter = $derived(new URLSearchParams(route.split('?')[1] ?? '').get('source_id'));
 
+  // The filters last searched with. Polling uses these, not what's half typed in the form.
+  let applied = { search: '', start: '', end: '', protectedOnly: false };
+  let generation = 0;
+  let loadFailed = false;
+
   async function load() {
     const params = new URLSearchParams({ limit: PAGE, offset });
-    if (search) params.set('search', search);
+    if (applied.search) params.set('search', applied.search);
     if (sourceFilter) params.set('source_id', sourceFilter);
-    if (start) params.set('start', new Date(start).getTime() / 1000);
-    if (end) params.set('end', new Date(end).getTime() / 1000);
-    if (protectedOnly) params.set('protected', 'true');
+    if (applied.start) params.set('start', new Date(applied.start).getTime() / 1000);
+    if (applied.end) params.set('end', new Date(applied.end).getTime() / 1000);
+    if (applied.protectedOnly) params.set('protected', 'true');
+    const mine = ++generation;
     try {
       const reply = await api(`recordings?${params}`);
+      if (mine !== generation) return;  // a newer search or page has been asked for
       items = reply.items;
       total = reply.total;
-      error = '';
+      if (loadFailed) error = '';  // a failed action's error stays until the next action
+      loadFailed = false;
     } catch (failure) {
+      if (mine !== generation) return;
       error = failure.message;
+      loadFailed = true;
     } finally {
       loaded = true;
     }
@@ -50,9 +60,28 @@
 
   function applyFilters(event) {
     event.preventDefault();
+    applied = { search, start, end, protectedOnly };
     offset = 0;
     load();
   }
+
+  // New calls, upload results and transcripts show up without reloading. Only the
+  // first page follows along, so an older page doesn't shift while you listen.
+  let polling = false;
+  async function poll() {
+    if (polling || offset !== 0 || document.hidden) return;
+    polling = true;
+    try {
+      await load();
+    } finally {
+      polling = false;
+    }
+  }
+
+  onMount(() => {
+    const timer = setInterval(poll, 5000);
+    return () => clearInterval(timer);
+  });
 
   function page(delta) {
     offset = Math.max(0, offset + delta);
@@ -61,6 +90,7 @@
   }
 
   async function setProtected(call, value) {
+    error = '';
     try {
       await api(`recordings/${call.id}/protect`, { method: 'POST', body: { protected: value } });
       call.protected = value;
@@ -71,6 +101,7 @@
 
   async function remove(call) {
     if (!confirm(`Permanently delete this recording of ${call.target_name}?`)) return;
+    error = '';
     try {
       await api(`recordings/${call.id}`, { method: 'DELETE' });
       await load();

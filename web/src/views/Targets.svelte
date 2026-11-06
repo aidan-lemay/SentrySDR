@@ -1,6 +1,7 @@
 <script>
   import { onMount } from 'svelte';
   import { api, formatMHz, MODULATIONS } from '../lib.js';
+  import { clearAfter } from '../notice.svelte.js';
 
   const blank = () => ({
     id: null, name: '', kind: 'audio', mhz: '', modulation: 'nfm', squelch: 50, volume_db: 0,
@@ -15,6 +16,7 @@
   let form = $state(blank());
   let error = $state('');
   let message = $state('');
+  clearAfter(() => message, () => (message = ''));
 
   async function refresh() {
     try {
