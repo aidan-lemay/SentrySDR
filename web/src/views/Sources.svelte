@@ -1,6 +1,6 @@
 <script>
   import { onMount } from 'svelte';
-  import { api, DEFAULT_GAIN_DB, formatMHz, formatTime, formatDuration, STATE_LABELS } from '../lib.js';
+  import { antennaCovers, api, DEFAULT_GAIN_DB, formatMHz, formatTime, formatDuration, STATE_LABELS } from '../lib.js';
 
   let { user } = $props();
   let sources = $state([]);
@@ -153,7 +153,7 @@
           <tr>
             <td class="title-cell">
               {source.name}
-              <div class="small dim" style="font-weight:normal">{source.node_name}{source.antenna ? `, ${source.antenna}` : ''}</div>
+              <div class="small dim" style="font-weight:normal">{source.node_name}{source.antenna_name ? `, ${source.antenna_name}` : ''}</div>
             </td>
             <td data-label="Tuned to">
               <div>
@@ -216,9 +216,12 @@
                     <select bind:value={draft.target} onchange={() => (draft.editing = true)}>
                       <option value="">None</option>
                       {#each targets as target (target.id)}
-                        <option value={target.id}>{target.name} ({formatMHz(target.frequency_hz)})</option>
+                        <option value={target.id}>{target.name} ({formatMHz(target.frequency_hz)}){antennaCovers(source.antenna_ranges, target.frequency_hz) ? '' : ', outside antenna range'}</option>
                       {/each}
                     </select>
+                    {#if source.antenna_name && draft.target !== '' && !antennaCovers(source.antenna_ranges, targets.find((t) => t.id === Number(draft.target))?.frequency_hz)}
+                      <span class="hint st-warn">{source.antenna_name} doesn't cover this frequency, so reception may be poor.</span>
+                    {/if}
                   </label>
                   <div class="buttons form-buttons"><button class="main" disabled={source.locked && !isAdmin} onclick={() => assign(source)}>Assign</button></div>
                   {#if source.locked && !isAdmin}<p class="small st-warn">This assignment is locked. Only an administrator can change it.</p>{/if}

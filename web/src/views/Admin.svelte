@@ -1,8 +1,8 @@
 <script>
   import { onMount, tick } from 'svelte';
-  import { DEFAULT_GAIN_DB, api, formatMHz, formatTime } from '../lib.js';
+  import { ANTENNA_UNITS, DEFAULT_GAIN_DB, api, formatRanges, formatTime } from '../lib.js';
 
-  const TABS = [['users', 'Users'], ['sources', 'SDR sources'], ['nodes', 'Nodes'], ['bans', 'Bans'], ['audit', 'Audit log'], ['settings', 'Settings']];
+  const TABS = [['users', 'Users'], ['sources', 'SDR sources'], ['antennas', 'Antennas'], ['nodes', 'Nodes'], ['bans', 'Bans'], ['audit', 'Audit log'], ['settings', 'Settings']];
   const PERMISSIONS = [
     ['listen_live', 'Listen live'], ['listen_recordings', 'Play recordings'], ['download', 'Download'],
     ['assign', 'Assign and schedule'], ['manage_targets', 'Manage targets'], ['protect', 'Protect recordings'],
@@ -21,8 +21,14 @@
   let sources = $state([]);
   let available = $state([]);
   let nodes = $state([]);
-  const blankSource = () => ({ id: null, key: '', name: '', description: '', antenna: '', min: '', max: '', gain: DEFAULT_GAIN_DB, ppm: 0 });
+  const blankSource = () => ({ id: null, key: '', name: '', description: '', antenna_id: '', gain: DEFAULT_GAIN_DB, ppm: 0 });
   let sourceForm = $state(blankSource());
+
+  let antennas = $state([]);
+  const ANTENNA_TYPES = ['Discone', 'Dipole', 'Ground plane', 'Collinear', 'J-pole', 'Slim Jim', 'Yagi', 'Log periodic', 'Whip', 'Telescopic', 'Loop', 'Magnetic mount'];
+  const blankAntenna = () => ({ id: null, name: '', kind: '', length: '', length_unit: 'in', notes: '', ranges: [], newLow: '', newHigh: '' });
+  let antennaForm = $state(blankAntenna());
+  let rangeProblem = $state('');
 
   let nodeName = $state('');
   let enrolment = $state(null);
@@ -62,7 +68,8 @@
 
   const loaders = {
     users: async () => { users = await api('admin/users'); },
-    sources: async () => { [sources, available] = await Promise.all([api('sources'), api('sources/available')]); },
+    sources: async () => { [sources, available, antennas] = await Promise.all([api('sources'), api('sources/available'), api('antennas')]); },
+    antennas: async () => { antennas = await api('antennas'); },
     nodes: async () => { nodes = await api('nodes'); },
     bans: async () => { bans = await api('admin/bans'); },
     audit: async () => { audit = await api(`admin/audit?limit=200${auditSearch ? `&search=${encodeURIComponent(auditSearch)}` : ''}`); },
@@ -129,10 +136,9 @@
   async function saveSource(event) {
     event.preventDefault();
     const [nodeId, ...serial] = sourceForm.key.split('|');
-    const toHz = (mhz) => (mhz === '' ? null : Math.round(Number(mhz) * 1e6));
     const body = {
       node_id: Number(nodeId), serial: serial.join('|'), name: sourceForm.name, description: sourceForm.description,
-      antenna: sourceForm.antenna, freq_min_hz: toHz(sourceForm.min), freq_max_hz: toHz(sourceForm.max),
+      antenna_id: sourceForm.antenna_id === '' ? null : Number(sourceForm.antenna_id),
       gain_db: sourceForm.gain === '' || sourceForm.gain === null ? null : Number(sourceForm.gain), ppm: Number(sourceForm.ppm),
     };
     const done = await run(() => (sourceForm.id
@@ -147,11 +153,85 @@
   function editSource(source) {
     sourceForm = {
       id: source.id, key: `${source.node_id}|${source.serial}`, name: source.name, description: source.description,
-      antenna: source.antenna, min: source.freq_min_hz ? source.freq_min_hz / 1e6 : '', max: source.freq_max_hz ? source.freq_max_hz / 1e6 : '',
-      gain: source.gain_db ?? '', ppm: source.ppm,
+      antenna_id: source.antenna_id ?? '', gain: source.gain_db ?? '', ppm: source.ppm,
     };
     document.getElementById('source-form')?.scrollIntoView();
   }
+
+  // --- antennas
+  const toHz = (mhz) => Math.round(Number(mhz) * 1e6);
+  const filled = (value) => value !== '' && value !== null && value !== undefined;
+  const plain = (hz) => +(hz / 1e6).toFixed(4);
+
+  function badRange(low, high) {
+    if (!filled(low) || !filled(high)) return 'Enter both ends of the range.';
+    if (Number(low) < 0 || Number(high) < 0) return 'Frequencies can\'t be negative.';
+    if (Number(low) > Number(high)) return 'The low end is above the high end.';
+    return '';
+  }
+
+  function addRange() {
+    rangeProblem = badRange(antennaForm.newLow, antennaForm.newHigh);
+    if (rangeProblem) return false;
+    antennaForm.ranges.push({ low: antennaForm.newLow, high: antennaForm.newHigh });
+    antennaForm.newLow = '';
+    antennaForm.newHigh = '';
+    document.getElementById('new-range-low')?.focus();
+    return true;
+  }
+
+  function addOnEnter(event) {
+    if (event.key !== 'Enter') return;
+    event.preventDefault();  // Enter here means add this range, not save the antenna
+    addRange();
+  }
+
+  async function saveAntenna(event) {
+    event.preventDefault();
+    rangeProblem = '';
+    // A range typed into the add row but not added yet still counts.
+    if ((filled(antennaForm.newLow) || filled(antennaForm.newHigh)) && !addRange()) return;
+    const broken = antennaForm.ranges.map((r) => badRange(r.low, r.high)).find(Boolean);
+    if (broken) {
+      rangeProblem = broken;
+      return;
+    }
+    const body = {
+      name: antennaForm.name, kind: antennaForm.kind, notes: antennaForm.notes,
+      length: filled(antennaForm.length) ? Number(antennaForm.length) : null, length_unit: antennaForm.length_unit,
+      ranges: antennaForm.ranges.map((r) => ({ low_hz: toHz(r.low), high_hz: toHz(r.high) })),
+    };
+    const done = await run(() => (antennaForm.id
+      ? api(`antennas/${antennaForm.id}`, { method: 'PUT', body })
+      : api('antennas', { method: 'POST', body })), 'Antenna saved.');
+    if (done) {
+      antennaForm = blankAntenna();
+      await loaders.antennas();
+    }
+  }
+
+  function editAntenna(antenna) {
+    antennaForm = {
+      ...blankAntenna(), id: antenna.id, name: antenna.name, kind: antenna.kind, notes: antenna.notes,
+      length: antenna.length ?? '', length_unit: antenna.length_unit,
+      ranges: antenna.ranges.map(([low, high]) => ({ low: plain(low), high: plain(high) })),
+    };
+    rangeProblem = '';
+    document.getElementById('antenna-form')?.scrollIntoView();
+  }
+
+  function removeAntenna(antenna) {
+    const used = antenna.sources.length ? ` ${antenna.sources.join(', ')} will have no antenna set.` : '';
+    if (!confirm(`Remove antenna ${antenna.name}?${used}`)) return;
+    run(async () => {
+      await api(`antennas/${antenna.id}`, { method: 'DELETE' });
+      if (antennaForm.id === antenna.id) antennaForm = blankAntenna();
+      await loaders.antennas();
+    }, 'Antenna removed.');
+  }
+
+  const unitLabel = (unit) => ANTENNA_UNITS.find(([id]) => id === unit)?.[1] ?? unit;
+  const formatLength = (antenna) => (antenna.length == null ? 'Not set' : `${antenna.length} ${unitLabel(antenna.length_unit)}`);
 
   const removeSource = (source) => confirm(`Remove source ${source.name}? Its recordings are kept.`) && run(async () => {
     await api(`sources/${source.id}`, { method: 'DELETE' });
@@ -394,8 +474,8 @@
             <td class="title-cell">{source.name}</td>
             <td data-label="Node"><span>{source.node_name}</span></td>
             <td data-label="Serial"><span class="mono small">{source.serial}</span></td>
-            <td data-label="Antenna"><span>{source.antenna || 'Not set'}</span></td>
-            <td data-label="Range"><span class="mono small">{source.freq_min_hz ? `${formatMHz(source.freq_min_hz)} to ${formatMHz(source.freq_max_hz)}` : 'Not set'}</span></td>
+            <td data-label="Antenna"><span>{source.antenna_name || 'Not set'}</span></td>
+            <td data-label="Range"><span class="mono small">{source.antenna_id ? formatRanges(source.antenna_ranges) : 'Not set'}</span></td>
             <td data-label="Gain"><span class="small">{source.gain_db == null ? 'Auto (AGC)' : `${source.gain_db} dB`}</span></td>
             <td>
               <div class="buttons" style="margin:0">
@@ -428,9 +508,13 @@
       </label>
       <label class="field"><span>Name</span><input bind:value={sourceForm.name} required maxlength="120" /></label>
       <label class="field"><span>Description</span><input bind:value={sourceForm.description} maxlength="500" /></label>
-      <label class="field"><span>Antenna type</span><input bind:value={sourceForm.antenna} maxlength="120" /></label>
-      <label class="field"><span>Antenna low end (MHz)</span><input type="number" inputmode="decimal" step="0.001" min="0" bind:value={sourceForm.min} /></label>
-      <label class="field"><span>Antenna high end (MHz)</span><input type="number" inputmode="decimal" step="0.001" min="0" bind:value={sourceForm.max} /></label>
+      <label class="field"><span>Antenna</span>
+        <select bind:value={sourceForm.antenna_id}>
+          <option value="">None</option>
+          {#each antennas as antenna (antenna.id)}<option value={antenna.id}>{antenna.name}{antenna.kind && antenna.kind !== antenna.name ? ` (${antenna.kind})` : ''}</option>{/each}
+        </select>
+        <span class="hint">Add antennas under the Antennas section. One antenna can feed several SDRs.</span>
+      </label>
       <label class="field"><span>Gain (dB)</span>
         <input type="number" inputmode="decimal" step="0.1" min="0" max="60" placeholder="AGC" bind:value={sourceForm.gain} />
         <span class="hint">Starts at {DEFAULT_GAIN_DB} dB. Leave empty for automatic gain (AGC). 0 means a real 0 dB, which may miss most calls.</span>
@@ -440,6 +524,79 @@
         <button class="main">Save</button>
         {#if sourceForm.id}<button type="button" onclick={() => (sourceForm = blankSource())}>Cancel</button>{/if}
       </div>
+    </fieldset>
+  </form>
+{/if}
+
+{#if tab === 'antennas'}
+  <div class="box">
+    <table class="table">
+      <thead><tr><th>Name</th><th>Type</th><th>Length</th><th>Effective ranges</th><th>Used by</th><th>Actions</th></tr></thead>
+      {#each antennas as antenna (antenna.id)}
+        <tbody>
+          <tr>
+            <td class="title-cell">{antenna.name}{#if antenna.notes}<div class="small dim" style="font-weight:normal">{antenna.notes}</div>{/if}</td>
+            <td data-label="Type"><span>{antenna.kind || 'Not set'}</span></td>
+            <td data-label="Length"><span class="small">{formatLength(antenna)}</span></td>
+            <td data-label="Ranges"><span class="mono small">{formatRanges(antenna.ranges)}</span></td>
+            <td data-label="Used by"><span class="small">{antenna.sources.join(', ') || 'No SDRs'}</span></td>
+            <td>
+              <div class="buttons" style="margin:0">
+                <button onclick={() => editAntenna(antenna)}>Edit</button>
+                <button class="bad" onclick={() => removeAntenna(antenna)}>Remove</button>
+              </div>
+            </td>
+          </tr>
+        </tbody>
+      {:else}
+        <tbody><tr><td class="empty" colspan="6">No antennas yet.</td></tr></tbody>
+      {/each}
+    </table>
+  </div>
+
+  <form id="antenna-form" onsubmit={saveAntenna}>
+    <fieldset>
+      <legend>{antennaForm.id ? 'Edit antenna' : 'Add an antenna'}</legend>
+      <label class="field"><span>Name</span><input bind:value={antennaForm.name} required maxlength="120" placeholder="Roof discone" /></label>
+      <label class="field"><span>Type</span>
+        <input bind:value={antennaForm.kind} maxlength="60" list="antenna-types" />
+        <datalist id="antenna-types">{#each ANTENNA_TYPES as kind (kind)}<option value={kind}></option>{/each}</datalist>
+      </label>
+      <div class="field"><span>Length</span>
+        <div class="pair">
+          <input type="number" inputmode="decimal" step="any" min="0" aria-label="Length" bind:value={antennaForm.length} />
+          <select aria-label="Unit" bind:value={antennaForm.length_unit}>
+            {#each ANTENNA_UNITS as [id, label] (id)}<option value={id}>{label}</option>{/each}
+          </select>
+        </div>
+      </div>
+      <div class="field top"><span>Effective ranges (MHz)</span>
+        <table class="ranges">
+          <thead><tr><th>From</th><th>To</th><th></th></tr></thead>
+          <tbody>
+            {#each antennaForm.ranges as range, index (range)}
+              <tr>
+                <td><input class="mono" type="number" inputmode="decimal" step="any" min="0" aria-label={`Range ${index + 1} from`} bind:value={range.low} required /></td>
+                <td><input class="mono" type="number" inputmode="decimal" step="any" min="0" aria-label={`Range ${index + 1} to`} bind:value={range.high} required /></td>
+                <td><button type="button" aria-label={`Remove range ${index + 1}`} onclick={() => antennaForm.ranges.splice(index, 1)}>Remove</button></td>
+              </tr>
+            {/each}
+            <tr class:adding={antennaForm.ranges.length > 0}>
+              <td><input id="new-range-low" class="mono" type="number" inputmode="decimal" step="any" min="0" aria-label="New range from" placeholder="144" bind:value={antennaForm.newLow} onkeydown={addOnEnter} /></td>
+              <td><input class="mono" type="number" inputmode="decimal" step="any" min="0" aria-label="New range to" placeholder="148" bind:value={antennaForm.newHigh} onkeydown={addOnEnter} /></td>
+              <td><button type="button" onclick={addRange}>+ Add</button></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      {#if rangeProblem}<p class="small st-bad form-buttons" role="alert">{rangeProblem}</p>{/if}
+      <p class="small dim form-buttons">Add one range per band the antenna works on. A target outside all of them gets a warning, but can still be assigned. With no ranges, nothing is checked.</p>
+      <label class="field"><span>Notes</span><input bind:value={antennaForm.notes} maxlength="500" placeholder="Mounting, feed line, splitter..." /></label>
+      <div class="buttons form-buttons">
+        <button class="main">{antennaForm.id ? 'Save antenna' : 'Add antenna'}</button>
+        {#if antennaForm.id}<button type="button" onclick={() => { antennaForm = blankAntenna(); rangeProblem = ''; }}>Cancel</button>{/if}
+      </div>
+      <p class="small dim form-buttons">To use an antenna, choose it on each SDR under SDR sources.</p>
     </fieldset>
   </form>
 {/if}

@@ -1,6 +1,6 @@
 <script>
   import { onMount } from 'svelte';
-  import { api, DAYS, formatMHz, formatSchedule } from '../lib.js';
+  import { antennaCovers, api, DAYS, formatMHz, formatSchedule } from '../lib.js';
 
   let { user } = $props();
   const canEdit = user.permissions.includes('assign');
@@ -14,6 +14,7 @@
   let message = $state('');
   let tz = $state('');
 
+  const chosenSource = $derived(sources.find((s) => s.id === Number(form.source_id)));
   const selectedLocked = $derived(sources.find((s) => s.id === Number(form.source_id))?.locked && user.role !== 'admin');
   const scheduled = $derived(recorders.filter((r) => r.schedule_days));
   const alwaysOn = $derived(recorders.filter((r) => !r.schedule_days));
@@ -141,8 +142,11 @@
       <label class="field"><span>Target</span>
         <select bind:value={form.target_id} required>
           <option value="" disabled>Choose...</option>
-          {#each targets as target (target.id)}<option value={target.id}>{target.name} ({formatMHz(target.frequency_hz)})</option>{/each}
+          {#each targets as target (target.id)}<option value={target.id}>{target.name} ({formatMHz(target.frequency_hz)}){antennaCovers(chosenSource?.antenna_ranges, target.frequency_hz) ? '' : ', outside antenna range'}</option>{/each}
         </select>
+        {#if chosenSource?.antenna_name && form.target_id !== '' && !antennaCovers(chosenSource.antenna_ranges, targets.find((t) => t.id === Number(form.target_id))?.frequency_hz)}
+          <span class="hint st-warn">{chosenSource.antenna_name} on {chosenSource.name} doesn't cover this frequency, so reception may be poor.</span>
+        {/if}
       </label>
       <label class="field"><span>Start time</span><input type="time" bind:value={form.start} required /></label>
       <label class="field"><span>End time</span><input type="time" bind:value={form.end} required /></label>

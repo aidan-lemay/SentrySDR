@@ -59,6 +59,13 @@ export const MODULATIONS = [
 export const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 
 export const formatMHz = (hz) => (hz == null ? '' : `${(hz / 1e6).toFixed(4).replace(/0{1,2}$/, '')} MHz`);
+const plainMHz = (hz) => String(+(hz / 1e6).toFixed(4));
+export const formatRanges = (ranges) => (ranges?.length
+  ? `${ranges.map(([low, high]) => `${plainMHz(low)} to ${plainMHz(high)}`).join(', ')} MHz`
+  : 'Not set');
+// An antenna with no ranges entered isn't judged, as on the server.
+export const antennaCovers = (ranges, hz) => !ranges?.length || ranges.some(([low, high]) => low <= hz && hz <= high);
+export const ANTENNA_UNITS = [['in', 'inches'], ['ft', 'feet'], ['cm', 'cm'], ['m', 'metres']];
 export const formatTime = (epoch) => (epoch ? new Date(epoch * 1000).toLocaleString() : 'None');
 
 export function formatDuration(seconds) {

@@ -91,12 +91,29 @@ class Source(Base):
     serial: Mapped[str] = mapped_column(String(64))
     name: Mapped[str] = mapped_column(String(120))
     description: Mapped[str] = mapped_column(String(500), default="")
+    # Retired: these became antennas. Kept empty so older databases still match.
     antenna: Mapped[str] = mapped_column(String(120), default="")
     freq_min_hz: Mapped[int | None] = mapped_column(nullable=True)
     freq_max_hz: Mapped[int | None] = mapped_column(nullable=True)
     gain_db: Mapped[float | None] = mapped_column(nullable=True)  # None = tuner AGC
     ppm: Mapped[int] = mapped_column(default=0)
+    antenna_id: Mapped[int | None] = mapped_column(nullable=True)  # Antenna.id, cleared when it's removed
     __table_args__ = (Index("uq_source_node_serial", "node_id", "serial", unique=True),)
+
+
+ANTENNA_UNITS = ("in", "ft", "cm", "m")
+
+
+class Antenna(Base):
+    """A physical antenna. Several SDRs can share one through a splitter."""
+    __tablename__ = "antennas"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(120))
+    kind: Mapped[str] = mapped_column(String(60), default="")  # discone, dipole...
+    length: Mapped[float | None] = mapped_column(nullable=True)
+    length_unit: Mapped[str] = mapped_column(String(4), default="in")
+    notes: Mapped[str] = mapped_column(String(500), default="")
+    ranges: Mapped[list] = mapped_column(JSON, default=list)  # [[low_hz, high_hz], ...], sorted
 
 
 class Target(Base):
@@ -231,6 +248,33 @@ def _retire_lock_passwords(engine) -> None:
         pass  # an older SQLite: the column stays, empty and unused
 
 
+def _convert_source_antennas(engine) -> None:
+    """Sources used to hold an antenna type and one range. Turn those into antennas."""
+    from .pipelines import FREQ_MAX_HZ
+    with engine.begin() as connection:
+        rows = connection.execute(text(
+            "SELECT id, name, antenna, freq_min_hz, freq_max_hz FROM sources WHERE antenna_id IS NULL "
+            "AND (COALESCE(antenna, '') != '' OR freq_min_hz IS NOT NULL OR freq_max_hz IS NOT NULL)"
+        )).all()
+        made: dict[tuple, int] = {}
+        for source_id, source_name, kind, low, high in rows:
+            kind = (kind or "").strip()[:60]
+            ranges = [[low or 0, high or FREQ_MAX_HZ]] if (low or high) else []
+            key = (kind, low, high)
+            # Sticks described the same way most likely share one antenna, but only when it has a type.
+            antenna_id = made.get(key) if kind else None
+            if antenna_id is None:
+                antenna_id = connection.execute(Antenna.__table__.insert().values(
+                    name=(kind or f"{source_name} antenna")[:120], kind=kind, length=None,
+                    length_unit="in", notes="", ranges=ranges,
+                )).inserted_primary_key[0]
+                made[key] = antenna_id
+            connection.execute(
+                text("UPDATE sources SET antenna_id = :a, antenna = '', freq_min_hz = NULL, freq_max_hz = NULL WHERE id = :s"),
+                {"a": antenna_id, "s": source_id},
+            )
+
+
 def make_session_factory(db_path: Path):
     db_path.parent.mkdir(parents=True, exist_ok=True)
     engine = create_engine(
@@ -249,6 +293,7 @@ def make_session_factory(db_path: Path):
     Base.metadata.create_all(engine)
     _add_missing_columns(engine)
     _retire_lock_passwords(engine)
+    _convert_source_antennas(engine)
     try:
         db_path.chmod(0o600)
     except OSError:

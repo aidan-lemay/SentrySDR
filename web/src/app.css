@@ -129,6 +129,13 @@ legend { font-weight: bold; padding: 0 .3rem; }
 .field .hint { display: block; font-size: .875rem; color: var(--dim); margin-top: .15rem; }
 .tick { display: flex; align-items: center; gap: .5rem; min-height: var(--touch); }
 .days { display: grid; grid-template-columns: repeat(4, 1fr); }
+.pair { display: flex; gap: .4rem; }
+.pair select { width: auto; flex: none; }
+.ranges { border-collapse: collapse; width: 100%; }
+.ranges th { text-align: left; font-size: .875rem; font-weight: normal; color: var(--dim); padding: 0 .4rem .15rem 0; }
+.ranges td { padding: 0 .4rem .4rem 0; }
+.ranges td:last-child { width: 1%; padding-right: 0; }
+.ranges tr.adding td { border-top: 1px dashed var(--rule); padding-top: .4rem; }
 
 /* --- tables: labelled rows on a phone, ordinary tables when wide --- */
 .table thead { position: absolute; left: -9999px; }
@@ -177,6 +184,8 @@ audio { width: 100%; }
   .field > span:first-child { margin: 0; font-size: 1rem; text-align: right; }
   .field .hint { grid-column: 2; margin-top: -.5rem; }
   .form-buttons { padding-left: 13.75rem; }
+  .field.top { align-items: start; }
+  .field.top > span:first-child { padding-top: 1.55rem; }
   .days { display: flex; gap: 1rem; }
 
   .table { display: table; border-collapse: collapse; }
