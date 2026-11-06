@@ -2,6 +2,8 @@
   import { onMount } from 'svelte';
   import QRCode from 'qrcode';
   import { api, formatTime } from '../lib.js';
+  import Notice from '../Notice.svelte';
+  import { clearAfter } from '../notice.svelte.js';
 
   let { user, onChange, forced = false } = $props();
   let name = $state(user.name);
@@ -16,6 +18,7 @@
   let activity = $state([]);
   let error = $state('');
   let message = $state('');
+  clearAfter(() => message, () => (message = ''));
 
   const emailChanged = $derived(email.trim().toLowerCase() !== user.email);
 
@@ -89,7 +92,7 @@
 <h1>{forced ? 'Choose a new password' : 'My account'}</h1>
 {#if forced}<div class="warn">An administrator reset your password. Choose a new one to continue.</div>{/if}
 {#if error}<div class="err" role="alert">{error}</div>{/if}
-{#if message}<div class="msg" role="status">{message}</div>{/if}
+{#if message}<Notice ondismiss={() => (message = '')}>{message}</Notice>{/if}
 
 {#if !forced}
   <form onsubmit={saveProfile}>

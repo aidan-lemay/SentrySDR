@@ -16,7 +16,7 @@ from .. import pipelines, schedule
 from ..config import SERIAL_RE
 from ..context import Context
 from ..engine import MeasureError
-from ..models import BroadcastifySystem, Node, Recorder, SdrProfile, Source, Target, User, now
+from ..models import ANTENNA_UNITS, Antenna, BroadcastifySystem, Node, Recorder, SdrProfile, Source, Target, User, now
 from .deps import admin_user, ctx_of, current_user, get_db, ip_of, require
 
 router = APIRouter(prefix="/api")
@@ -25,7 +25,98 @@ MEASURE_LIMIT = 30
 MEASURE_WINDOW = 3600
 LIVE_MAX_TOTAL = 50
 LIVE_MAX_PER_USER = 3
+MAX_ANTENNA_RANGES = 20
 _live_counts: dict[int, int] = {}
+
+
+# --- antennas --------------------------------------------------------------
+class RangeBody(BaseModel):
+    low_hz: int = Field(ge=0, le=10_000_000_000)
+    high_hz: int = Field(ge=0, le=10_000_000_000)
+
+
+class AntennaBody(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    kind: str = Field(default="", max_length=60)
+    length: float | None = Field(default=None, gt=0, le=100_000)
+    length_unit: str = "in"
+    notes: str = Field(default="", max_length=500)
+    ranges: list[RangeBody] = Field(default_factory=list, max_length=MAX_ANTENNA_RANGES)
+
+    @field_validator("length_unit")
+    @classmethod
+    def _unit(cls, value: str) -> str:
+        if value not in ANTENNA_UNITS:
+            raise ValueError(f"unit must be one of {', '.join(ANTENNA_UNITS)}")
+        return value
+
+    def clean_ranges(self) -> list[list[int]]:
+        for item in self.ranges:
+            if item.low_hz > item.high_hz:
+                raise HTTPException(422, "A range starts above where it ends")
+        return [list(pair) for pair in sorted({(r.low_hz, r.high_hz) for r in self.ranges})]
+
+
+def antenna_covers(antenna: Antenna | None, frequency_hz: int) -> bool:
+    """An antenna with no ranges entered isn't judged."""
+    if antenna is None or not antenna.ranges:
+        return True
+    return any(low <= frequency_hz <= high for low, high in antenna.ranges)
+
+
+def _antenna_view(db, antenna: Antenna) -> dict:
+    users = db.scalars(select(Source.name).where(Source.antenna_id == antenna.id).order_by(Source.name)).all()
+    return {
+        "id": antenna.id, "name": antenna.name, "kind": antenna.kind, "length": antenna.length,
+        "length_unit": antenna.length_unit, "notes": antenna.notes, "ranges": antenna.ranges or [],
+        "sources": list(users),
+    }
+
+
+@router.get("/antennas")
+def list_antennas(_user: User = Depends(current_user), db=Depends(get_db)):
+    return [_antenna_view(db, a) for a in db.scalars(select(Antenna).order_by(Antenna.name))]
+
+
+def _apply_antenna(antenna: Antenna, body: AntennaBody) -> None:
+    antenna.ranges = body.clean_ranges()
+    antenna.name, antenna.kind, antenna.notes = body.name.strip(), body.kind.strip(), body.notes
+    antenna.length, antenna.length_unit = body.length, body.length_unit
+
+
+@router.post("/antennas", status_code=201)
+def create_antenna(body: AntennaBody, request: Request, admin: User = Depends(admin_user), db=Depends(get_db)):
+    antenna = Antenna()
+    _apply_antenna(antenna, body)
+    db.add(antenna)
+    db.commit()
+    ctx_of(request).audit("antenna.created", user=admin, ip=ip_of(request), target=antenna.name)
+    return _antenna_view(db, antenna)
+
+
+@router.put("/antennas/{antenna_id}")
+def update_antenna(antenna_id: int, body: AntennaBody, request: Request, admin: User = Depends(admin_user), db=Depends(get_db)):
+    antenna = db.get(Antenna, antenna_id)
+    if antenna is None:
+        raise HTTPException(404, "Antenna not found")
+    _apply_antenna(antenna, body)
+    db.commit()
+    ctx_of(request).audit("antenna.updated", user=admin, ip=ip_of(request), target=antenna.name)
+    return _antenna_view(db, antenna)
+
+
+@router.delete("/antennas/{antenna_id}")
+def delete_antenna(antenna_id: int, request: Request, admin: User = Depends(admin_user), db=Depends(get_db)):
+    antenna = db.get(Antenna, antenna_id)
+    if antenna is None:
+        raise HTTPException(404, "Antenna not found")
+    name = antenna.name
+    for source in db.scalars(select(Source).where(Source.antenna_id == antenna_id)):
+        source.antenna_id = None
+    db.delete(antenna)
+    db.commit()
+    ctx_of(request).audit("antenna.deleted", user=admin, ip=ip_of(request), target=name)
+    return {"detail": "Deleted"}
 
 
 # --- sources ---------------------------------------------------------------
@@ -34,9 +125,7 @@ class SourceBody(BaseModel):
     serial: str = Field(min_length=1, max_length=64)
     name: str = Field(min_length=1, max_length=120)
     description: str = Field(default="", max_length=500)
-    antenna: str = Field(default="", max_length=120)
-    freq_min_hz: int | None = Field(default=None, ge=0)
-    freq_max_hz: int | None = Field(default=None, ge=0)
+    antenna_id: int | None = None
     gain_db: float | None = Field(default=None, ge=0, le=60)
     ppm: int = Field(default=0, ge=-500, le=500)
 
@@ -57,11 +146,12 @@ def _source_view(ctx: Context, db, source: Source, winners: dict, recorders: lis
     profile = next((p for p in profiles if target and p.target_id == target.id), None)
     online = ctx.node_online(node) if node else False
     status = ctx.status.get((source.node_id, source.serial), {}) if online else {}
+    antenna = db.get(Antenna, source.antenna_id) if source.antenna_id else None
     return {
         "id": source.id, "node_id": source.node_id, "node_name": node.name if node else "",
         "node_online": online, "serial": source.serial, "name": source.name,
-        "description": source.description, "antenna": source.antenna,
-        "freq_min_hz": source.freq_min_hz, "freq_max_hz": source.freq_max_hz,
+        "description": source.description, "antenna_id": antenna.id if antenna else None,
+        "antenna_name": antenna.name if antenna else "", "antenna_ranges": antenna.ranges if antenna else [],
         "gain_db": source.gain_db, "ppm": source.ppm,
         "state": status.get("state", "offline" if not online else "idle"),
         "error": status.get("error", ""), "in_call": status.get("in_call", False),
@@ -128,8 +218,8 @@ def _validate_source(ctx: Context, db, body: SourceBody) -> Node:
         raise HTTPException(404, "Node not found")
     if body.serial not in (node.serials or []):
         raise HTTPException(422, "That serial isn't in the node's sdr.serials configuration")
-    if body.freq_min_hz and body.freq_max_hz and body.freq_min_hz > body.freq_max_hz:
-        raise HTTPException(422, "Minimum frequency is above maximum frequency")
+    if body.antenna_id is not None and db.get(Antenna, body.antenna_id) is None:
+        raise HTTPException(422, "That antenna doesn't exist")
     return node
 
 
@@ -323,13 +413,11 @@ def _base_for(db, source_id: int) -> Recorder | None:
     return None
 
 
-def _range_warning(source: Source, target: Target) -> str | None:
-    if target.frequency_hz and (
-        (source.freq_min_hz and target.frequency_hz < source.freq_min_hz)
-        or (source.freq_max_hz and target.frequency_hz > source.freq_max_hz)
-    ):
-        return f"{target.name} is outside the antenna range set for {source.name}"
-    return None
+def _range_warning(db, source: Source, target: Target) -> str | None:
+    antenna = db.get(Antenna, source.antenna_id) if source.antenna_id else None
+    if antenna_covers(antenna, target.frequency_hz):
+        return None
+    return f"{target.name} is outside every range of {antenna.name}, the antenna on {source.name}, so reception may be poor."
 
 
 def _other_sdr_warning(db, source: Source, target: Target) -> str | None:
@@ -348,7 +436,7 @@ def _other_sdr_warning(db, source: Source, target: Target) -> str | None:
 
 
 def _warnings(db, source: Source, target: Target) -> str | None:
-    found = [w for w in (_range_warning(source, target), _other_sdr_warning(db, source, target)) if w]
+    found = [w for w in (_range_warning(db, source, target), _other_sdr_warning(db, source, target)) if w]
     return " ".join(found) or None
 
 

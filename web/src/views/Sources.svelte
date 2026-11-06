@@ -1,6 +1,8 @@
 <script>
   import { onMount } from 'svelte';
-  import { api, DEFAULT_GAIN_DB, formatMHz, formatTime, formatDuration, STATE_LABELS } from '../lib.js';
+  import { antennaCovers, api, DEFAULT_GAIN_DB, formatMHz, formatTime, formatDuration, STATE_LABELS } from '../lib.js';
+  import Notice from '../Notice.svelte';
+  import { NOTICE_MS } from '../notice.svelte.js';
 
   let { user } = $props();
   let sources = $state([]);
@@ -14,12 +16,22 @@
   let recent = $state({});
   let measures = $state({});
 
+  // Info and warnings clear themselves after a while. Errors stay until the next action.
+  const noticeTimers = {};
+  function notify(id, notice) {
+    clearTimeout(noticeTimers[id]);
+    notices[id] = notice;
+    if (notice && notice.kind !== 'err') noticeTimers[id] = setTimeout(() => (notices[id] = null), NOTICE_MS);
+  }
+
   const can = (permission) => user.permissions.includes(permission);
   const isAdmin = user.role === 'admin';
 
   async function refresh() {
     try {
-      [sources, targets, recorders] = await Promise.all([api('sources'), api('targets'), api('recorders')]);
+      [sources, targets, recorders] = await Promise.all([
+        api('sources'), api('targets'), api('recorders'), ...Object.keys(callsOpen).map((id) => loadRecent(id)),
+      ]);
       for (const source of sources) {
         drafts[source.id] ??= { target: '', editing: false };
         // Follow changes made elsewhere, unless this user is mid-selection.
@@ -37,21 +49,32 @@
     }
   }
 
+  let refreshing = false;
+  async function poll() {
+    if (refreshing || document.hidden) return;  // don't stack requests on a slow link
+    refreshing = true;
+    try {
+      await refresh();
+    } finally {
+      refreshing = false;
+    }
+  }
+
   onMount(() => {
     refresh();
-    const timer = setInterval(refresh, 3000);
+    const timer = setInterval(poll, 3000);
     return () => clearInterval(timer);
   });
 
   async function act(source, path, options, success) {
-    notices[source.id] = null;
+    notify(source.id, null);
     try {
       const reply = await api(path, options);
-      notices[source.id] = reply?.warning ? { kind: 'warn', text: reply.warning } : { kind: 'msg', text: success };
+      notify(source.id, reply?.warning ? { kind: 'warn', text: reply.warning } : { kind: 'msg', text: success });
       await refresh();
       return true;
     } catch (failure) {
-      notices[source.id] = { kind: 'err', text: failure.message };
+      notify(source.id, { kind: 'err', text: failure.message });
       return false;
     }
   }
@@ -94,12 +117,12 @@
     if (running && !confirm(`Measure noise on ${source.name}?${running}`)) return;
     m.busy = true;
     m.result = null;
-    notices[source.id] = null;
+    notify(source.id, null);
     try {
       m.result = await api(`sources/${source.id}/measure`, { method: 'POST', body: { target_id: Number(m.target), gain_db: optionalNumber(m.gain) } });
       m.squelch = m.result.suggested;
     } catch (failure) {
-      notices[source.id] = { kind: 'err', text: failure.message };
+      notify(source.id, { kind: 'err', text: failure.message });
     } finally {
       m.busy = false;
     }
@@ -116,16 +139,25 @@
     act(source, `sources/${source.id}/profiles/${targetId}`, { method: 'DELETE' }, 'Profile removed.');
   }
 
+  // An open call list is reloaded with each refresh, so new calls and transcripts appear.
+  const callsOpen = {};
+  async function loadRecent(id) {
+    const reply = await api(`recordings?source_id=${id}&limit=5`);
+    if (callsOpen[id]) recent[id] = reply.items;  // unless it was closed meanwhile
+  }
+
   async function toggleRecent(source) {
-    if (recent[source.id]) {
+    if (callsOpen[source.id]) {
+      delete callsOpen[source.id];
       delete recent[source.id];
       return;
     }
+    callsOpen[source.id] = true;
     try {
-      const reply = await api(`recordings?source_id=${source.id}&limit=5`);
-      recent[source.id] = reply.items;
+      await loadRecent(source.id);
     } catch (failure) {
-      notices[source.id] = { kind: 'err', text: failure.message };
+      delete callsOpen[source.id];
+      notify(source.id, { kind: 'err', text: failure.message });
     }
   }
 
@@ -153,7 +185,7 @@
           <tr>
             <td class="title-cell">
               {source.name}
-              <div class="small dim" style="font-weight:normal">{source.node_name}{source.antenna ? `, ${source.antenna}` : ''}</div>
+              <div class="small dim" style="font-weight:normal">{source.node_name}{source.antenna_name ? `, ${source.antenna_name}` : ''}</div>
             </td>
             <td data-label="Tuned to">
               <div>
@@ -191,7 +223,8 @@
           </tr>
           <tr>
             <td colspan="5">
-              {#if notices[source.id]}<div class={notices[source.id].kind} role="status">{notices[source.id].text}</div>{/if}
+              {#if notices[source.id]?.kind === 'err'}<div class="err" role="alert">{notices[source.id].text}</div>
+              {:else if notices[source.id]}<Notice kind={notices[source.id].kind} ondismiss={() => notify(source.id, null)}>{notices[source.id].text}</Notice>{/if}
               {#if listening === source.id}
                 <!-- svelte-ignore a11y_media_has_caption -->
                 <audio src={`api/live/${source.id}`} controls autoplay></audio>
@@ -216,9 +249,12 @@
                     <select bind:value={draft.target} onchange={() => (draft.editing = true)}>
                       <option value="">None</option>
                       {#each targets as target (target.id)}
-                        <option value={target.id}>{target.name} ({formatMHz(target.frequency_hz)})</option>
+                        <option value={target.id}>{target.name} ({formatMHz(target.frequency_hz)}){antennaCovers(source.antenna_ranges, target.frequency_hz) ? '' : ', outside antenna range'}</option>
                       {/each}
                     </select>
+                    {#if source.antenna_name && draft.target !== '' && !antennaCovers(source.antenna_ranges, targets.find((t) => t.id === Number(draft.target))?.frequency_hz)}
+                      <span class="hint st-warn">{source.antenna_name} doesn't cover this frequency, so reception may be poor.</span>
+                    {/if}
                   </label>
                   <div class="buttons form-buttons"><button class="main" disabled={source.locked && !isAdmin} onclick={() => assign(source)}>Assign</button></div>
                   {#if source.locked && !isAdmin}<p class="small st-warn">This assignment is locked. Only an administrator can change it.</p>{/if}

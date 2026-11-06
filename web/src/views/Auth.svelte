@@ -1,5 +1,7 @@
 <script>
   import { api } from '../lib.js';
+  import Notice from '../Notice.svelte';
+  import { clearAfter } from '../notice.svelte.js';
 
   let { onSignedIn } = $props();
   let mode = $state('login');
@@ -10,6 +12,7 @@
   let needTotp = $state(false);
   let error = $state('');
   let message = $state('');
+  clearAfter(() => message, () => (message = ''));
   let busy = $state(false);
 
   async function submit(event) {
@@ -49,7 +52,7 @@
 <div class="signin">
   <h1>SentrySDR</h1>
   {#if error}<div class="err" role="alert">{error}</div>{/if}
-  {#if message}<div class="msg" role="status">{message}</div>{/if}
+  {#if message}<Notice ondismiss={() => (message = '')}>{message}</Notice>{/if}
   <form onsubmit={submit}>
     <fieldset>
       <legend>{mode === 'login' ? 'Sign in' : 'Request an account'}</legend>

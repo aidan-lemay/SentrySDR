@@ -18,7 +18,7 @@ from sqlalchemy import select
 from sentrysdr import pipelines, schedule, sdr, uploaders
 from sentrysdr.context import BROADCASTIFY_RETRY_SECONDS, UPLOAD_MAX_ATTEMPTS
 from sentrysdr.engine import MeasureError, VolumeControl, merge_ais_message
-from sentrysdr.models import BroadcastifySystem, Node, Recorder, Recording, SdrProfile, Source, Target, UploadJob, make_session_factory
+from sentrysdr.models import Antenna, BroadcastifySystem, Node, Recorder, Recording, SdrProfile, Source, Target, UploadJob, make_session_factory
 
 from .conftest import ADMIN_EMAIL, PASSWORD, add_user, client_for
 
@@ -239,10 +239,82 @@ def test_old_lock_passwords_become_plain_locks_and_are_deleted(tmp_path):
     assert "lock_hash" not in columns and "locked" in columns
 
 
-def test_out_of_range_target_warns(admin):
-    source = make_source(admin, freq_min_hz=380_000_000, freq_max_hz=460_000_000)
+def make_antenna(admin, name="Dual band", ranges=((144_000_000, 148_000_000), (420_000_000, 450_000_000)), **extra):
+    body = {"name": name, "ranges": [{"low_hz": lo, "high_hz": hi} for lo, hi in ranges], **extra}
+    response = admin.post("/api/antennas", json=body)
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
+def test_antenna_with_several_ranges_warns_outside_all_of_them(admin):
+    antenna = make_antenna(admin, kind="Ground plane", length=19.25, length_unit="in")
+    assert antenna["ranges"] == [[144_000_000, 148_000_000], [420_000_000, 450_000_000]]
+    source = make_source(admin, antenna_id=antenna["id"])
+    uhf, vhf = make_target(admin, "UHF", 444_850_000), make_target(admin, "VHF", 146_520_000)
+    air = make_target(admin, "Air", 120_000_000, modulation="am")
+    for inside in (uhf, vhf):
+        assert admin.post(f"/api/sources/{source}/assign", json={"target_id": inside}).json()["warning"] is None
+    reply = admin.post(f"/api/sources/{source}/assign", json={"target_id": air})
+    assert reply.status_code == 200 and "outside every range of Dual band" in reply.json()["warning"]
+    listed = next(s for s in admin.get("/api/sources").json() if s["id"] == source)
+    assert listed["antenna_name"] == "Dual band" and listed["antenna_ranges"] == antenna["ranges"]
+
+
+def test_antenna_without_ranges_never_warns(admin):
+    source = make_source(admin, antenna_id=make_antenna(admin, ranges=())["id"])
     target = make_target(admin, "Air", 120_000_000, modulation="am")
-    assert "outside the antenna range" in admin.post(f"/api/sources/{source}/assign", json={"target_id": target}).json()["warning"]
+    assert admin.post(f"/api/sources/{source}/assign", json={"target_id": target}).json()["warning"] is None
+
+
+def test_one_antenna_feeds_several_sdrs_and_removal_unbinds(admin):
+    antenna = make_antenna(admin)
+    first = make_source(admin, antenna_id=antenna["id"])
+    second = make_source(admin, "SER2", "Source 2", antenna_id=antenna["id"])
+    listed = next(a for a in admin.get("/api/antennas").json() if a["id"] == antenna["id"])
+    assert listed["sources"] == ["Source 1", "Source 2"]
+    assert admin.delete(f"/api/antennas/{antenna['id']}").status_code == 200
+    assert {s["id"]: s["antenna_id"] for s in admin.get("/api/sources").json()} == {first: None, second: None}
+
+
+def test_antenna_validation_and_admin_only(admin, operator):
+    bad = admin.post("/api/antennas", json={"name": "X", "ranges": [{"low_hz": 450_000_000, "high_hz": 420_000_000}]})
+    assert bad.status_code == 422
+    assert admin.post("/api/antennas", json={"name": "X", "length": 3, "length_unit": "furlong"}).status_code == 422
+    too_many = [{"low_hz": i, "high_hz": i + 1} for i in range(21)]
+    assert admin.post("/api/antennas", json={"name": "X", "ranges": too_many}).status_code == 422
+    assert admin.post("/api/sources", json={"serial": "SER1", "name": "S", "antenna_id": 999}).status_code == 422
+    assert operator.post("/api/antennas", json={"name": "Mine"}).status_code == 403
+    antenna = make_antenna(admin)
+    assert operator.put(f"/api/antennas/{antenna['id']}", json={"name": "Mine"}).status_code == 403
+    assert operator.delete(f"/api/antennas/{antenna['id']}").status_code == 403
+    assert operator.get("/api/antennas").status_code == 200
+
+
+def test_old_source_antenna_fields_become_antennas(tmp_path):
+    db = tmp_path / "old.db"
+    make_session_factory(db)
+    connection = sqlite3.connect(db)
+    connection.execute("INSERT INTO nodes (id, name, is_local, status, serials, created_at) VALUES (1, 'n', 1, 'active', '[]', 0)")
+    rows = [(1, "A", "Discone", 25_000_000, 1_300_000_000), (2, "B", "Discone", 25_000_000, 1_300_000_000),
+            (3, "C", "", 380_000_000, None), (4, "D", "", None, None)]
+    for sid, name, kind, low, high in rows:
+        connection.execute(
+            "INSERT INTO sources (id, node_id, serial, name, description, antenna, freq_min_hz, freq_max_hz, ppm) "
+            "VALUES (?, 1, ?, ?, '', ?, ?, ?, 0)", (sid, f"S{sid}", name, kind, low, high))
+    connection.commit()
+    connection.close()
+    with make_session_factory(db)() as session:
+        sources = {s.name: s for s in session.scalars(select(Source))}
+        antennas = {a.id: a for a in session.scalars(select(Antenna))}
+    assert sources["A"].antenna_id == sources["B"].antenna_id  # same description, so one antenna
+    assert antennas[sources["A"].antenna_id].ranges == [[25_000_000, 1_300_000_000]]
+    assert antennas[sources["C"].antenna_id].name == "C antenna"
+    assert antennas[sources["C"].antenna_id].ranges == [[380_000_000, pipelines.FREQ_MAX_HZ]]
+    assert sources["D"].antenna_id is None and len(antennas) == 2
+    assert all(s.antenna == "" and s.freq_min_hz is None for s in sources.values())
+    make_session_factory(db)  # runs again on every start, and must not make more
+    with make_session_factory(db)() as session:
+        assert len(session.scalars(select(Antenna)).all()) == 2
 
 
 def test_scheduled_recorder_end_to_end(ctx, admin, operator):
