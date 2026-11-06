@@ -90,6 +90,8 @@ main { padding: .6rem; max-width: 1100px; margin: 0 auto; }
 .msg, .err, .warn { border: 1px solid var(--rule); background: var(--box); padding: .5rem .6rem; margin-bottom: .75rem; }
 .err { border: 2px solid var(--red); color: var(--red); }
 .warn { border: 2px solid var(--amber); }
+.notice { display: flex; justify-content: space-between; align-items: flex-start; gap: .6rem; width: 100%; min-height: 0; text-align: left; border-radius: 0; }
+.notice-x { color: var(--dim); font-size: 1.1rem; line-height: 1; }
 .secret { font-family: Consolas, Menlo, monospace; overflow-wrap: anywhere; user-select: all; background: var(--page); border: 1px solid var(--rule); padding: .4rem; margin-top: .3rem; }
 
 /* --- status words --- */

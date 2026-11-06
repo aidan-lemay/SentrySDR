@@ -1,6 +1,7 @@
 <script>
   import { onMount, tick } from 'svelte';
   import { ANTENNA_UNITS, DEFAULT_GAIN_DB, api, formatRanges, formatTime } from '../lib.js';
+  import Notice from '../Notice.svelte';
   import { clearAfter, NOTICE_MS } from '../notice.svelte.js';
 
   const TABS = [['users', 'Users'], ['sources', 'SDR sources'], ['antennas', 'Antennas'], ['nodes', 'Nodes'], ['bans', 'Bans'], ['audit', 'Audit log'], ['settings', 'Settings']];
@@ -339,7 +340,7 @@
 </div>
 
 {#if error}<div class="err" role="alert">{error}</div>{/if}
-{#if message}<div class="msg" role="status">{message}</div>{/if}
+{#if message}<Notice ondismiss={() => (message = '')}>{message}</Notice>{/if}
 
 {#if tab === 'users'}
   {#if pending}<div class="warn">{pending} account request{pending === 1 ? '' : 's'} waiting for a decision.</div>{/if}
@@ -755,7 +756,7 @@
             <button type="button" onclick={() => (systemForm = { ...blankSystem(), id: system.id, name: system.name, system_id: system.system_id })}>Edit</button>
             <button type="button" onclick={() => removeSystem(system)}>Remove</button>
           </div>
-          {#if systemReplies[system.id]}<div role="status">{systemReplies[system.id]}</div>{/if}
+          {#if systemReplies[system.id]}<Notice ondismiss={() => delete systemReplies[system.id]}>{systemReplies[system.id]}</Notice>{/if}
         </div>
       {/each}
       <label class="field"><span>Name</span><input bind:value={systemForm.name} maxlength="120" required /></label>

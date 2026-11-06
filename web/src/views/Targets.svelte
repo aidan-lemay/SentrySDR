@@ -1,6 +1,7 @@
 <script>
   import { onMount } from 'svelte';
   import { api, formatMHz, MODULATIONS } from '../lib.js';
+  import Notice from '../Notice.svelte';
   import { clearAfter } from '../notice.svelte.js';
 
   const blank = () => ({
@@ -80,7 +81,7 @@
 
 <h1>Targets</h1>
 {#if error}<div class="err" role="alert">{error}</div>{/if}
-{#if message}<div class="msg" role="status">{message}</div>{/if}
+{#if message}<Notice ondismiss={() => (message = '')}>{message}</Notice>{/if}
 
 <div class="box">
   <table class="table">

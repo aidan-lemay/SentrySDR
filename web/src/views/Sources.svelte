@@ -1,6 +1,7 @@
 <script>
   import { onMount } from 'svelte';
   import { antennaCovers, api, DEFAULT_GAIN_DB, formatMHz, formatTime, formatDuration, STATE_LABELS } from '../lib.js';
+  import Notice from '../Notice.svelte';
   import { NOTICE_MS } from '../notice.svelte.js';
 
   let { user } = $props();
@@ -222,7 +223,8 @@
           </tr>
           <tr>
             <td colspan="5">
-              {#if notices[source.id]}<div class={notices[source.id].kind} role="status">{notices[source.id].text}</div>{/if}
+              {#if notices[source.id]?.kind === 'err'}<div class="err" role="alert">{notices[source.id].text}</div>
+              {:else if notices[source.id]}<Notice kind={notices[source.id].kind} ondismiss={() => notify(source.id, null)}>{notices[source.id].text}</Notice>{/if}
               {#if listening === source.id}
                 <!-- svelte-ignore a11y_media_has_caption -->
                 <audio src={`api/live/${source.id}`} controls autoplay></audio>

@@ -1,6 +1,7 @@
 <script>
   import { onMount } from 'svelte';
   import { antennaCovers, api, DAYS, formatMHz, formatSchedule } from '../lib.js';
+  import Notice from '../Notice.svelte';
   import { clearAfter } from '../notice.svelte.js';
 
   let { user } = $props();
@@ -83,7 +84,7 @@
 <p class="small">A schedule takes over its source for the times shown, then the source goes back to its assigned target.{#if tz} Times are in {tz}.{/if}</p>
 
 {#if error}<div class="err" role="alert">{error}</div>{/if}
-{#if message}<div class="msg" role="status">{message}</div>{/if}
+{#if message}<Notice ondismiss={() => (message = '')}>{message}</Notice>{/if}
 
 <div class="box">
   <h2>Scheduled recorders</h2>
