@@ -62,5 +62,5 @@ min_call_seconds = 0.5
 max_call_seconds = 1800
 
 [binaries]
-# Folders searched before PATH for rtl_fm, readsb, AIS-catcher, dsd-fme, ffmpeg.
+# Folders searched before PATH for rtl_fm, rtl_test, readsb, AIS-catcher, dsd-fme, acarsdec, ffmpeg.
 search_dirs = ["/opt/sentrysdr/.vendor/bin"]
