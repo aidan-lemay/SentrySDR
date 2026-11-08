@@ -214,11 +214,18 @@ def _winners(ctx: Context, db) -> tuple[dict, list[Recorder]]:
 
 
 @router.get("/sources")
-def list_sources(request: Request, _user: User = Depends(current_user), db=Depends(get_db)):
+def list_sources(request: Request, user: User = Depends(current_user), db=Depends(get_db)):
     ctx = ctx_of(request)
     winners, recorders = _winners(ctx, db)
     sources = db.scalars(select(Source).order_by(Source.name))
-    return [_source_view(ctx, db, s, winners, recorders) for s in sources]
+    views = []
+    for source in sources:
+        view = _source_view(ctx, db, source, winners, recorders)
+        # Admins only: with the ID, someone else could feed aggregators as this receiver.
+        if user.role == "admin":
+            view["feeder_uuid"] = source.feeder_uuid
+        views.append(view)
+    return views
 
 
 @router.get("/sources/available")

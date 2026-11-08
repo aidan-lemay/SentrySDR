@@ -1985,3 +1985,11 @@ def test_ui_lists_the_same_feed_services():
     lib = (Path(__file__).resolve().parent.parent / "web" / "src" / "lib.js").read_text()
     for key in [*feeds.ADSB_AGGREGATORS, *feeds.AIS_SERVICES]:
         assert f"['{key}'," in lib
+
+
+def test_feeder_id_shown_to_admins_only(ctx, admin, operator):
+    source = make_source(admin)
+    with ctx.db() as session:
+        expected = session.get(Source, source).feeder_uuid
+    assert next(s for s in admin.get("/api/sources").json() if s["id"] == source)["feeder_uuid"] == expected
+    assert "feeder_uuid" not in next(s for s in operator.get("/api/sources").json() if s["id"] == source)

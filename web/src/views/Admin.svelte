@@ -170,7 +170,7 @@
   function editSource(source) {
     sourceForm = {
       id: source.id, key: `${source.node_id}|${source.serial}`, name: source.name, description: source.description,
-      antenna_id: source.antenna_id ?? '', gain: source.gain_db ?? '', ppm: source.ppm,
+      antenna_id: source.antenna_id ?? '', gain: source.gain_db ?? '', ppm: source.ppm, feederId: source.feeder_uuid ?? '',
       tuner: source.tuner, steps: source.gain_steps.join(' '),
       capMin: source.cap_min_hz == null ? '' : plain(source.cap_min_hz), capMax: source.cap_max_hz == null ? '' : plain(source.cap_max_hz),
       uses: [...source.uses],
@@ -520,7 +520,7 @@
           <tr>
             <td class="title-cell">{source.name}{#if source.description}<div class="small dim" style="font-weight:normal">{source.description}</div>{/if}</td>
             <td data-label="Node"><span>{source.node_name}</span></td>
-            <td data-label="Serial"><span class="mono small">{source.serial}</span></td>
+            <td data-label="Serial"><span class="mono small">{source.serial}{#if source.feeder_uuid}<br /><span class="dim">Feeder ID</span><br /><span class="copyable">{source.feeder_uuid}</span>{/if}</span></td>
             <td data-label="Stick">
               <span class="small">
                 {source.tuner || 'Tuner not set'}{#if source.cap_min_hz != null || source.cap_max_hz != null}, <span class="mono">{formatRange(source.cap_min_hz, source.cap_max_hz)}</span>{/if}
@@ -559,6 +559,12 @@
         </select>
       </label>
       <label class="field"><span>Name</span><input bind:value={sourceForm.name} required maxlength="120" /></label>
+      {#if sourceForm.feederId}
+        <div class="field"><span>Feeder ID</span>
+          <span class="mono small copyable">{sourceForm.feederId}</span>
+          <span class="hint">Sent with ADS-B shared to aggregators, so they can tell this SDR's feed apart. Some feeder stats pages ask for it. Keep it private: anyone with it could feed data as this receiver.</span>
+        </div>
+      {/if}
       <label class="field"><span>Description</span><input bind:value={sourceForm.description} maxlength="500" /></label>
       <label class="field"><span>Antenna</span>
         <select bind:value={sourceForm.antenna_id}>
