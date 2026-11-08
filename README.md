@@ -152,6 +152,14 @@ If a target is outside every range of an SDR's antenna, the target pickers mark 
 
 An older database's antenna type and frequency range on each source are turned into antennas on first start. Sources with the same type and range share one.
 
+## Stick capabilities
+
+Under **Admin > SDR sources**, each SDR can record what it can do: its tuner, frequency range, gain steps and uses. **Detect from the stick** reads the tuner and gain steps from the stick itself, on the master or a slave, and fills in that tuner's usual range. It pauses the stick for a few seconds and saves nothing until you select **Save**. Every field can be edited by hand.
+
+- A target outside the stick's range, or of a kind the stick isn't ticked for, is marked in the target pickers and warns when assigned or scheduled. It still runs. Analog voice, digital voice, ADS-B and AIS are checked; the other uses, such as GOES, are labels only.
+- A gain between two of the stick's steps is rounded to the nearest by the stick. Gain boxes say which step it will use.
+- Anything left blank isn't checked. The description shows on the Sources page under the SDR's name.
+
 ## Tuning call detection
 
 A call is whatever passes the target's **squelch level**. If the level is below the noise, the squelch never closes, and you get back-to-back `max_call_seconds` recordings of static. After 10 minutes open, the Sources page shows a warning. A squelch of `0` records continuously, split into `max_call_seconds` pieces.

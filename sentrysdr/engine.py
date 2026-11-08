@@ -20,7 +20,7 @@ from array import array
 from pathlib import Path
 from typing import Awaitable, Callable
 
-from . import pipelines, sdr
+from . import capabilities, pipelines, sdr
 from .config import Config
 
 log = logging.getLogger("sentrysdr.engine")
@@ -33,6 +33,7 @@ SQUELCH_STUCK_SECONDS = 600
 SQUELCH_STUCK_WARNING = "Squelch has been open for over 10 minutes. If nothing is transmitting, measure this SDR and raise its squelch."
 MEASURE_SECONDS = 6.0
 MEASURE_ATTEMPTS = 3
+DETECT_SECONDS = 8.0
 # Signs that a stick didn't open cleanly: USB timeouts (-7), librtlsdr resetting it,
 # or a setup step failing. Seen on real hardware after a tool was killed without
 # closing the stick. It may then send nothing, which looks the same as a closed squelch.
@@ -271,27 +272,69 @@ class Worker:
                 await self.task
             self.task = None
 
-    async def measure(self, frequency_hz: int, modulation: str, gain_db: float | None, ppm: int) -> dict:
-        """Pause this SDR's assignment, read the noise level, then resume."""
+    @contextlib.asynccontextmanager
+    async def _paused(self, state: str):
+        """Stop this SDR's assignment, hand over its device index, then resume."""
         if self.measuring:
-            raise MeasureError("This SDR is already being measured.")
+            raise MeasureError("This SDR is busy with another measurement. Try again in a moment.")
         self.measuring = True
         try:
             await self.stop()  # saves a call in progress
             self.in_call, self.call_started = False, None
-            self._publish("measuring", "")
+            self._publish(state, "")
             devices = await asyncio.to_thread(self.sup.enumerate)
             index = sdr.index_for_serial(self.serial, devices)
             if index is None:
                 raise MeasureError("This SDR isn't connected, or its serial is duplicated.")
-            args = pipelines.measure_args(self.cfg, index, frequency_hz, modulation, gain_db, ppm)
-            return await self._read_levels(args, pipelines.measure_rate(modulation))
+            yield index
         finally:
             self.measuring = False
             if self.spec is not None:
                 self.task = asyncio.create_task(self._run(self.spec), name=f"sdr-{self.serial}")
             else:
                 self._publish("idle", "")
+
+    async def measure(self, frequency_hz: int, modulation: str, gain_db: float | None, ppm: int) -> dict:
+        """Pause this SDR's assignment, read the noise level, then resume."""
+        async with self._paused("measuring") as index:
+            args = pipelines.measure_args(self.cfg, index, frequency_hz, modulation, gain_db, ppm)
+            return await self._read_levels(args, pipelines.measure_rate(modulation))
+
+    async def detect(self) -> dict:
+        """Pause this SDR's assignment, read its tuner and gain steps, then resume."""
+        async with self._paused("detecting") as index:
+            args = [self.cfg.binary("rtl_test") or "rtl_test", "-d", str(index), "-t"]
+            for attempt in range(MEASURE_ATTEMPTS):
+                if attempt:
+                    await asyncio.sleep(1.0)  # the stick can take a moment to be released
+                text = await self._read_text(args, DETECT_SECONDS)
+                found = capabilities.parse_rtl_test(text)
+                if found["tuner"]:
+                    return found
+            last = [line for line in text.splitlines() if line.strip()]
+            raise MeasureError(f"Couldn't read the tuner. {last[-1] if last else ''}".strip()[:300])
+
+    async def _read_text(self, args: list[str], seconds: float) -> str:
+        """Run a tool briefly and return what it printed. Stops early once the gain steps are out."""
+        proc = await asyncio.create_subprocess_exec(
+            *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, env=self.cfg.tool_env(),
+        )
+        out = b""
+        deadline = time.monotonic() + seconds
+        try:
+            while (remaining := deadline - time.monotonic()) > 0 and len(out) < 65536:
+                try:
+                    chunk = await asyncio.wait_for(proc.stdout.read(4096), remaining)
+                except asyncio.TimeoutError:
+                    break
+                if not chunk:
+                    break
+                out += chunk
+                if b"Supported gain values" in out and out.endswith(b"\n"):
+                    break  # an E4000 would go on to a long benchmark
+        finally:
+            await stop_process(proc)  # SIGTERM lets rtl_test close the stick cleanly
+        return out.decode(errors="replace")
 
     async def _read_levels(self, args: list[str], rate: int) -> dict:
         tail: list[str] = []
@@ -578,6 +621,8 @@ class Supervisor:
         worker = self.workers.get(serial)
         if worker is None:
             raise MeasureError("That SDR isn't in sdr.serials on this node.")
+        if request.get("op") == "detect":
+            return await worker.detect()
         return await worker.measure(**request)
 
     async def shutdown(self) -> None:

@@ -9,13 +9,14 @@ import time
 import uuid
 from array import array
 from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
 import pytest
 from sqlalchemy import select
 
-from sentrysdr import pipelines, schedule, sdr, uploaders
+from sentrysdr import capabilities, pipelines, schedule, sdr, uploaders
 from sentrysdr.context import BROADCASTIFY_RETRY_SECONDS, UPLOAD_MAX_ATTEMPTS
 from sentrysdr.engine import MeasureError, VolumeControl, merge_ais_message
 from sentrysdr.models import Antenna, BroadcastifySystem, Node, Recorder, Recording, SdrProfile, Source, Target, UploadJob, make_session_factory
@@ -937,10 +938,10 @@ def test_measure_requests_from_the_network_are_validated(bad):
         pipelines.sanitize_measure({**good, **bad})
 
 
-def pending_future(ctx, node_id=7):
+def pending_future(ctx, node_id=7, op="measure"):
     loop = asyncio.new_event_loop()
     future = loop.create_future()
-    ctx.pending_measures["abc"] = (node_id, future)
+    ctx.pending_measures["abc"] = (node_id, future, op)
     return loop, future
 
 
@@ -963,6 +964,106 @@ def test_bad_measurement_replies_become_errors(ctx, message):
     ctx.finish_measure(7, {"id": "abc", **message})
     assert isinstance(future.exception(), MeasureError)
     loop.close()
+
+
+def test_detect_reply_from_a_node_is_cleaned(ctx):
+    loop, future = pending_future(ctx, op="detect")
+    ctx.finish_measure(7, {"id": "abc", "ok": True, "result": {
+        "tuner": "R820T" * 20, "gain_steps": [0.0, 49.6, 900, 49.6], "freq_min_hz": 24_000_000, "freq_max_hz": -5}})
+    assert future.result() == {"tuner": ("R820T" * 20)[:40], "gain_steps": [0.0, 49.6], "freq_min_hz": 24_000_000, "freq_max_hz": None}
+    loop.close()
+
+
+@pytest.mark.parametrize("result", [5, {"gain_steps": ["x"]}, {"gain_steps": 7}])
+def test_bad_detect_replies_become_errors(ctx, result):
+    loop, future = pending_future(ctx, op="detect")
+    ctx.finish_measure(7, {"id": "abc", "ok": True, "result": result})
+    assert isinstance(future.exception(), MeasureError)
+    loop.close()
+
+
+# --- stick capabilities -------------------------------------------------------
+R820T_OUTPUT = """Found 3 device(s):
+  0:  Realtek, RTL2838UHIDIR, SN: 12345678
+Using device 2: Generic RTL2832U OEM
+Found Rafael Micro R820T tuner
+Supported gain values (29): 0.0 0.9 1.4 2.7 3.7 7.7 8.7 12.5 14.4 15.7 16.6 19.7 20.7 22.9 25.4 28.0 29.7 32.8 33.8 36.4 37.2 38.6 40.2 42.1 43.4 43.9 44.5 48.0 49.6 
+No E4000 tuner found, aborting.
+"""
+
+
+def test_rtl_test_output_parsed_from_real_sticks():
+    found = capabilities.parse_rtl_test(R820T_OUTPUT)
+    assert found["tuner"] == "R820T" and len(found["gain_steps"]) == 29 and found["gain_steps"][-1] == 49.6
+    assert (found["freq_min_hz"], found["freq_max_hz"]) == (24_000_000, 1_766_000_000)
+    fc = capabilities.parse_rtl_test("Found Fitipower FC0012 tuner\nSupported gain values (5): -9.9 -4.0 7.1 17.9 19.2 \n")
+    assert fc["tuner"] == "FC0012" and fc["gain_steps"] == [-9.9, -4.0, 7.1, 17.9, 19.2] and fc["freq_max_hz"] == 948_600_000
+    assert capabilities.parse_rtl_test("usb_open error -3")["tuner"] == ""
+    assert capabilities.parse_rtl_test("Found Mystery X9 tuner")["freq_min_hz"] is None
+
+
+def test_nearest_gain_step():
+    steps = [0.0, 19.7, 40.2, 49.6]
+    assert capabilities.nearest_step(steps, 40.2) is None and capabilities.nearest_step(steps, 40) == 40.2
+    assert capabilities.nearest_step([], 40) is None and capabilities.nearest_step(steps, None) is None
+
+
+def stick(admin, **extra):
+    return make_source(admin, tuner="FC0012", gain_steps=[-9.9, -4.0, 7.1, 17.9, 19.2],
+                       cap_min_hz=22_000_000, cap_max_hz=948_600_000, uses=["voice", "adsb"], gain_db=19.2, **extra)
+
+
+def test_incompatible_targets_warn_but_still_assign(admin):
+    source = stick(admin)
+    ok = make_target(admin, "Fine", 444_850_000)
+    high = make_target(admin, "GPS", 1_575_420_000)
+    dmr = make_target(admin, "DMR", 441_000_000, modulation="dmr")
+    ais = make_target(admin, "Ships", 162_000_000, kind="ais", modulation="ais")
+    assert admin.post(f"/api/sources/{source}/assign", json={"target_id": ok}).json()["warning"] is None
+    for target, text in ((high, "outside the stick's frequency range"), (dmr, "needs Digital voice"), (ais, "needs AIS")):
+        reply = admin.post(f"/api/sources/{source}/assign", json={"target_id": target})
+        assert reply.status_code == 200 and text in reply.json()["warning"], reply.text
+    listed = next(s for s in admin.get("/api/sources").json() if s["id"] == source)
+    assert listed["base_target_id"] == ais and listed["tuner"] == "FC0012" and listed["uses"] == ["adsb", "voice"]
+
+
+def test_gain_off_the_steps_warns_with_the_nearest(admin):
+    source = make_source(admin, gain_steps=[7.1, 17.9, 19.2], gain_db=40.2)
+    target = make_target(admin)
+    assert "so it will get 19.2 dB" in admin.post(f"/api/sources/{source}/assign", json={"target_id": target}).json()["warning"]
+    reply = admin.put(f"/api/sources/{source}", json={"serial": "SER1", "name": "S", "gain_steps": [7.1, 17.9, 19.2], "gain_db": 18})
+    assert "will use 17.9 dB" in reply.json()["warning"]
+    profile = admin.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": 80, "gain_db": 7.1})
+    assert profile.json()["warning"] is None
+    assert admin.post(f"/api/sources/{source}/assign", json={"target_id": target}).json()["warning"] is None  # the profile's 7.1 is a step
+
+
+def test_unset_capabilities_are_not_judged(admin):
+    source = make_source(admin)
+    target = make_target(admin, "Ships", 162_000_000, kind="ais", modulation="ais")
+    assert admin.post(f"/api/sources/{source}/assign", json={"target_id": target}).json()["warning"] is None
+
+
+def test_broadcast_fm_counts_for_wfm(admin):
+    source = make_source(admin, uses=["broadcast_fm"])
+    target = make_target(admin, "Radio", 98_900_000, modulation="wfm")
+    assert admin.post(f"/api/sources/{source}/assign", json={"target_id": target}).json()["warning"] is None
+
+
+@pytest.mark.parametrize("bad", [{"uses": ["teleport"]}, {"gain_steps": [99]}, {"cap_min_hz": 500, "cap_max_hz": 100}, {"tuner": "x" * 41}])
+def test_capability_validation(admin, bad):
+    assert admin.post("/api/sources", json={"serial": "SER1", "name": "S", **bad}).status_code == 422
+
+
+def test_detect_is_admin_only_and_checks_the_serial(admin, operator):
+    assert operator.post("/api/sources/detect", json={"serial": "SER1"}).status_code == 403
+    assert admin.post("/api/sources/detect", json={"serial": "NOPE"}).status_code == 404
+
+
+def test_ui_lists_the_same_uses():
+    lib = (Path(__file__).resolve().parent.parent / "web" / "src" / "lib.js").read_text()
+    for key in capabilities.USES:
+        assert f"['{key}'," in lib
 
 
 # --- Broadcastify Calls -------------------------------------------------------

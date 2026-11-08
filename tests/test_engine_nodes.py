@@ -664,7 +664,7 @@ async def test_measuring_twice_at_once_is_refused(tmp_path, monkeypatch):
     try:
         running = asyncio.create_task(sup.measure("SER1", **MEASURE))
         assert await wait_for(lambda: sup.workers["SER1"].measuring)
-        with pytest.raises(engine.MeasureError, match="already"):
+        with pytest.raises(engine.MeasureError, match="busy"):
             await sup.measure("SER1", **MEASURE)
         await running
     finally:
@@ -930,3 +930,52 @@ async def test_reset_note_reaches_the_sources_page(ctx, admin):
     admin.post("/api/sources", json={"serial": "SER1", "name": "S"}).raise_for_status()
     ctx.status[(ctx.local_node_id, "SER1")] = {"state": "listening", "error": "", "note": "Reset itself on start"}
     assert admin.get("/api/sources").json()[0]["note"] == "Reset itself on start"
+
+
+# --- detecting a stick's tuner --------------------------------------------------
+FAKE_RTL_TEST = """#!/usr/bin/env python3
+import sys
+sys.stderr.write("Found 1 device(s):\\nUsing device 0: Generic RTL2832U OEM\\nFound Rafael Micro R828D tuner\\n")
+sys.stderr.write("Supported gain values (3): 0.0 19.7 49.6 \\nNo E4000 tuner found, aborting.\\n")
+"""
+
+
+async def test_detect_pauses_reads_and_resumes(tmp_path):
+    bins = tmp_path / "bin"
+    install_tool(bins, "rtl_test", FAKE_RTL_TEST)
+    install_tool(bins, "rtl_fm", "#!/bin/sh\nsleep 60\n")
+    sup = supervisor(make_config(tmp_path, bin_dirs=[bins]), [])
+    worker = sup.workers["SER1"]
+    try:
+        await sup.apply({"SER1": spec()})
+        assert await wait_for(lambda: worker.state == "listening")
+        found = await sup.measure("SER1", op="detect")
+        assert found == {"tuner": "R828D", "gain_steps": [0.0, 19.7, 49.6], "freq_min_hz": 24_000_000, "freq_max_hz": 1_766_000_000}
+        assert await wait_for(lambda: worker.state == "listening")
+    finally:
+        await sup.shutdown()
+
+
+async def test_detect_with_no_tuner_found_is_an_error(tmp_path):
+    bins = tmp_path / "bin"
+    install_tool(bins, "rtl_test", "#!/bin/sh\necho 'usb_claim_interface error -6'\n")
+    sup = supervisor(make_config(tmp_path, bin_dirs=[bins]), [])
+    try:
+        with pytest.raises(engine.MeasureError, match="usb_claim_interface"):
+            await sup.measure("SER1", op="detect")
+    finally:
+        await sup.shutdown()
+
+
+async def test_slave_answers_a_detect_request(tmp_path):
+    bins = tmp_path / "bin"
+    install_tool(bins, "rtl_test", FAKE_RTL_TEST)
+    cfg = make_config(tmp_path, role="slave", master_url="https://sentry.example.com", bin_dirs=[bins], serials=["FIELD1"])
+    slave = Slave(cfg, enumerate_fn=lambda: ["FIELD1"])
+    slave.outgoing = asyncio.Queue()
+    try:
+        await slave.handle_message({"t": "measure", "id": "d1", "serial": "FIELD1", "op": "detect"})
+        reply = json.loads(await asyncio.wait_for(slave.outgoing.get(), 15))
+        assert reply["ok"] and reply["result"]["tuner"] == "R828D"
+    finally:
+        await slave.supervisor.shutdown()

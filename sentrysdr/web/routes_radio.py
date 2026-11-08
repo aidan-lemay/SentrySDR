@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 
-from .. import pipelines, schedule
+from .. import capabilities, pipelines, schedule
 from ..config import SERIAL_RE
 from ..context import Context
 from ..engine import MeasureError
@@ -128,6 +128,26 @@ class SourceBody(BaseModel):
     antenna_id: int | None = None
     gain_db: float | None = Field(default=None, ge=0, le=60)
     ppm: int = Field(default=0, ge=-500, le=500)
+    tuner: str | None = Field(default=None, max_length=40)
+    gain_steps: list[float] = Field(default_factory=list, max_length=capabilities.MAX_GAIN_STEPS)
+    cap_min_hz: int | None = Field(default=None, ge=0, le=10_000_000_000)
+    cap_max_hz: int | None = Field(default=None, ge=0, le=10_000_000_000)
+    uses: list[str] = Field(default_factory=list, max_length=len(capabilities.USES))
+
+    @field_validator("gain_steps")
+    @classmethod
+    def _steps(cls, value: list[float]) -> list[float]:
+        if any(not -20 <= step <= 70 for step in value):
+            raise ValueError("gain steps must be between -20 and 70 dB")
+        return sorted({round(step, 1) for step in value})
+
+    @field_validator("uses")
+    @classmethod
+    def _uses(cls, value: list[str]) -> list[str]:
+        unknown = set(value) - set(capabilities.USES)
+        if unknown:
+            raise ValueError(f"unknown uses: {', '.join(sorted(unknown))}")
+        return sorted(set(value))
 
     @field_validator("serial")
     @classmethod
@@ -153,6 +173,8 @@ def _source_view(ctx: Context, db, source: Source, winners: dict, recorders: lis
         "description": source.description, "antenna_id": antenna.id if antenna else None,
         "antenna_name": antenna.name if antenna else "", "antenna_ranges": antenna.ranges if antenna else [],
         "gain_db": source.gain_db, "ppm": source.ppm,
+        "tuner": source.tuner or "", "gain_steps": source.gain_steps or [],
+        "cap_min_hz": source.cap_min_hz, "cap_max_hz": source.cap_max_hz, "uses": source.uses or [],
         "state": status.get("state", "offline" if not online else "idle"),
         "error": status.get("error", ""), "in_call": status.get("in_call", False),
         "note": status.get("note", ""),
@@ -221,7 +243,16 @@ def _validate_source(ctx: Context, db, body: SourceBody) -> Node:
         raise HTTPException(422, "That serial isn't in the node's sdr.serials configuration")
     if body.antenna_id is not None and db.get(Antenna, body.antenna_id) is None:
         raise HTTPException(422, "That antenna doesn't exist")
+    if body.cap_min_hz is not None and body.cap_max_hz is not None and body.cap_min_hz > body.cap_max_hz:
+        raise HTTPException(422, "The stick's frequency range starts above where it ends")
     return node
+
+
+def _gain_warning(source: Source) -> str | None:
+    nearest = capabilities.nearest_step(source.gain_steps, source.gain_db)
+    if nearest is None:
+        return None
+    return f"{source.gain_db:g} dB isn't one of this stick's gain steps, so it will use {nearest:g} dB."
 
 
 @router.post("/sources", status_code=201)
@@ -237,7 +268,7 @@ def create_source(body: SourceBody, request: Request, admin: User = Depends(admi
     db.commit()
     ctx.audit("source.created", user=admin, ip=ip_of(request), target=source.name)
     ctx.kick()
-    return {"id": source.id}
+    return {"id": source.id, "warning": _gain_warning(source)}
 
 
 @router.put("/sources/{source_id}")
@@ -254,7 +285,7 @@ def update_source(source_id: int, body: SourceBody, request: Request, admin: Use
     db.commit()
     ctx.audit("source.updated", user=admin, ip=ip_of(request), target=source.name)
     ctx.kick()
-    return {"id": source.id}
+    return {"id": source.id, "warning": _gain_warning(source)}
 
 
 @router.delete("/sources/{source_id}")
@@ -436,8 +467,18 @@ def _other_sdr_warning(db, source: Source, target: Target) -> str | None:
     return f"{', '.join(names)} can also record this channel. If both run together, only the first copy of each call is uploaded."
 
 
+def _stick_warning(db, source: Source, target: Target) -> str | None:
+    profile = db.scalar(select(SdrProfile).where(SdrProfile.source_id == source.id, SdrProfile.target_id == target.id))
+    gain = profile.gain_db if profile else source.gain_db
+    found = capabilities.problems(source, target.frequency_hz, target.kind, target.modulation, gain)
+    if not found:
+        return None
+    return f"{target.name} {' and '.join(found)} on {source.name}. It will still be tried."
+
+
 def _warnings(db, source: Source, target: Target) -> str | None:
-    found = [w for w in (_range_warning(db, source, target), _other_sdr_warning(db, source, target)) if w]
+    found = [w for w in (_stick_warning(db, source, target), _range_warning(db, source, target),
+                         _other_sdr_warning(db, source, target)) if w]
     return " ".join(found) or None
 
 
@@ -549,6 +590,32 @@ async def measure_source(source_id: int, body: MeasureBody, request: Request, us
     return {**result, "gain_db": body.gain_db}
 
 
+class DetectBody(BaseModel):
+    node_id: int | None = None
+    serial: str = Field(min_length=1, max_length=64)
+
+
+@router.post("/sources/detect")
+async def detect_stick(body: DetectBody, request: Request, admin: User = Depends(admin_user), db=Depends(get_db)):
+    """Read a stick's tuner and gain steps. Pauses its recording for a few seconds. Saves nothing."""
+    ctx = ctx_of(request)
+    node = db.get(Node, body.node_id or ctx.local_node_id)
+    if node is None or node.status != "active" or body.serial not in (node.serials or []):
+        raise HTTPException(404, "That SDR isn't configured on that node")
+    if not ctx.node_online(node):
+        raise HTTPException(409, "That node is offline.")
+    key = f"measure:{admin.id}"
+    if ctx.limiter.blocked(key, MEASURE_LIMIT, MEASURE_WINDOW):
+        raise HTTPException(429, "Too many measurements. Try again later.")
+    ctx.limiter.hit(key, MEASURE_WINDOW)
+    db.commit()  # ends the read transaction: detection takes seconds
+    ctx.audit("source.detected", user=admin, ip=ip_of(request), target=body.serial)
+    try:
+        return await ctx.measure(node, body.serial, {"op": "detect"})
+    except MeasureError as exc:
+        raise HTTPException(409, str(exc)) from None
+
+
 class ProfileBody(BaseModel):
     squelch: int = Field(ge=0, le=100000)
     gain_db: float | None = Field(default=None, ge=0, le=60)
@@ -571,7 +638,9 @@ def save_profile(source_id: int, target_id: int, body: ProfileBody, request: Req
     ctx.audit("profile.saved", user=user, ip=ip_of(request), target=source.name,
               details={"target": target.name, "squelch": body.squelch, "gain_db": body.gain_db})
     ctx.kick()
-    return _profile_view(profile)
+    nearest = capabilities.nearest_step(source.gain_steps, body.gain_db)
+    warning = f"{body.gain_db:g} dB isn't one of this stick's gain steps, so it will use {nearest:g} dB." if nearest is not None else None
+    return {**_profile_view(profile), "warning": warning}
 
 
 @router.delete("/sources/{source_id}/profiles/{target_id}")

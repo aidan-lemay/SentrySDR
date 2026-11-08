@@ -1,6 +1,6 @@
 <script>
   import { onMount } from 'svelte';
-  import { antennaCovers, api, DAYS, formatMHz, formatSchedule } from '../lib.js';
+  import { api, DAYS, formatMHz, formatSchedule, problemNote, stickProblems } from '../lib.js';
   import Notice from '../Notice.svelte';
   import { clearAfter } from '../notice.svelte.js';
 
@@ -145,10 +145,10 @@
       <label class="field"><span>Target</span>
         <select bind:value={form.target_id} required>
           <option value="" disabled>Choose...</option>
-          {#each targets as target (target.id)}<option value={target.id}>{target.name} ({formatMHz(target.frequency_hz)}){antennaCovers(chosenSource?.antenna_ranges, target.frequency_hz) ? '' : ', outside antenna range'}</option>{/each}
+          {#each targets as target (target.id)}<option value={target.id}>{target.name} ({formatMHz(target.frequency_hz)}){problemNote(chosenSource, target)}</option>{/each}
         </select>
-        {#if chosenSource?.antenna_name && form.target_id !== '' && !antennaCovers(chosenSource.antenna_ranges, targets.find((t) => t.id === Number(form.target_id))?.frequency_hz)}
-          <span class="hint st-warn">{chosenSource.antenna_name} on {chosenSource.name} doesn't cover this frequency, so reception may be poor.</span>
+        {#if form.target_id !== '' && stickProblems(chosenSource, targets.find((t) => t.id === Number(form.target_id))).length}
+          <span class="hint st-warn">{chosenSource.name} may not suit that target: {stickProblems(chosenSource, targets.find((t) => t.id === Number(form.target_id))).join(', ')}. You can still schedule it.</span>
         {/if}
       </label>
       <label class="field"><span>Start time</span><input type="time" bind:value={form.start} required /></label>

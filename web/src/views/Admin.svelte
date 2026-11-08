@@ -1,6 +1,6 @@
 <script>
   import { onMount, tick } from 'svelte';
-  import { ANTENNA_UNITS, DEFAULT_GAIN_DB, api, formatRanges, formatTime } from '../lib.js';
+  import { ANTENNA_UNITS, DEFAULT_GAIN_DB, OTHER_USES, RECORDED_USES, api, formatRange, formatRanges, formatTime, nearestStep } from '../lib.js';
   import Notice from '../Notice.svelte';
   import { clearAfter, NOTICE_MS } from '../notice.svelte.js';
 
@@ -24,7 +24,12 @@
   let sources = $state([]);
   let available = $state([]);
   let nodes = $state([]);
-  const blankSource = () => ({ id: null, key: '', name: '', description: '', antenna_id: '', gain: DEFAULT_GAIN_DB, ppm: 0 });
+  const blankSource = () => ({
+    id: null, key: '', name: '', description: '', antenna_id: '', gain: DEFAULT_GAIN_DB, ppm: 0,
+    tuner: '', steps: '', capMin: '', capMax: '', uses: [],
+  });
+  const TUNERS = ['R820T', 'R820T2', 'R828D', 'FC0012', 'FC0013', 'FC2580', 'E4000'];
+  let detecting = $state(false);
   let sourceForm = $state(blankSource());
 
   let antennas = $state([]);
@@ -143,11 +148,19 @@
       node_id: Number(nodeId), serial: serial.join('|'), name: sourceForm.name, description: sourceForm.description,
       antenna_id: sourceForm.antenna_id === '' ? null : Number(sourceForm.antenna_id),
       gain_db: sourceForm.gain === '' || sourceForm.gain === null ? null : Number(sourceForm.gain), ppm: Number(sourceForm.ppm),
+      tuner: sourceForm.tuner.trim() || null, gain_steps: parseSteps(sourceForm.steps),
+      cap_min_hz: filled(sourceForm.capMin) ? toHz(sourceForm.capMin) : null,
+      cap_max_hz: filled(sourceForm.capMax) ? toHz(sourceForm.capMax) : null, uses: sourceForm.uses,
     };
+    if (body.gain_steps.some(Number.isNaN)) {
+      error = 'Gain steps must be numbers, separated by spaces or commas.';
+      return;
+    }
     const done = await run(() => (sourceForm.id
       ? api(`sources/${sourceForm.id}`, { method: 'PUT', body })
       : api('sources', { method: 'POST', body })), 'Source saved.');
     if (done) {
+      if (done.warning) message = `Source saved. ${done.warning}`;
       sourceForm = blankSource();
       await loaders.sources();
     }
@@ -157,8 +170,31 @@
     sourceForm = {
       id: source.id, key: `${source.node_id}|${source.serial}`, name: source.name, description: source.description,
       antenna_id: source.antenna_id ?? '', gain: source.gain_db ?? '', ppm: source.ppm,
+      tuner: source.tuner, steps: source.gain_steps.join(' '),
+      capMin: source.cap_min_hz == null ? '' : plain(source.cap_min_hz), capMax: source.cap_max_hz == null ? '' : plain(source.cap_max_hz),
+      uses: [...source.uses],
     };
     document.getElementById('source-form')?.scrollIntoView();
+  }
+
+  const parseSteps = (text) => text.split(/[\s,]+/).filter(Boolean).map(Number);
+  const formSteps = $derived(parseSteps(sourceForm.steps).filter((n) => !Number.isNaN(n)));
+  const formNearest = $derived(nearestStep(formSteps, sourceForm.gain));
+
+  // Reads the tuner from the stick itself. Fills the form; nothing is saved until Save.
+  async function detect() {
+    const [nodeId, ...serial] = sourceForm.key.split('|');
+    const existing = sources.find((s) => s.node_id === Number(nodeId) && s.serial === serial.join('|'));
+    if (existing?.active_target && !confirm(`Detect the tuner on ${existing.name}? It stops listening on ${existing.active_target.name} for a few seconds.`)) return;
+    detecting = true;
+    const found = await run(() => api('sources/detect', { method: 'POST', body: { node_id: Number(nodeId), serial: serial.join('|') } }));
+    detecting = false;
+    if (!found) return;
+    sourceForm.tuner = found.tuner;
+    sourceForm.steps = found.gain_steps.join(' ');
+    if (found.freq_min_hz != null) sourceForm.capMin = plain(found.freq_min_hz);
+    if (found.freq_max_hz != null) sourceForm.capMax = plain(found.freq_max_hz);
+    message = `Found ${found.tuner} with ${found.gain_steps.length} gain steps${found.freq_min_hz == null ? '. Its range isn\'t known, so enter it if you want it checked' : ''}. Save to keep it.`;
   }
 
   // --- antennas
@@ -472,15 +508,20 @@
 {#if tab === 'sources'}
   <div class="box">
     <table class="table">
-      <thead><tr><th>Name</th><th>Node</th><th>Serial</th><th>Antenna</th><th>Range</th><th>Gain</th><th>Actions</th></tr></thead>
+      <thead><tr><th>Name</th><th>Node</th><th>Serial</th><th>Stick</th><th>Antenna</th><th>Gain</th><th>Actions</th></tr></thead>
       {#each sources as source (source.id)}
         <tbody>
           <tr>
-            <td class="title-cell">{source.name}</td>
+            <td class="title-cell">{source.name}{#if source.description}<div class="small dim" style="font-weight:normal">{source.description}</div>{/if}</td>
             <td data-label="Node"><span>{source.node_name}</span></td>
             <td data-label="Serial"><span class="mono small">{source.serial}</span></td>
-            <td data-label="Antenna"><span>{source.antenna_name || 'Not set'}</span></td>
-            <td data-label="Range"><span class="mono small">{source.antenna_id ? formatRanges(source.antenna_ranges) : 'Not set'}</span></td>
+            <td data-label="Stick">
+              <span class="small">
+                {source.tuner || 'Tuner not set'}{#if source.cap_min_hz != null || source.cap_max_hz != null}, <span class="mono">{formatRange(source.cap_min_hz, source.cap_max_hz)}</span>{/if}
+                {#if source.uses.length}<br />{[...RECORDED_USES, ...OTHER_USES].filter(([id]) => source.uses.includes(id)).map(([, label]) => label).join(', ')}{/if}
+              </span>
+            </td>
+            <td data-label="Antenna"><span class="small">{source.antenna_name || 'Not set'}{#if source.antenna_id}<br /><span class="mono">{formatRanges(source.antenna_ranges)}</span>{/if}</span></td>
             <td data-label="Gain"><span class="small">{source.gain_db == null ? 'Auto (AGC)' : `${source.gain_db} dB`}</span></td>
             <td>
               <div class="buttons" style="margin:0">
@@ -522,9 +563,40 @@
       </label>
       <label class="field"><span>Gain (dB)</span>
         <input type="number" inputmode="decimal" step="0.1" min="0" max="60" placeholder="AGC" bind:value={sourceForm.gain} />
+        {#if formNearest !== null}<span class="hint st-warn">Not one of this stick's gain steps. It will use {formNearest} dB.</span>{/if}
         <span class="hint">Starts at {DEFAULT_GAIN_DB} dB. Leave empty for automatic gain (AGC). 0 means a real 0 dB, which may miss most calls.</span>
       </label>
       <label class="field"><span>Frequency correction (ppm)</span><input type="number" min="-500" max="500" bind:value={sourceForm.ppm} /></label>
+    </fieldset>
+    <fieldset>
+      <legend>What this stick can do</legend>
+      <p class="small dim form-buttons">Used only for warnings: a target this stick doesn't suit can still be assigned. Leave anything blank to skip that check.</p>
+      <div class="buttons form-buttons">
+        <button type="button" disabled={!sourceForm.key || detecting} onclick={detect}>{detecting ? 'Detecting...' : 'Detect from the stick'}</button>
+      </div>
+      <p class="small dim form-buttons">Reads the tuner and gain steps, and fills in that tuner's usual range. Pauses the stick for a few seconds. Works on slaves too.</p>
+      <label class="field"><span>Tuner</span>
+        <input bind:value={sourceForm.tuner} maxlength="40" list="tuner-names" placeholder="R820T" />
+        <datalist id="tuner-names">{#each TUNERS as name (name)}<option value={name}></option>{/each}</datalist>
+      </label>
+      <div class="field"><span>Frequency range (MHz)</span>
+        <div class="pair">
+          <input class="mono" type="number" inputmode="decimal" step="any" min="0" aria-label="Lowest frequency" placeholder="From" bind:value={sourceForm.capMin} />
+          <input class="mono" type="number" inputmode="decimal" step="any" min="0" aria-label="Highest frequency" placeholder="To" bind:value={sourceForm.capMax} />
+        </div>
+      </div>
+      <label class="field"><span>Gain steps (dB)</span>
+        <input class="mono" bind:value={sourceForm.steps} placeholder="0.0 0.9 1.4 ..." />
+        <span class="hint">Separated by spaces or commas. A gain between two steps is rounded to the nearest.</span>
+      </label>
+      <div class="field top"><span>Uses</span>
+        <div>
+          <div class="small dim">Checked against targets</div>
+          <div class="flags">{#each RECORDED_USES as [id, label] (id)}<label class="tick"><input type="checkbox" value={id} bind:group={sourceForm.uses} /> {label}</label>{/each}</div>
+          <div class="small dim" style="margin-top:.3rem">Labels only</div>
+          <div class="flags">{#each OTHER_USES as [id, label] (id)}<label class="tick"><input type="checkbox" value={id} bind:group={sourceForm.uses} /> {label}</label>{/each}</div>
+        </div>
+      </div>
       <div class="buttons form-buttons">
         <button class="main">Save</button>
         {#if sourceForm.id}<button type="button" onclick={() => (sourceForm = blankSource())}>Cancel</button>{/if}

@@ -98,6 +98,13 @@ class Source(Base):
     gain_db: Mapped[float | None] = mapped_column(nullable=True)  # None = tuner AGC
     ppm: Mapped[int] = mapped_column(default=0)
     antenna_id: Mapped[int | None] = mapped_column(nullable=True)  # Antenna.id, cleared when it's removed
+    # What the stick can do. Unset values aren't checked. Not freq_min_hz/freq_max_hz,
+    # which are retired: filling those would turn them into an antenna on the next start.
+    tuner: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    gain_steps: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    cap_min_hz: Mapped[int | None] = mapped_column(nullable=True)
+    cap_max_hz: Mapped[int | None] = mapped_column(nullable=True)
+    uses: Mapped[list | None] = mapped_column(JSON, nullable=True)
     __table_args__ = (Index("uq_source_node_serial", "node_id", "serial", unique=True),)
 
 

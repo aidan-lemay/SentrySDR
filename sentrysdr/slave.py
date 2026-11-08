@@ -268,7 +268,7 @@ class Slave:
     async def _measure(self, message: dict) -> None:
         reply = {"t": "measure_result", "id": str(message.get("id", ""))[:64], "ok": False}
         try:
-            request = pipelines.sanitize_measure(message)
+            request = {"op": "detect"} if message.get("op") == "detect" else pipelines.sanitize_measure(message)
             reply["result"] = await self.supervisor.measure(str(message.get("serial", "")), **request)
             reply["ok"] = True
         except (pipelines.SpecError, MeasureError) as exc:

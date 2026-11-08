@@ -1,6 +1,6 @@
 <script>
   import { onMount } from 'svelte';
-  import { antennaCovers, api, DEFAULT_GAIN_DB, formatMHz, formatTime, formatDuration, STATE_LABELS } from '../lib.js';
+  import { api, DEFAULT_GAIN_DB, formatMHz, formatTime, formatDuration, nearestStep, problemNote, STATE_LABELS, stickProblems } from '../lib.js';
   import Notice from '../Notice.svelte';
   import { NOTICE_MS } from '../notice.svelte.js';
 
@@ -185,7 +185,8 @@
           <tr>
             <td class="title-cell">
               {source.name}
-              <div class="small dim" style="font-weight:normal">{source.node_name}{source.antenna_name ? `, ${source.antenna_name}` : ''}</div>
+              {#if source.description}<div class="small" style="font-weight:normal">{source.description}</div>{/if}
+              <div class="small dim" style="font-weight:normal">{source.node_name}{source.tuner ? `, ${source.tuner}` : ''}{source.antenna_name ? `, ${source.antenna_name}` : ''}</div>
             </td>
             <td data-label="Tuned to">
               <div>
@@ -250,11 +251,11 @@
                     <select bind:value={draft.target} onchange={() => (draft.editing = true)}>
                       <option value="">None</option>
                       {#each targets as target (target.id)}
-                        <option value={target.id}>{target.name} ({formatMHz(target.frequency_hz)}){antennaCovers(source.antenna_ranges, target.frequency_hz) ? '' : ', outside antenna range'}</option>
+                        <option value={target.id}>{target.name} ({formatMHz(target.frequency_hz)}){problemNote(source, target)}</option>
                       {/each}
                     </select>
-                    {#if source.antenna_name && draft.target !== '' && !antennaCovers(source.antenna_ranges, targets.find((t) => t.id === Number(draft.target))?.frequency_hz)}
-                      <span class="hint st-warn">{source.antenna_name} doesn't cover this frequency, so reception may be poor.</span>
+                    {#if draft.target !== '' && stickProblems(source, targets.find((t) => t.id === Number(draft.target))).length}
+                      <span class="hint st-warn">This SDR may not suit that target: {stickProblems(source, targets.find((t) => t.id === Number(draft.target))).join(', ')}. You can still assign it.</span>
                     {/if}
                   </label>
                   <div class="buttons form-buttons"><button class="main" disabled={source.locked && !isAdmin} onclick={() => assign(source)}>Assign</button></div>
@@ -286,6 +287,7 @@
                   </label>
                   <label class="field"><span>Gain (dB)</span>
                     <input class="mono" type="number" inputmode="decimal" min="0" max="60" step="0.1" placeholder="AGC" bind:value={m.gain} />
+                    {#if nearestStep(source.gain_steps, m.gain) !== null}<span class="hint st-warn">Not one of this stick's gain steps. It will use {nearestStep(source.gain_steps, m.gain)} dB.</span>{/if}
                     <span class="hint">Leave empty for automatic gain (AGC). A fixed gain usually gives a steadier noise level. 0 means a real 0 dB, which may miss most calls.</span>
                   </label>
                   <p class="small dim">Measure while nothing is transmitting on this frequency.</p>

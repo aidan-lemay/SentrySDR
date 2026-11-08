@@ -17,7 +17,7 @@ from urllib.parse import urlsplit
 import httpx
 from sqlalchemy import delete, or_, select
 
-from . import pipelines, schedule, uploaders
+from . import capabilities, pipelines, schedule, uploaders
 from .config import Config
 from .engine import MeasureError, Supervisor
 from .live import LiveHub
@@ -82,7 +82,7 @@ class Context:
         self.tracks: dict[str, dict[str, dict]] = {"adsb": {}, "ais": {}}
         self.live = LiveHub(cfg, self._live_demand)
         self.node_links: dict[int, object] = {}
-        self.pending_measures: dict[str, tuple[int, asyncio.Future]] = {}
+        self.pending_measures: dict[str, tuple[int, asyncio.Future, str]] = {}
         self.bans_cache: tuple[float, list] = (0.0, [])
         self._tile_origin: str | None = None
         self.local_node_id = self._ensure_local_node()
@@ -225,7 +225,7 @@ class Context:
             raise MeasureError("That node is offline.")
         request_id = uuid.uuid4().hex
         future = asyncio.get_running_loop().create_future()
-        self.pending_measures[request_id] = (node.id, future)
+        self.pending_measures[request_id] = (node.id, future, request.get("op", "measure"))
         try:
             link.request_measure(request_id, serial, request)
             return await asyncio.wait_for(future, MEASURE_TIMEOUT)
@@ -238,17 +238,20 @@ class Context:
         pending = self.pending_measures.get(str(message.get("id")))
         if pending is None or pending[0] != node_id or pending[1].done():
             return  # late, unknown, or from a node that wasn't asked
-        future = pending[1]
+        future, op = pending[1], pending[2]
         if not message.get("ok"):
             future.set_exception(MeasureError(str(message.get("error") or "The measurement failed.")[:300]))
             return
         try:
             result = message["result"]
+            if op == "detect":
+                future.set_result(capabilities.clean_detected(result))
+                return
             future.set_result({
                 "low": int(result["low"]), "typical": int(result["typical"]), "high": int(result["high"]),
                 "suggested": int(result["suggested"]), "moved": bool(result["moved"]),
             })
-        except (KeyError, TypeError, ValueError):
+        except (AttributeError, KeyError, TypeError, ValueError):
             future.set_exception(MeasureError("The node sent an unreadable result."))
 
     def kick(self) -> None:

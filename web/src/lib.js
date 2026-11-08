@@ -91,4 +91,45 @@ export const DEFAULT_GAIN_DB = 40.2;
 
 export const STATE_LABELS = {
   listening: 'Listening', idle: 'Idle', error: 'Fault', offline: 'Offline', measuring: 'Measuring noise',
+  detecting: 'Detecting tuner',
 };
+
+// What a stick can do. Keep in step with sentrysdr/capabilities.py.
+export const RECORDED_USES = [['voice', 'Analog voice'], ['digital', 'Digital voice'], ['adsb', 'ADS-B'], ['ais', 'AIS']];
+export const OTHER_USES = [
+  ['goes', 'GOES / HRIT'], ['noaa_apt', 'NOAA APT'], ['meteor', 'Meteor LRPT'], ['broadcast_fm', 'Broadcast FM'],
+  ['acars', 'ACARS'], ['pager', 'Pagers (POCSAG)'], ['trunk_cc', 'Trunking control channel'],
+];
+const ANALOG_MODES = ['nfm', 'am', 'wfm'];
+export const useLabel = (key) => [...RECORDED_USES, ...OTHER_USES].find(([id]) => id === key)?.[1] ?? key;
+
+// The step the stick will really use when a gain isn't one of its steps, else null.
+export function nearestStep(steps, gain) {
+  if (!steps?.length || gain === '' || gain === null || gain === undefined) return null;
+  const value = Number(gain);
+  const nearest = steps.reduce((best, step) => (Math.abs(step - value) < Math.abs(best - value) ? step : best));
+  return Math.abs(nearest - value) <= 0.05 ? null : nearest;
+}
+
+function neededUses(target) {
+  if (target.kind === 'adsb' || target.kind === 'ais') return [target.kind];
+  if (target.modulation === 'wfm') return ['voice', 'broadcast_fm'];
+  if (ANALOG_MODES.includes(target.modulation)) return ['voice'];
+  return ['digital'];
+}
+
+// Short reasons a stick may not suit a target, for marking pickers. Unset values aren't judged.
+export function stickProblems(source, target) {
+  if (!source || !target) return [];
+  const found = [];
+  const hz = target.frequency_hz;
+  if ((source.cap_min_hz != null && hz < source.cap_min_hz) || (source.cap_max_hz != null && hz > source.cap_max_hz)) found.push('outside stick range');
+  if (source.uses?.length && !neededUses(target).some((use) => source.uses.includes(use))) found.push('stick not set up for this');
+  if (!antennaCovers(source.antenna_ranges, hz)) found.push('outside antenna range');
+  return found;
+}
+export const problemNote = (source, target) => {
+  const found = stickProblems(source, target);
+  return found.length ? `, ${found.join(', ')}` : '';
+};
+export const formatRange = (low, high) => (low == null && high == null ? 'Not set' : `${low == null ? '?' : plainMHz(low)} to ${high == null ? '?' : plainMHz(high)} MHz`);
