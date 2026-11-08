@@ -20,7 +20,7 @@ from array import array
 from pathlib import Path
 from typing import Awaitable, Callable
 
-from . import capabilities, pipelines, sdr
+from . import acars, capabilities, pipelines, sdr
 from .config import Config
 
 log = logging.getLogger("sentrysdr.engine")
@@ -405,7 +405,7 @@ class Worker:
 
     async def _run(self, spec: dict) -> None:
         delay = RESTART_MIN
-        pipeline = {"adsb": self._run_adsb, "ais": self._run_ais}.get(spec["kind"], self._run_audio)
+        pipeline = {"adsb": self._run_adsb, "ais": self._run_ais, "acars": self._run_acars}.get(spec["kind"], self._run_audio)
         self._set_note("")  # a new assignment starts with a clean slate
         while True:
             started = time.monotonic()
@@ -552,6 +552,34 @@ class Worker:
             await stop_process(proc)
             reader.cancel()
             shutil.rmtree(json_dir, ignore_errors=True)
+
+    async def _run_acars(self, index: int, spec: dict) -> str:
+        tail: list[str] = []
+        proc = await asyncio.create_subprocess_exec(
+            *pipelines.acars_args(self.cfg, index, spec),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=self.cfg.tool_env(),
+            limit=acars.MAX_LINE * 2,
+        )
+        reader = asyncio.create_task(_log_stderr(self.serial, proc.stderr, tail, self._on_reset))
+        self._publish("listening", "")
+        try:
+            while True:
+                try:
+                    line = await proc.stdout.readline()
+                except ValueError:  # a line over the limit; readline has already dropped it
+                    continue
+                if not line:
+                    break
+                message = acars.parse_line(line)
+                if message is not None:
+                    self.last_call_at = time.time()
+                    self.sup.tracks("acars", self.serial, {"message": message, "target_id": spec["target_id"]})
+            await proc.wait()
+            detail = tail[-1] if tail else ""
+            return f"acarsdec exited ({proc.returncode}) {detail}".strip()
+        finally:
+            await stop_process(proc)
+            reader.cancel()
 
     async def _run_ais(self, index: int, spec: dict) -> str:
         tail: list[str] = []

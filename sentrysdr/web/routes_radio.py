@@ -18,6 +18,7 @@ from ..context import Context
 from ..engine import MeasureError
 from ..models import ANTENNA_UNITS, Antenna, BroadcastifySystem, Node, Recorder, SdrProfile, Source, Target, User, now
 from .deps import admin_user, ctx_of, current_user, get_db, ip_of, require
+from .routes_messages import annotate_aircraft
 
 router = APIRouter(prefix="/api")
 
@@ -132,7 +133,7 @@ class SourceBody(BaseModel):
     gain_steps: list[float] = Field(default_factory=list, max_length=capabilities.MAX_GAIN_STEPS)
     cap_min_hz: int | None = Field(default=None, ge=0, le=10_000_000_000)
     cap_max_hz: int | None = Field(default=None, ge=0, le=10_000_000_000)
-    uses: list[str] = Field(default_factory=list, max_length=len(capabilities.USES))
+    uses: list[str] = Field(default_factory=list, max_length=len(capabilities.USES) + len(capabilities.RETIRED_USES))
 
     @field_validator("gain_steps")
     @classmethod
@@ -144,6 +145,7 @@ class SourceBody(BaseModel):
     @field_validator("uses")
     @classmethod
     def _uses(cls, value: list[str]) -> list[str]:
+        value = [use for use in value if use not in capabilities.RETIRED_USES]  # from a page opened before they went
         unknown = set(value) - set(capabilities.USES)
         if unknown:
             raise ValueError(f"unknown uses: {', '.join(sorted(unknown))}")
@@ -330,12 +332,24 @@ class TargetBody(BaseModel):
     broadcastify_enabled: bool = False
     broadcastify_system_ref: int | None = None
     broadcastify_slot: int | None = Field(default=None, ge=1)
+    acars_channels: list[int] | None = Field(default_factory=list, max_length=pipelines.ACARS_MAX_CHANNELS)
+    airframes_enabled: bool = False
 
 
 def _validate_target(body: TargetBody, db, target_id: int | None = None) -> None:
-    allowed = {"audio": pipelines.ANALOG | set(pipelines.DIGITAL), "adsb": {"adsb"}, "ais": {"ais"}}
+    allowed = {"audio": pipelines.ANALOG | set(pipelines.DIGITAL), "adsb": {"adsb"}, "ais": {"ais"}, "acars": {"acars"}}
     if body.modulation not in allowed.get(body.kind, set()):
         raise HTTPException(422, f"Modulation {body.modulation} doesn't fit a {body.kind} target")
+    if body.kind == "acars":
+        body.acars_channels = sorted(set(body.acars_channels or []))
+        problem = pipelines.acars_channel_problem(body.acars_channels)
+        if problem:
+            raise HTTPException(422, problem)
+        body.frequency_hz = body.acars_channels[0]  # the lowest, for range checks and lists
+    else:
+        if body.acars_channels or body.airframes_enabled:  # None is fine too
+            raise HTTPException(422, "Only ACARS targets have channels or feed airframes.io")
+        body.acars_channels = None
     if body.clearcut_enabled and (body.clearcut_id is None or not body.clearcut_system):
         raise HTTPException(422, "ClearCut upload needs a system ID and a talkgroup")
     if body.rdio_enabled and (body.rdio_system is None or body.rdio_talkgroup is None):
@@ -795,10 +809,13 @@ async def live_audio(source_id: int, request: Request, user: User = Depends(requ
 
 # --- maps ------------------------------------------------------------------
 @router.get("/maps/{kind}")
-def map_tracks(kind: str, request: Request, _user: User = Depends(require("maps"))):
+def map_tracks(kind: str, request: Request, _user: User = Depends(require("maps")), db=Depends(get_db)):
     if kind not in ("adsb", "ais"):
         raise HTTPException(404, "Unknown map")
-    return {"items": ctx_of(request).current_tracks(kind)}
+    items = ctx_of(request).current_tracks(kind)
+    if kind == "adsb":
+        items = annotate_aircraft(request, db, items)
+    return {"items": items}
 
 
 def _tar1090_json(ctx: Context, name: str) -> Response:

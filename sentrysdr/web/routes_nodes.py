@@ -244,7 +244,7 @@ def handle_agent_message(ctx: Context, node_id: int, allowed: list[str], message
         ctx.finish_measure(node_id, message)
     elif kind == "tracks":
         serial, track_kind = message.get("serial"), message.get("kind")
-        if serial in allowed and track_kind in ("adsb", "ais") and isinstance(message.get("data"), dict):
+        if serial in allowed and track_kind in ("adsb", "ais", "acars") and isinstance(message.get("data"), dict):
             ctx.update_tracks(track_kind, node_id, serial, message["data"])
 
 

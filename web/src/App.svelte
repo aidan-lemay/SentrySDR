@@ -7,6 +7,7 @@
   import Recordings from './views/Recordings.svelte';
   import Targets from './views/Targets.svelte';
   import Maps from './views/Maps.svelte';
+  import Messages from './views/Messages.svelte';
   import Account from './views/Account.svelte';
   import Admin from './views/Admin.svelte';
 
@@ -23,6 +24,7 @@
     { id: 'recordings', label: 'Recordings', show: can('listen_recordings') },
     { id: 'targets', label: 'Targets', show: can('manage_targets') },
     { id: 'maps', label: 'Maps', show: can('maps') },
+    { id: 'messages', label: 'Messages', show: can('maps') },
     { id: 'admin', label: 'Admin', show: user?.role === 'admin' },
     { id: 'account', label: 'My account' },
   ].filter((link) => link.show !== false));
@@ -92,6 +94,8 @@
       <Targets />
     {:else if view === 'maps'}
       <Maps {user} />
+    {:else if view === 'messages'}
+      <Messages {route} />
     {:else if view === 'account'}
       <Account {user} onChange={refreshUser} />
     {:else if view === 'admin' && user.role === 'admin'}

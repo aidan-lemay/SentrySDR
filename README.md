@@ -17,7 +17,7 @@ It supervises existing tools instead of reimplementing them: `rtl_fm`, `ffmpeg`,
 
 ```sh
 sudo ./scripts/install.sh master          # or: slave
-sudo ./scripts/install.sh master --with-decoders   # also builds readsb, tar1090, AIS-catcher, dsd-fme
+sudo ./scripts/install.sh master --with-decoders   # also builds readsb, tar1090, AIS-catcher, dsd-fme, acarsdec
 ```
 
 The script prints the remaining steps: choose SDR serials, edit `/etc/sentrysdr/sentrysdr.toml`, create the first admin, and start the service. There are no default credentials. Example configurations are in [config/](config/).
@@ -104,6 +104,7 @@ This can run alongside a proxy. Requests through the proxy still get Secure cook
 - **Secrets at rest:** TOTP seeds and upload API keys are encrypted with `secret.key` in the data folder. Back up that file with the database, and keep both private.
 - **Browser protections:** strict CSP, `HttpOnly` and `SameSite=Strict` cookies, and Host and Origin checks. tar1090 is the one exception: it needs inline scripts, so it gets a looser CSP on its own path.
 - **Radio tools:** run as argv lists, never through a shell, with all values validated first, including those arriving from the network. Decoders are started with no network options, so they open no ports.
+- **Outbound connections:** only the uploads you turn on, and the airframes.io feed for ACARS targets that have it on. That feed sends each message over UDP, with only acarsdec's own message fields and your station ID.
 - **SDRs:** only serials in `sdr.serials` are ever opened. Other dongles stay free for other software. Duplicate serials are refused; fix them with `rtl_eeprom -s`.
 - **Service:** runs unprivileged under a systemd sandbox, with only its data and log folders writable. If you move `recordings_dir` or `log_dir`, see [Storing recordings on another drive](#storing-recordings-on-another-drive).
 - **Encryption on the air:** encrypted digital traffic isn't decoded. Check the rules on recording and sharing radio traffic where you operate.
@@ -115,6 +116,7 @@ This can run alongside a proxy. Requests through the proxy still get Secure cook
 | `rtl_fm` (NFM, AM, WFM) | Run on a real RTL-SDR, including recording and live audio |
 | `readsb`, tar1090 | Run on a real RTL-SDR with real aircraft |
 | `AIS-catcher` | Run on a real RTL-SDR, and its output checked with a known message; no live ship received yet |
+| `acarsdec` | Not yet run on a real stick: tested against a stand-in that follows acarsdec's documented options and JSON output |
 | `dsd-fme` | DMR tested on air: a real simplex transmission recorded and played back clearly, with correct speed and call splitting, and live audio in step. P25, NXDN, D-STAR and YSF use the same pipeline but haven't been tested on air |
 
 Squelch, calls and noise measurement have been tested on air with NFM on three tuners: R820T (NESDR Mini), R828D and FC0012. Noise readings and squelch numbers differ between them, so measure each stick.
@@ -156,10 +158,20 @@ An older database's antenna type and frequency range on each source are turned i
 
 Under **Admin > SDR sources**, each SDR can record what it can do: its tuner, frequency range, gain steps and uses. **Detect from the stick** reads the tuner and gain steps from the stick itself, on the master or a slave, and fills in that tuner's usual range. It pauses the stick for a few seconds and saves nothing until you select **Save**. Every field can be edited by hand.
 
-- A target outside the stick's range, or of a kind the stick isn't ticked for, is marked in the target pickers and warns when assigned or scheduled. It still runs. Analog voice, digital voice, ADS-B and AIS are checked; the other uses, such as GOES, are labels only.
+- A target outside the stick's range, or of a kind the stick isn't ticked for, is marked in the target pickers and warns when assigned or scheduled. It still runs. Analog voice, digital voice, ADS-B, AIS and ACARS are checked; Broadcast FM also counts for WFM targets.
 - The sticks only support their own gain steps: anything in between is rounded to the nearest. Once a stick's steps are known, its gain boxes become a list of those steps plus AGC, and other values are refused. A gain saved before the steps were known stays until changed, shown with the step it really gets. Detect moves the gain to the nearest step.
 - Without steps, for example before Detect or when the stick is open in another program, the gain box takes any number.
 - Anything left blank isn't checked. The description shows on the Sources page under the SDR's name.
+
+## ACARS
+
+ACARS is the short text messages aircraft send on VHF. An ACARS target lists the channels to decode: **North America** and **Europe** fill in the usual ones, and **+ Add** adds others. One stick decodes all of a target's channels at once with `acarsdec`, so they must fit within 2 MHz. North America's fifth channel, 129.125 MHz, doesn't fit with the other four, so it needs its own target and stick. Gain matters: acarsdec's AGC usually sits at maximum, so set a fixed gain on the stick.
+
+Messages appear on the **Messages** page, newest first, and update by themselves. Search by flight, registration, label or text. Messages with no text, mostly link checks, are hidden unless you tick **Show messages with no text**. On the ADS-B map, an aircraft that sent messages in the last hour links to them, matched by registration through tar1090's aircraft database. Flight numbers aren't matched, because ACARS and ADS-B use different airline codes. If two sticks hear the same message, it's kept once.
+
+To feed [airframes.io](https://airframes.io), set a **Station ID** under **Admin > Settings**, for example `KE-KSEA-ACARS`: your initials, the nearest airport's ICAO code, then ACARS. Then tick **Feed messages to airframes.io** on the target. No account is needed. Messages are kept for 30 days by default, set under **Admin > Settings**. Messages from a slave are lost while its link to the master is down.
+
+acarsdec needs cJSON to build: `libcjson-dev` on Debian and Raspberry Pi OS, which `install.sh --with-decoders` installs.
 
 ## Tuning call detection
 

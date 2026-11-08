@@ -17,7 +17,12 @@ ANALOG = {"nfm", "am", "wfm"}
 DIGITAL = {"p25p1": "-f1", "p25p2": "-f2", "dmr": "-fs", "nxdn48": "-fi", "nxdn96": "-fn", "dstar": "-fd", "ysf": "-fy"}
 # DSD-FME writes one channel per time slot for these modes, and mono for the rest.
 TWO_SLOT = {"p25p2", "dmr"}
-MODULATIONS = ANALOG | set(DIGITAL) | {"adsb", "ais"}
+MODULATIONS = ANALOG | set(DIGITAL) | {"adsb", "ais", "acars"}
+# ACARS: one stick decodes several channels, so they must fit in what it can sample.
+ACARS_MIN_HZ = 118_000_000
+ACARS_MAX_HZ = 137_000_000
+ACARS_MAX_SPAN_HZ = 2_000_000
+ACARS_MAX_CHANNELS = 8
 PCM_RATE = 16000
 DIGITAL_INPUT_RATE = 48000
 DSD_OUTPUT_RATE = 8000
@@ -51,13 +56,20 @@ def sanitize_spec(spec: dict) -> dict:
             "gain_db": None if spec.get("gain_db") is None else float(spec["gain_db"]),
             "ppm": int(spec.get("ppm", 0)),
             "volume_db": float(spec.get("volume_db") or 0),
+            "channels": [int(hz) for hz in spec.get("channels") or []],
         }
     except (KeyError, TypeError, ValueError) as exc:
         raise SpecError(f"bad assignment: {exc}") from exc
     if not VOLUME_MIN_DB <= clean["volume_db"] <= VOLUME_MAX_DB:
         raise SpecError("volume out of range")
-    if clean["kind"] not in ("audio", "adsb", "ais"):
+    if clean["kind"] not in ("audio", "adsb", "ais", "acars"):
         raise SpecError("bad kind")
+    if clean["kind"] == "acars":
+        problem = acars_channel_problem(clean["channels"])
+        if problem:
+            raise SpecError(problem)
+    elif clean["channels"]:
+        raise SpecError("only ACARS uses channels")
     if clean["modulation"] not in MODULATIONS:
         raise SpecError("bad modulation")
     if not FREQ_MIN_HZ <= clean["frequency_hz"] <= FREQ_MAX_HZ:
@@ -173,6 +185,31 @@ def pcm_rate(spec: dict) -> int:
 
 def pcm_channels(spec: dict) -> int:
     return 2 if spec["modulation"] in TWO_SLOT else 1
+
+
+def acars_channel_problem(channels: list[int]) -> str | None:
+    """Why a set of ACARS channels can't run on one stick, or None."""
+    if not channels:
+        return "An ACARS target needs at least one channel"
+    if len(channels) > ACARS_MAX_CHANNELS:
+        return f"An ACARS target can have at most {ACARS_MAX_CHANNELS} channels"
+    if any(not ACARS_MIN_HZ <= hz <= ACARS_MAX_HZ for hz in channels):
+        return "ACARS channels must be between 118 and 137 MHz"
+    span = max(channels) - min(channels)
+    if span > ACARS_MAX_SPAN_HZ:
+        return (f"Those channels span {span / 1e6:.3f} MHz, but one stick covers at most "
+                f"{ACARS_MAX_SPAN_HZ / 1e6:g} MHz. Remove the outermost channel, or use a second target on another stick.")
+    return None
+
+
+def acars_args(cfg: Config, index: int, spec: dict) -> list[str]:
+    # JSON to stdout only: no UDP, MQTT or other network outputs from acarsdec itself.
+    args = [cfg.binary("acarsdec") or "acarsdec", "--output", "json:file:path=-", "--rtlsdr", str(index)]
+    if spec.get("gain_db") is not None:
+        args += ["-g", f"{spec['gain_db']:g}"]
+    if spec.get("ppm"):
+        args += ["-p", str(spec["ppm"])]
+    return args + [f"{hz / 1e6:.3f}" for hz in sorted(spec["channels"])]
 
 
 def readsb_args(cfg: Config, index: int, spec: dict, json_dir: str) -> list[str]:

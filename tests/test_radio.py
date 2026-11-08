@@ -19,7 +19,7 @@ from sqlalchemy import select
 from sentrysdr import capabilities, pipelines, schedule, sdr, uploaders
 from sentrysdr.context import BROADCASTIFY_RETRY_SECONDS, UPLOAD_MAX_ATTEMPTS
 from sentrysdr.engine import MeasureError, VolumeControl, merge_ais_message
-from sentrysdr.models import Antenna, BroadcastifySystem, Node, Recorder, Recording, SdrProfile, Source, Target, UploadJob, make_session_factory
+from sentrysdr.models import AcarsMessage, Antenna, BroadcastifySystem, Node, Recorder, Recording, SdrProfile, Source, Target, UploadJob, make_session_factory
 
 from .conftest import ADMIN_EMAIL, PASSWORD, add_user, client_for
 
@@ -1679,3 +1679,205 @@ async def test_other_uploads_still_back_off_slowly(admin, ctx, tmp_path):
     with ctx.db() as session:
         job = session.scalar(select(UploadJob).where(UploadJob.recording_id == call))
     assert job.destination == "rdio" and job.next_attempt_at - time.time() > 30
+
+
+# --- ACARS --------------------------------------------------------------------
+NA = [130_025_000, 130_450_000, 131_125_000, 131_550_000]
+
+
+def test_acars_channels_must_fit_one_stick():
+    assert pipelines.acars_channel_problem(NA) is None
+    assert "span 2.425 MHz" in pipelines.acars_channel_problem([129_125_000, *NA])
+    assert "at least one" in pipelines.acars_channel_problem([])
+    assert "118 and 137" in pipelines.acars_channel_problem([162_000_000])
+    assert "at most 8" in pipelines.acars_channel_problem([130_000_000 + i * 10_000 for i in range(9)])
+
+
+def test_acars_args_output_json_to_stdout_only():
+    cfg = SimpleNamespace(binary=lambda name: None)
+    args = pipelines.acars_args(cfg, 2, {"channels": [131_550_000, 130_025_000], "gain_db": 40.2, "ppm": 3})
+    assert args == ["acarsdec", "--output", "json:file:path=-", "--rtlsdr", "2", "-g", "40.2", "-p", "3", "130.025", "131.550"]
+    assert not any("udp" in a or "mqtt" in a for a in args)
+
+
+def make_acars_target(client, name="ACARS", channels=NA, **extra):
+    body = {"name": name, "kind": "acars", "modulation": "acars", "frequency_hz": channels[0], "acars_channels": channels, **extra}
+    response = client.post("/api/targets", json=body)
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
+def test_acars_target_api(admin):
+    made = make_acars_target(admin, channels=[131_550_000, 130_025_000, 130_025_000])
+    assert made["acars_channels"] == [130_025_000, 131_550_000] and made["frequency_hz"] == 130_025_000
+    wide = admin.post("/api/targets", json={"name": "W", "kind": "acars", "modulation": "acars", "frequency_hz": 129_125_000,
+                                            "acars_channels": [129_125_000, *NA]})
+    assert wide.status_code == 422 and "one stick covers at most 2 MHz" in wide.text
+    audio = admin.post("/api/targets", json={"name": "A", "frequency_hz": 444_000_000, "acars_channels": NA})
+    assert audio.status_code == 422
+    assert admin.post("/api/targets", json={"name": "A", "frequency_hz": 444_000_000, "airframes_enabled": True}).status_code == 422
+
+
+def test_acars_assignment_reaches_the_spec(ctx, admin):
+    source = make_source(admin)
+    target = make_acars_target(admin)["id"]
+    admin.post(f"/api/sources/{source}/assign", json={"target_id": target}).raise_for_status()
+    spec = ctx.assignments()[ctx.local_node_id]["SER1"]
+    assert spec["kind"] == "acars" and spec["channels"] == NA
+    assert pipelines.sanitize_spec(spec)["channels"] == NA
+
+
+def test_acars_stick_without_the_use_warns(admin):
+    source = make_source(admin, uses=["voice"])
+    target = make_acars_target(admin)["id"]
+    assert "needs ACARS" in admin.post(f"/api/sources/{source}/assign", json={"target_id": target}).json()["warning"]
+
+
+RAW = {"timestamp": 1.0, "station_id": "X", "channel": 0, "freq": 131.55, "level": -21.5, "error": 0, "mode": "2",
+       "label": "H1", "block_id": "4", "ack": False, "tail": ".N123UA", "flight": "UA0123", "msgno": "M01A",
+       "text": "POSN 4740N12218W", "app": {"name": "acarsdec", "ver": "4"}, "evil": "x" * 10}
+
+
+class UdpCatcher:
+    def __init__(self):
+        import socket
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.settimeout(3)
+        self.address = f"127.0.0.1:{self.sock.getsockname()[1]}"
+
+    def receive(self):
+        return json.loads(self.sock.recv(65536))
+
+
+def run_ingest(ctx, items):
+    async def go():
+        ctx.loop = asyncio.get_running_loop()
+        for node_id, serial, data in items:
+            ctx.update_tracks("acars", node_id, serial, data)
+        await asyncio.sleep(0.3)
+        await asyncio.gather(*ctx.tasks, return_exceptions=True)
+    asyncio.run(go())
+
+
+def test_acars_messages_stored_once_and_fed_to_airframes(ctx, admin):
+    source = make_source(admin, name="Air stick")
+    target = make_acars_target(admin, airframes_enabled=True)["id"]
+    catcher = UdpCatcher()
+    ctx.set_setting("airframes_feed", catcher.address)
+    ctx.set_setting("airframes_station_id", "KE-KSEA-ACARS")
+    data = {"message": RAW, "target_id": target}
+    run_ingest(ctx, [(ctx.local_node_id, "SER1", data), (ctx.local_node_id, "SER2", data)])  # two sticks, one channel
+    sent = catcher.receive()
+    assert sent["station_id"] == "KE-KSEA-ACARS" and sent["text"] == RAW["text"] and sent["tail"] == ".N123UA"
+    assert "evil" not in sent and sent["app"]["name"] == "SentrySDR"
+    import socket
+    with pytest.raises(socket.timeout):
+        catcher.receive()  # the duplicate wasn't fed
+    with ctx.db() as session:
+        rows = session.scalars(select(AcarsMessage)).all()
+    assert len(rows) == 1
+    row = rows[0]
+    assert (row.tail, row.flight, row.frequency_hz, row.source_name, row.target_name, row.fed) == ("N123UA", "UA0123", 131_550_000, "Air stick", "ACARS", True)
+
+
+def test_acars_not_fed_without_a_station_or_when_off(ctx, admin):
+    make_source(admin)
+    on = make_acars_target(admin, "On", airframes_enabled=True)["id"]
+    off = make_acars_target(admin, "Off", channels=[131_525_000])["id"]
+    catcher = UdpCatcher()
+    ctx.set_setting("airframes_feed", catcher.address)
+    run_ingest(ctx, [(ctx.local_node_id, "SER1", {"message": {**RAW, "msgno": "A"}, "target_id": on})])  # no station ID yet
+    ctx.set_setting("airframes_station_id", "KE-KSEA-ACARS")
+    run_ingest(ctx, [(ctx.local_node_id, "SER1", {"message": {**RAW, "msgno": "B"}, "target_id": off})])
+    import socket
+    with pytest.raises(socket.timeout):
+        catcher.receive()
+    with ctx.db() as session:
+        assert [m.fed for m in session.scalars(select(AcarsMessage))] == [None, None]
+
+
+def test_bad_acars_input_is_cleaned(ctx, admin):
+    make_source(admin)
+    weird = {"freq": "nan", "level": "loud", "tail": None, "text": "a\x00b" + "x" * 5000, "label": ["H1"]}
+    run_ingest(ctx, [(ctx.local_node_id, "SER1", {"message": weird, "target_id": "x"}),
+                     (ctx.local_node_id, "SER1", {"message": "not a dict"})])
+    with ctx.db() as session:
+        row = session.scalars(select(AcarsMessage)).one()
+    assert row.frequency_hz == 0 and row.level is None and row.target_id is None and len(row.text) == 4000 and "\x00" not in row.text
+
+
+def add_message(ctx, **fields):
+    with ctx.db() as session:
+        values = {"received_at": time.time(), "tail": "N1", "flight": "UA1", "text": "HELLO", "has_text": True, **fields}
+        session.add(AcarsMessage(**values))
+        session.commit()
+
+
+def test_messages_feed_filters(ctx, admin, listener):
+    add_message(ctx, text="POSITION REPORT")
+    add_message(ctx, text="", has_text=False, tail="N2")
+    add_message(ctx, text="FUEL 12000", tail="N3", flight="DL22")
+    got = listener.get("/api/messages").json()
+    assert got["total"] == 2 and {m["tail"] for m in got["items"]} == {"N1", "N3"}
+    assert listener.get("/api/messages?show_empty=true").json()["total"] == 3
+    assert [m["tail"] for m in listener.get("/api/messages?search=fuel").json()["items"]] == ["N3"]
+    assert [m["tail"] for m in listener.get("/api/messages?search=DL22").json()["items"]] == ["N3"]
+    assert listener.get("/api/messages?tail=.N-1").json()["total"] == 1
+
+
+def test_messages_need_the_maps_permission(ctx, listener, admin):
+    user = next(u for u in admin.get("/api/admin/users").json() if u["role"] == "listener")
+    admin.patch(f"/api/admin/users/{user['id']}", json={"perm_overrides": {"maps": False}}).raise_for_status()
+    assert listener.get("/api/messages").status_code == 403
+
+
+def test_old_messages_pruned(ctx):
+    add_message(ctx, received_at=time.time() - 40 * 86400)
+    add_message(ctx)
+    assert ctx.apply_retention()["messages"] == 1
+
+
+def test_map_aircraft_link_to_their_messages(ctx, app, admin, tmp_path):
+    import gzip
+    db2 = tmp_path / "tar1090" / "db2"
+    db2.mkdir(parents=True)
+    (db2 / "A.js").write_bytes(gzip.compress(json.dumps({"children": ["A0"], "12345": ["N9"]}).encode()))
+    (db2 / "A0.js").write_bytes(gzip.compress(json.dumps({"children": [], "0001": ["N1", "C172"]}).encode()))
+    app.state.tar1090_dir = tmp_path / "tar1090"
+    add_message(ctx, tail="N1")
+    add_message(ctx, tail="N1", text="", has_text=False)
+    ctx.update_tracks("adsb", ctx.local_node_id, "SER1", {"aircraft": [{"hex": "a00001"}, {"hex": "a12345"}, {"hex": "bbbbbb"}]})
+    items = {a["hex"]: a for a in admin.get("/api/maps/adsb").json()["items"]}
+    assert items["a00001"]["registration"] == "N1" and items["a00001"]["acars_count"] == 1 and items["a00001"]["acars_tail"] == "N1"
+    assert items["a12345"]["registration"] == "N9" and "acars_count" not in items["a12345"]
+    assert "registration" not in items["bbbbbb"]
+
+
+def test_retired_uses_dropped(tmp_path, admin):
+    db = tmp_path / "uses.db"
+    make_session_factory(db)
+    connection = sqlite3.connect(db)
+    connection.execute("INSERT INTO nodes (id, name, is_local, status, serials, created_at) VALUES (1, 'n', 1, 'active', '[]', 0)")
+    connection.execute("INSERT INTO sources (id, node_id, serial, name, description, antenna, ppm, uses) VALUES (1, 1, 'S', 'S', '', '', 0, ?)",
+                       (json.dumps(["goes", "voice", "pager"]),))
+    connection.commit()
+    connection.close()
+    with make_session_factory(db)() as session:
+        assert session.get(Source, 1).uses == ["voice"]
+    saved = admin.post("/api/sources", json={"serial": "SER1", "name": "S", "uses": ["meteor", "acars"]})
+    assert saved.status_code == 201
+    assert next(s for s in admin.get("/api/sources").json() if s["name"] == "S")["uses"] == ["acars"]
+
+
+@pytest.mark.parametrize("body", [{"airframes_station_id": "bad id!"}, {"airframes_feed": "http://x"}, {"airframes_feed": "host"}])
+def test_airframes_settings_checked(admin, body):
+    assert admin.patch("/api/admin/settings", json=body).status_code == 422
+
+
+def test_airframes_settings_saved(admin):
+    reply = admin.patch("/api/admin/settings", json={"airframes_station_id": "KE-KSEA-ACARS", "airframes_feed": "feed.acars.io:5550",
+                                                       "message_retention_days": 14})
+    assert reply.status_code == 200
+    got = admin.get("/api/admin/settings").json()
+    assert (got["airframes_station_id"], got["message_retention_days"]) == ("KE-KSEA-ACARS", "14")

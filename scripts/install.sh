@@ -27,7 +27,7 @@ if command -v apt-get >/dev/null; then
   [[ "$ROLE" == "master" ]] && apt-get install -y npm
   if [[ "$WITH_DECODERS" == "--with-decoders" ]]; then
     apt-get install -y git cmake build-essential pkg-config librtlsdr-dev libusb-1.0-0-dev \
-      libncurses-dev libsndfile1-dev libitpp-dev libzstd-dev zlib1g-dev libpulse-dev
+      libncurses-dev libsndfile1-dev libitpp-dev libzstd-dev zlib1g-dev libpulse-dev libcjson-dev
   fi
 fi
 

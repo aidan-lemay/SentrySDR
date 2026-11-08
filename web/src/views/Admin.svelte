@@ -322,6 +322,8 @@
       rdio_server: settings.rdio_server, clearcut_server: settings.clearcut_server,
       clearcut_page_url: settings.clearcut_page_url, map_tile_url: settings.map_tile_url,
       broadcastify_server: settings.broadcastify_server,
+      message_retention_days: Number(settings.message_retention_days),
+      airframes_station_id: settings.airframes_station_id.trim(), airframes_feed: settings.airframes_feed.trim(),
     };
     for (const name of ['rdio_api_key', 'clearcut_api_key']) {
       if (keys[name]) body[name] = keys[name];
@@ -795,6 +797,10 @@
         <input type="number" inputmode="numeric" min="0" bind:value={settings.audit_retention_days} />
         <span class="hint">0 keeps them forever.</span>
       </label>
+      <label class="field"><span>ACARS messages (days)</span>
+        <input type="number" inputmode="numeric" min="0" bind:value={settings.message_retention_days} />
+        <span class="hint">0 keeps them forever.</span>
+      </label>
       <p class="small wrap-any">Recordings are in <span class="mono">{settings.recordings_dir}</span> and logs in <span class="mono">{settings.log_dir}</span>. Change these in the configuration file.</p>
     </fieldset>
     <fieldset>
@@ -817,6 +823,15 @@
     <fieldset>
       <legend>Broadcastify Calls server</legend>
       <label class="field"><span>Upload address</span><input class="mono" type="url" bind:value={settings.broadcastify_server} /></label>
+    </fieldset>
+    <fieldset>
+      <legend>airframes.io feed</legend>
+      <p class="small">ACARS targets with feeding turned on send each message here. No account is needed.</p>
+      <label class="field"><span>Station ID</span>
+        <input class="mono" bind:value={settings.airframes_station_id} maxlength="40" pattern="[A-Za-z0-9][A-Za-z0-9\-]*" placeholder="KE-KSEA-ACARS" />
+        <span class="hint">Your initials, the nearest airport's ICAO code, then ACARS. Leave empty to send nothing.</span>
+      </label>
+      <label class="field"><span>Feed address</span><input class="mono" bind:value={settings.airframes_feed} maxlength="260" placeholder="feed.acars.io:5550" /></label>
     </fieldset>
     <fieldset>
       <legend>Maps</legend>

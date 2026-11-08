@@ -979,3 +979,34 @@ async def test_slave_answers_a_detect_request(tmp_path):
         assert reply["ok"] and reply["result"]["tuner"] == "R828D"
     finally:
         await slave.supervisor.shutdown()
+
+
+# --- ACARS ------------------------------------------------------------------------
+FAKE_ACARSDEC = """#!/usr/bin/env python3
+import json, sys, time
+open(sys.argv[0] + ".args", "w").write(" ".join(sys.argv[1:]))
+print("not json")
+print("x" * 70000)
+print(json.dumps({"freq": 131.55, "tail": ".N123UA", "text": "HELLO", "label": "H1"}))
+sys.stdout.flush()
+time.sleep(60)
+"""
+
+
+async def test_acars_worker_passes_messages_on(tmp_path):
+    bins = tmp_path / "bin"
+    install_tool(bins, "acarsdec", FAKE_ACARSDEC)
+    got = []
+    sup = supervisor(make_config(tmp_path, bin_dirs=[bins]), [], tracks=lambda kind, serial, data: got.append((kind, serial, data)))
+    try:
+        await sup.apply({"SER1": spec(kind="acars", modulation="acars", frequency_hz=130_025_000, squelch=0,
+                                      channels=[130_025_000, 131_550_000], gain_db=40.2)})
+        assert await wait_for(lambda: got)
+        await asyncio.sleep(0.3)
+    finally:
+        await sup.shutdown()
+    assert len(got) == 1  # the junk lines are skipped
+    kind, serial, data = got[0]
+    assert kind == "acars" and serial == "SER1" and data["target_id"] == 1 and data["message"]["tail"] == ".N123UA"
+    args = (bins / "acarsdec.args").read_text()
+    assert args == "--output json:file:path=- --rtlsdr 0 -g 40.2 130.025 131.550"

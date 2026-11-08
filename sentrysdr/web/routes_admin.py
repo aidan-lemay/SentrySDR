@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import or_, select
 
-from .. import security, uploaders
+from .. import acars, security, uploaders
 from ..context import SECRET_SETTINGS, SETTING_DEFAULTS
 from ..models import AuditLog, Ban, BroadcastifySystem, Target, User, UserSession
 from .deps import ALL_PERMISSIONS, admin_user, ctx_of, effective_permissions, get_db, ip_of
@@ -306,6 +306,9 @@ class SettingsBody(BaseModel):
     clearcut_page_url: str | None = Field(default=None, max_length=500)
     broadcastify_server: str | None = Field(default=None, max_length=500)
     map_tile_url: str | None = Field(default=None, max_length=500)
+    message_retention_days: int | None = Field(default=None, ge=0, le=36500)
+    airframes_station_id: str | None = Field(default=None, max_length=40)
+    airframes_feed: str | None = Field(default=None, max_length=260)
 
 
 def _check_url(value: str) -> None:
@@ -317,6 +320,10 @@ def _check_url(value: str) -> None:
 def update_settings(body: SettingsBody, request: Request, admin: User = Depends(admin_user)):
     ctx = ctx_of(request)
     changed = []
+    if body.airframes_station_id and not acars.STATION_RE.match(body.airframes_station_id):
+        raise HTTPException(422, "A station ID is letters, numbers and dashes, like KE-KSEA-ACARS")
+    if body.airframes_feed is not None and not acars.FEED_RE.match(body.airframes_feed):
+        raise HTTPException(422, "The airframes.io address is host:port, like feed.acars.io:5550")
     for key, value in body.model_dump(exclude_none=True).items():
         if key in SECRET_SETTINGS:
             ctx.set_setting(key, ctx.secrets.seal(value) if value else "")

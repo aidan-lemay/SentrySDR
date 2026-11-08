@@ -17,11 +17,11 @@ from urllib.parse import urlsplit
 import httpx
 from sqlalchemy import delete, or_, select
 
-from . import capabilities, pipelines, schedule, uploaders
+from . import acars, capabilities, pipelines, schedule, uploaders
 from .config import Config
 from .engine import MeasureError, Supervisor
 from .live import LiveHub
-from .models import AuditLog, BroadcastifySystem, Node, Recorder, Recording, SdrProfile, Setting, Source, Target, UploadJob, make_session_factory
+from .models import AcarsMessage, AuditLog, BroadcastifySystem, Node, Recorder, Recording, SdrProfile, Setting, Source, Target, UploadJob, make_session_factory
 from .sdr import enumerate_serials
 from .security import RateLimiter, SecretBox
 
@@ -37,6 +37,9 @@ SETTING_DEFAULTS = {
     "clearcut_page_url": "",
     "broadcastify_server": "https://api.broadcastify.com/call-upload",
     "map_tile_url": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+    "message_retention_days": "30",
+    "airframes_station_id": "",
+    "airframes_feed": acars.AIRFRAMES_DEFAULT,
 }
 SECRET_SETTINGS = {"rdio_api_key", "clearcut_api_key"}
 TRACK_EXPIRY_SECONDS = 60
@@ -82,6 +85,8 @@ class Context:
         self.tracks: dict[str, dict[str, dict]] = {"adsb": {}, "ais": {}}
         self.live = LiveHub(cfg, self._live_demand)
         self.node_links: dict[int, object] = {}
+        self.acars_duplicates = acars.Duplicates()
+        self.airframes = acars.AirframesFeed()
         self.pending_measures: dict[str, tuple[int, asyncio.Future, str]] = {}
         self.bans_cache: tuple[float, list] = (0.0, [])
         self._tile_origin: str | None = None
@@ -167,7 +172,42 @@ class Context:
             link.request_live(serial, on)
 
     def update_tracks(self, kind: str, node_id: int, serial: str, data: dict) -> None:
+        if kind == "acars":
+            self.ingest_acars(node_id, serial, data)
+            return
         self.tracks.setdefault(kind, {})[f"{node_id}:{serial}"] = {"at": time.time(), "data": data}
+
+    def ingest_acars(self, node_id: int, serial: str, data: dict) -> None:
+        """Store one decoded ACARS message, and feed it on if its target says so."""
+        raw = data.get("message")
+        if not isinstance(raw, dict):
+            return
+        message = acars.clean(raw)
+        if not self.acars_duplicates.first(message):
+            return  # another SDR on this channel got it first
+        try:
+            target_id = int(data.get("target_id"))
+        except (TypeError, ValueError):
+            target_id = None
+        with self.db() as session:
+            node = session.get(Node, node_id)
+            source = session.scalar(select(Source).where(Source.node_id == node_id, Source.serial == serial))
+            target = session.get(Target, target_id) if target_id else None
+            if target is not None and target.kind != "acars":
+                target = None
+            station = self.get_setting("airframes_station_id")
+            feed = bool(target and target.airframes_enabled and station)
+            session.add(AcarsMessage(
+                received_at=time.time(), node_name=node.name if node else "", serial=serial[:64],
+                source_name=source.name if source else "", target_id=target.id if target else None,
+                target_name=target.name if target else "", fed=feed or None, **message,
+            ))
+            session.commit()
+        if feed and self.loop is not None:
+            payload = acars.feed_payload(raw, station)
+            task = self.loop.create_task(self.airframes.send(self.get_setting("airframes_feed"), payload))
+            self.tasks.append(task)
+            task.add_done_callback(lambda done: done in self.tasks and self.tasks.remove(done))
 
     def current_tracks(self, kind: str) -> list[dict]:
         """Merge every receiver's view. The freshest report wins for duplicates."""
@@ -207,6 +247,7 @@ class Context:
                         "squelch": profile.squelch if profile else target.squelch,
                         "gain_db": profile.gain_db if profile else source.gain_db,
                         "ppm": source.ppm, "volume_db": target.volume_db or 0,
+                        "channels": target.acars_channels or [] if target.kind == "acars" else [],
                     })
                 except pipelines.SpecError as exc:
                     log.error("recorder %s has an invalid configuration: %s", recorder.id, exc)
@@ -489,7 +530,8 @@ class Context:
 
     def apply_retention(self, now: float | None = None) -> dict:
         now = now or time.time()
-        removed = {"recordings": 0, "audit": 0}
+        removed = {"recordings": 0, "audit": 0, "messages": 0}
+        message_days = int(self.get_setting("message_retention_days") or 0)
         recording_days = int(self.get_setting("recording_retention_days") or 0)
         audit_days = int(self.get_setting("audit_retention_days") or 0)
         with self.db() as session:
@@ -503,6 +545,9 @@ class Context:
                         path.unlink(missing_ok=True)
                     session.delete(recording)
                     removed["recordings"] += 1
+            if message_days > 0:
+                result = session.execute(delete(AcarsMessage).where(AcarsMessage.received_at < now - message_days * 86400))
+                removed["messages"] = result.rowcount
             if audit_days > 0:
                 result = session.execute(delete(AuditLog).where(AuditLog.ts < now - audit_days * 86400))
                 removed["audit"] = result.rowcount

@@ -20,13 +20,12 @@ TUNER_RANGES = {
 }
 
 # Uses SentrySDR records, so a target of one of these kinds can be checked.
-RECORDED_USES = {"voice": "Analog voice", "digital": "Digital voice", "adsb": "ADS-B", "ais": "AIS"}
+RECORDED_USES = {"voice": "Analog voice", "digital": "Digital voice", "adsb": "ADS-B", "ais": "AIS", "acars": "ACARS"}
 # Labels for other work the stick is set up for. Nothing checks these.
-OTHER_USES = {
-    "goes": "GOES / HRIT", "noaa_apt": "NOAA APT", "meteor": "Meteor LRPT",
-    "broadcast_fm": "Broadcast FM", "acars": "ACARS", "pager": "Pagers (POCSAG)", "trunk_cc": "Trunking control channel",
-}
+OTHER_USES = {"broadcast_fm": "Broadcast FM"}
 USES = {**RECORDED_USES, **OTHER_USES}
+# Offered once, then removed. Saved values are dropped when the database opens.
+RETIRED_USES = {"goes", "noaa_apt", "meteor", "pager", "trunk_cc"}
 
 MAX_GAIN_STEPS = 64
 GAIN_MATCH_DB = 0.05
@@ -77,7 +76,7 @@ def nearest_step(steps: list[float] | None, gain: float | None) -> float | None:
 
 def use_for(kind: str, modulation: str) -> set[str]:
     """Which ticked uses would cover a target. Empty means nothing to check."""
-    if kind in ("adsb", "ais"):
+    if kind in ("adsb", "ais", "acars"):
         return {kind}
     if modulation in DIGITAL:
         return {"digital"}

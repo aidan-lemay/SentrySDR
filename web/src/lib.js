@@ -95,11 +95,8 @@ export const STATE_LABELS = {
 };
 
 // What a stick can do. Keep in step with sentrysdr/capabilities.py.
-export const RECORDED_USES = [['voice', 'Analog voice'], ['digital', 'Digital voice'], ['adsb', 'ADS-B'], ['ais', 'AIS']];
-export const OTHER_USES = [
-  ['goes', 'GOES / HRIT'], ['noaa_apt', 'NOAA APT'], ['meteor', 'Meteor LRPT'], ['broadcast_fm', 'Broadcast FM'],
-  ['acars', 'ACARS'], ['pager', 'Pagers (POCSAG)'], ['trunk_cc', 'Trunking control channel'],
-];
+export const RECORDED_USES = [['voice', 'Analog voice'], ['digital', 'Digital voice'], ['adsb', 'ADS-B'], ['ais', 'AIS'], ['acars', 'ACARS']];
+export const OTHER_USES = [['broadcast_fm', 'Broadcast FM']];
 const ANALOG_MODES = ['nfm', 'am', 'wfm'];
 export const useLabel = (key) => [...RECORDED_USES, ...OTHER_USES].find(([id]) => id === key)?.[1] ?? key;
 
@@ -112,7 +109,7 @@ export function nearestStep(steps, gain) {
 }
 
 function neededUses(target) {
-  if (target.kind === 'adsb' || target.kind === 'ais') return [target.kind];
+  if (['adsb', 'ais', 'acars'].includes(target.kind)) return [target.kind];
   if (target.modulation === 'wfm') return ['voice', 'broadcast_fm'];
   if (ANALOG_MODES.includes(target.modulation)) return ['voice'];
   return ['digital'];
