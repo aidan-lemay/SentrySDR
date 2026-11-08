@@ -119,7 +119,8 @@ Each permission except the admin-only ones can be allowed or denied per user, un
 | SDR sources | Each SDR's name, description, antenna, gain, frequency correction and capabilities |
 | Antennas | Antennas and their frequency ranges |
 | Nodes | Slaves: create a one-time enrolment token, or revoke a slave |
-| Settings | How long recordings, ACARS messages and audit logs are kept (0 keeps them forever); sign-ups; RDIO and ClearCut servers and keys; the Broadcastify upload address and systems; the airframes.io station ID; the map tile server |
+| Settings | How long recordings, ACARS messages and audit logs are kept (0 keeps them forever); sign-ups; the map tile server |
+| Uploads and feeds | RDIO and ClearCut servers and keys; the Broadcastify upload address and systems; the airframes.io station ID and address |
 
 Upload API keys are never shown again once saved. Leave a key's box blank to keep it.
 
@@ -177,7 +178,7 @@ If a stick is unplugged, its source shows a fault, and recording resumes by itse
 
 Describe each antenna under **Admin > Antennas**: name, type, length and the frequency ranges it works on. Use **+ Add** for each band, so a dual-band antenna gets two ranges. Then choose the antenna on each SDR under **Admin > SDR sources**. One antenna can feed several SDRs, for example through a splitter.
 
-If a target is outside every range of an SDR's antenna, the target pickers mark it **outside antenna range**, and assigning or scheduling it shows a warning. It still works, because an antenna often hears more than its rated bands. An antenna with no ranges isn't checked. Removing an antenna leaves its SDRs with none set.
+If a target is outside every range of an SDR's antenna, the target pickers mark it **(may not suit)**, choosing it says why, and assigning or scheduling it shows a warning. It still works, because an antenna often hears more than its rated bands. An antenna with no ranges isn't checked. Removing an antenna leaves its SDRs with none set.
 
 An older database's antenna type and frequency range on each source are turned into antennas on first start. Sources with the same type and range share one.
 
@@ -185,7 +186,7 @@ An older database's antenna type and frequency range on each source are turned i
 
 Under **Admin > SDR sources**, each SDR can record what it can do: its tuner, frequency range, gain steps and uses. **Detect from the stick** reads the tuner and gain steps from the stick itself, on the master or a slave, and fills in that tuner's usual range. It pauses the stick for a few seconds and saves nothing until you select **Save**. Every field can be edited by hand.
 
-- A target outside the stick's range, or of a kind the stick isn't ticked for, is marked in the target pickers and warns when assigned or scheduled. It still runs. Analog voice, digital voice, ADS-B, AIS and ACARS are checked; Broadcast FM also counts for WFM targets.
+- A target outside the stick's range, or of a kind the stick isn't ticked for, is marked **(may not suit)** in the target pickers and warns when assigned or scheduled. It still runs. Analog voice, digital voice, ADS-B, AIS and ACARS are checked; Broadcast FM also counts for WFM targets.
 - The sticks only support their own gain steps: anything in between is rounded to the nearest. Once a stick's steps are known, its gain boxes become a list of those steps plus AGC, and other values are refused. A gain saved before the steps were known stays until changed, shown with the step it really gets. Detect moves the gain to the nearest step.
 - Without steps, for example before Detect or when the stick is open in another program, the gain box takes any number.
 - Anything left blank isn't checked. The description shows on the Sources page under the SDR's name.
@@ -196,7 +197,7 @@ ACARS is the short text messages aircraft send on VHF. An ACARS target lists the
 
 Messages appear on the **Messages** page, newest first, and update by themselves. Search by flight, registration, label or text. Messages with no text, mostly link checks, are hidden unless you tick **Show messages with no text**. On the ADS-B map, an aircraft that sent messages in the last hour links to them, matched by registration through tar1090's aircraft database. Flight numbers aren't matched, because ACARS and ADS-B use different airline codes. If two sticks hear the same message, it's kept once.
 
-To feed [airframes.io](https://airframes.io), set a **Station ID** under **Admin > Settings**, for example `KE-KSEA-ACARS`: your initials, the nearest airport's ICAO code, then ACARS. Then tick **Feed messages to airframes.io** on the target. No account is needed. Messages are kept for 30 days by default, set under **Admin > Settings**. Messages from a slave are lost while its link to the master is down.
+To feed [airframes.io](https://airframes.io), set a **Station ID** under **Admin > Uploads and feeds**, for example `KE-KSEA-ACARS`: your initials, the nearest airport's ICAO code, then ACARS. Then tick **Feed messages to airframes.io** on the target. No account is needed. Messages are kept for 30 days by default, set under **Admin > Settings**. Messages from a slave are lost while its link to the master is down.
 
 acarsdec needs cJSON to build: `libcjson-dev` on Debian and Raspberry Pi OS, which `install.sh --with-decoders` installs.
 
@@ -206,7 +207,7 @@ Turn sharing on per target, on the Targets page.
 
 Sharing runs wherever the target runs, on the master or a slave, and stops when the SDR moves to another target. A slave whose link to the master drops keeps sharing for its last assignment.
 
-**ADS-B aggregators:** tick ADS-B Exchange, airplanes.live, adsb.lol or adsb.fi under **Share with** on an ADS-B target. readsb connects out to each one, using the addresses from each service's own setup script; no account or sign-up is needed. Each SDR has its own random feeder ID, which the services use to tell feeders apart. Admins can see it under **Admin > SDR sources**, below the serial, for feeder stats pages that ask for it. Keep it private: anyone with it could feed data as that receiver. The Sources page shows whether each one is connected; it checks every 10 seconds. To confirm data is arriving, use the feeder check on each service's website, which finds your feed by your public IP address.
+**ADS-B aggregators:** tick ADS-B Exchange, airplanes.live, adsb.lol or adsb.fi under **Aggregators** in the Sharing box of an ADS-B target. readsb connects out to each one, using the addresses from each service's own setup script; no account or sign-up is needed. Each SDR has its own random feeder ID, which the services use to tell feeders apart. Admins can see it by editing the SDR under **Admin > SDR sources**, for feeder stats pages that ask for it. Keep it private: anyone with it could feed data as that receiver. The Sources page shows whether each one is connected; it checks every 10 seconds. To confirm data is arriving, use the feeder check on each service's website, which finds your feed by your public IP address.
 
 **FlightRadar24 and FlightAware** need their own programs, `fr24feed` and `piaware`, installed on the machine with the ADS-B stick (the master or a slave). Tick **Offer data to fr24feed or piaware** on the ADS-B target, and choose a port (30005 is the usual one). SentrySDR then offers Beast data on `127.0.0.1` only. The Sources page shows how many programs are reading it.
 
@@ -245,7 +246,7 @@ With nothing else running, `sentrysdr measure --serial <serial> --mhz 444.85 --m
 
 ## Uploads
 
-Set server URLs and keys in **Admin > Settings**, then turn uploads on per target, on the Targets page. Uploads go from the master, including calls recorded on slaves. Failed uploads retry with increasing delays, up to 12 attempts, and the result shows on each recording.
+Set server URLs and keys in **Admin > Uploads and feeds**, then turn uploads on per target, in the Uploads box on the Targets page. Uploads go from the master, including calls recorded on slaves. Failed uploads retry with increasing delays, up to 12 attempts, and the result shows on each recording.
 
 A target's **Volume** setting applies to its recordings, uploads and live audio. It doesn't affect squelch. Any setting other than 0 dB also removes DC, which stops a tuning offset from clipping the start of a call.
 
@@ -256,7 +257,7 @@ Replaces trunk-recorder's `broadcastify_uploader` for conventional channels. Bro
 - **Keep the clock right.** Broadcastify requires accurate time, and it rejects or wrongly deduplicates calls with bad timestamps. Each call's time comes from the machine that recorded it, so check the master and every slave with `timedatectl`, which should say `System clock synchronized: yes`. A Pi usually has no battery-backed clock, so it needs network time.
 - **Credentials are separate per environment.** Production credentials only work on `https://api.broadcastify.com/call-upload`. Development credentials are issued separately and only work on `https://api.broadcastify.com/call-upload-dev`. Don't try one on the other.
 
-1. In **Admin > Settings > Broadcastify Calls systems**, add each node's name, system ID and API key, then select **Check credentials**. This sends no call.
+1. In **Admin > Uploads and feeds > Broadcastify Calls systems**, add each node's name, system ID and API key, then select **Check credentials**. This sends no call.
 2. On each target, turn on **Upload calls to Broadcastify Calls**, then choose the system and the frequency's slot. Slots are on Broadcastify's Manage Calls Systems page, under Node Frequencies.
 
 All uploads go from the master, including calls recorded on slaves. A call Broadcastify skips counts as finished, and a call it rejects, or refuses for a bad API key, is not retried. The reason shows on the recording, and other calls keep uploading. Broadcastify refuses calls that arrive late (64 seconds was too late in testing), so other failures retry every 10 seconds, and calls held during an outage will probably be rejected. They stay in SentrySDR.
@@ -266,7 +267,7 @@ All uploads go from the master, including calls recorded on slaves. A call Broad
 ### RDIO Scanner
 
 1. In your RDIO Scanner admin, create an API key, and note the system and talkgroup IDs the channel should appear under.
-2. In **Admin > Settings > Uploads**, enter the RDIO server's address, such as `https://rdio.example.com`, and the API key. SentrySDR posts calls to its `/api/call-upload`.
+2. In **Admin > Uploads and feeds**, enter the RDIO server's address, such as `https://rdio.example.com`, and the API key. SentrySDR posts calls to its `/api/call-upload`.
 3. On each target, turn on **Upload calls to RDIO** and enter the system and talkgroup.
 
 ### Duplicate channels

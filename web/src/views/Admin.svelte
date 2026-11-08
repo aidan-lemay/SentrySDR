@@ -5,7 +5,7 @@
   import { clearAfter, NOTICE_MS } from '../notice.svelte.js';
   import GainField from '../GainField.svelte';
 
-  const TABS = [['users', 'Users'], ['sources', 'SDR sources'], ['antennas', 'Antennas'], ['nodes', 'Nodes'], ['bans', 'Bans'], ['audit', 'Audit log'], ['settings', 'Settings']];
+  const TABS = [['users', 'Users'], ['sources', 'SDR sources'], ['antennas', 'Antennas'], ['nodes', 'Nodes'], ['bans', 'Bans'], ['audit', 'Audit log'], ['settings', 'Settings'], ['uploads', 'Uploads and feeds']];
   const PERMISSIONS = [
     ['listen_live', 'Listen live'], ['listen_recordings', 'Play recordings'], ['download', 'Download'],
     ['assign', 'Assign and schedule'], ['manage_targets', 'Manage targets'], ['protect', 'Protect recordings'],
@@ -76,13 +76,15 @@
   }
 
   const loaders = {
-    users: async () => { users = await api('admin/users'); },
+    // Requests waiting for a decision come first.
+    users: async () => { users = (await api('admin/users')).sort((a, b) => (b.status === 'pending') - (a.status === 'pending')); },
     sources: async () => { [sources, available, antennas] = await Promise.all([api('sources'), api('sources/available'), api('antennas')]); },
     antennas: async () => { antennas = await api('antennas'); },
     nodes: async () => { nodes = await api('nodes'); },
     bans: async () => { bans = await api('admin/bans'); },
     audit: async () => { audit = await api(`admin/audit?limit=200${auditSearch ? `&search=${encodeURIComponent(auditSearch)}` : ''}`); },
     settings: async () => { settings = await api('admin/settings'); systems = await api('admin/broadcastify'); },
+    uploads: async () => { settings = await api('admin/settings'); systems = await api('admin/broadcastify'); },
   };
 
   function open(next) {
@@ -520,7 +522,7 @@
           <tr>
             <td class="title-cell">{source.name}{#if source.description}<div class="small dim" style="font-weight:normal">{source.description}</div>{/if}</td>
             <td data-label="Node"><span>{source.node_name}</span></td>
-            <td data-label="Serial"><span class="mono small">{source.serial}{#if source.feeder_uuid}<br /><span class="dim">Feeder ID</span><br /><span class="copyable">{source.feeder_uuid}</span>{/if}</span></td>
+            <td data-label="Serial"><span class="mono small">{source.serial}</span></td>
             <td data-label="Stick">
               <span class="small">
                 {source.tuner || 'Tuner not set'}{#if source.cap_min_hz != null || source.cap_max_hz != null}, <span class="mono">{formatRange(source.cap_min_hz, source.cap_max_hz)}</span>{/if}
@@ -791,8 +793,9 @@
   </div>
 {/if}
 
-{#if tab === 'settings' && settings}
+{#if (tab === 'settings' || tab === 'uploads') && settings}
   <form onsubmit={saveSettings}>
+    {#if tab === 'settings'}
     <fieldset>
       <legend>How long to keep things</legend>
       <label class="field"><span>Recordings (days)</span>
@@ -817,6 +820,7 @@
         Let people request accounts
       </label>
     </fieldset>
+    {:else}
     <fieldset>
       <legend>Uploads</legend>
       <p class="small">Saved keys are never shown again. Leave a key blank to keep the current one.</p>
@@ -839,12 +843,16 @@
       </label>
       <label class="field"><span>Feed address</span><input class="mono" bind:value={settings.airframes_feed} maxlength="260" placeholder="feed.acars.io:5550" /></label>
     </fieldset>
+    {/if}
+    {#if tab === 'settings'}
     <fieldset>
       <legend>Maps</legend>
       <label class="field"><span>Map tile URL</span><input class="mono" bind:value={settings.map_tile_url} /></label>
     </fieldset>
-    <div class="buttons"><button class="main">Save settings</button></div>
+    {/if}
+    <div class="buttons"><button class="main">{tab === 'uploads' ? 'Save uploads and feeds' : 'Save settings'}</button></div>
   </form>
+  {#if tab === 'uploads'}
   <form onsubmit={saveSystem}>
     <fieldset>
       <legend>Broadcastify Calls systems</legend>
@@ -861,11 +869,12 @@
         </div>
       {/each}
       <label class="field"><span>Name</span><input bind:value={systemForm.name} maxlength="120" required /></label>
-      <label class="field"><span>System ID (from Broadcastify, not RadioReference)</span><input type="number" inputmode="numeric" min="1" bind:value={systemForm.system_id} required /></label>
+      <label class="field"><span>Broadcastify system ID</span><input type="number" inputmode="numeric" min="1" bind:value={systemForm.system_id} required /><span class="hint">The node's ID from Broadcastify, not a RadioReference ID.</span></label>
       <label class="field"><span>API key{systemForm.id ? ' (leave blank to keep the saved key)' : ''}</span><input type="password" bind:value={systemForm.api_key} autocomplete="off" required={!systemForm.id} /></label>
       <div class="buttons form-buttons"><button>{systemForm.id ? 'Save system' : 'Add system'}</button>
         {#if systemForm.id}<button type="button" onclick={() => (systemForm = blankSystem())}>Cancel</button>{/if}
       </div>
     </fieldset>
   </form>
+  {/if}
 {/if}

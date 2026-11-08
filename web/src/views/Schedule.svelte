@@ -81,7 +81,7 @@
 </script>
 
 <h1>Schedule</h1>
-<p class="small">A schedule takes over its source for the times shown, then the source goes back to its assigned target.{#if tz} Times are in {tz}.{/if}</p>
+<p class="small">A schedule takes over its source for the times shown, then the source goes back to its assigned target.{tz ? ` Times are in ${tz}.` : ''}</p>
 
 {#if error}<div class="err" role="alert">{error}</div>{/if}
 {#if message}<Notice ondismiss={() => (message = '')}>{message}</Notice>{/if}
@@ -93,7 +93,7 @@
     <tbody>
       {#each scheduled as recorder (recorder.id)}
         <tr>
-          <td class="title-cell">{recorder.name}{#if !recorder.enabled} <span class="st-warn">(off)</span>{/if}</td>
+          <td class="title-cell">{recorder.name}{#if !recorder.enabled}{' '}<span class="st-warn">(off)</span>{/if}</td>
           <td data-label="Source"><span>{recorder.source_name}</span></td>
           <td data-label="Target"><span>{recorder.target_name} <span class="mono small nowrap">{formatMHz(recorder.frequency_hz)}</span></span></td>
           <td data-label="When"><span>{formatSchedule(recorder)}</span></td>
@@ -142,7 +142,7 @@
           {#each sources as source (source.id)}<option value={source.id}>{source.name}</option>{/each}
         </select>
       </label>
-      <label class="field"><span>Target</span>
+      <label class="field wide"><span>Target</span>
         <select bind:value={form.target_id} required>
           <option value="" disabled>Choose...</option>
           {#each targets as target (target.id)}<option value={target.id}>{target.name} ({formatMHz(target.frequency_hz)}){problemNote(chosenSource, target)}</option>{/each}

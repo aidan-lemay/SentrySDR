@@ -134,6 +134,11 @@ legend { font-weight: bold; padding: 0 .3rem; }
 .days { display: grid; grid-template-columns: repeat(4, 1fr); }
 .pair { display: flex; gap: .4rem; }
 .pair select { width: auto; flex: none; }
+.pair button { flex: none; }
+.search { margin-bottom: .75rem; }
+.search summary { padding: .4rem 0; }
+.search .pair input { flex: 1; }
+@media (min-width: 760px) { .search { max-width: 37.75rem; } }
 .ranges { border-collapse: collapse; width: 100%; }
 .ranges th { text-align: left; font-size: .875rem; font-weight: normal; color: var(--dim); padding: 0 .4rem .15rem 0; }
 .ranges td { padding: 0 .4rem .4rem 0; }
@@ -151,6 +156,7 @@ legend { font-weight: bold; padding: 0 .3rem; }
 .table td[data-label] { display: grid; grid-template-columns: 6.5rem minmax(0, 1fr); gap: .5rem; }
 .table td[data-label]::before { content: attr(data-label); color: var(--dim); font-size: .875rem; }
 .table td.empty { color: var(--dim); }
+.table td.wide-only { display: none; }  /* an empty cell keeps desktop columns lined up */
 .table .title-cell { font-weight: bold; }
 
 /* --- calls --- */
@@ -188,6 +194,7 @@ audio { width: 100%; }
   .field > span:first-child { margin: 0; font-size: 1rem; text-align: right; }
   .field .hint { grid-column: 2; margin-top: -.5rem; }
   .form-buttons { padding-left: 13.75rem; }
+  .field.wide { grid-template-columns: 13rem minmax(0, 36rem); }
   .field.top { align-items: start; }
   .field.top > span:first-child { padding-top: 1.55rem; }
   .days { display: flex; gap: 1rem; }
@@ -201,6 +208,7 @@ audio { width: 100%; }
     display: table-cell; border: 1px solid var(--rule); padding: .3rem .5rem; vertical-align: top;
   }
   .table td[data-label]::before { content: none; }
+  .table td.wide-only { display: table-cell; }
   .table .title-cell { font-weight: normal; }
 
   .tabs { display: flex; flex-wrap: wrap; gap: 2px; margin-bottom: .75rem; }

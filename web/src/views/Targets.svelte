@@ -41,6 +41,7 @@
     eu: ['Europe', [131.525, 131.725, 131.825]],
   };
   const MAX_SPAN_MHZ = 2;
+  const MODE_NAMES = { adsb: 'ADS-B', ais: 'AIS', acars: 'ACARS' };
   // These frequencies are the standard ones each decoder listens on.
   const FIXED = { adsb: { modulation: 'adsb', mhz: 1090 }, ais: { modulation: 'ais', mhz: 162 } };
 
@@ -162,8 +163,8 @@
         <tr>
           <td class="title-cell">{target.name}</td>
           <td data-label="Frequency"><span class="mono">{target.kind === 'acars' ? (target.acars_channels ?? []).map((hz) => +(hz / 1e6).toFixed(4)).join(', ') + ' MHz' : formatMHz(target.frequency_hz)}</span></td>
-          <td data-label="Mode"><span>{target.modulation.toUpperCase()}</span></td>
-          <td data-label="Squelch"><span class="mono">{target.kind === 'audio' ? target.squelch || 'Off' : 'n/a'}</span></td>
+          <td data-label="Mode"><span>{MODE_NAMES[target.modulation] ?? target.modulation.toUpperCase()}</span></td>
+          {#if target.kind === 'audio'}<td data-label="Squelch"><span class="mono">{target.squelch || 'Off'}</span></td>{:else}<td class="wide-only"></td>{/if}
           <td data-label="Sends to"><span>{[target.clearcut_enabled && 'ClearCut', target.rdio_enabled && 'RDIO', target.broadcastify_enabled && 'Broadcastify', target.airframes_enabled && 'airframes.io', ...feedSummary(target)].filter(Boolean).join(', ') || 'None'}</span></td>
           <td>
             <div class="buttons" style="margin:0">
@@ -191,36 +192,6 @@
         <option value="acars">ACARS aircraft messages</option>
       </select>
     </label>
-    {#if form.kind === 'adsb'}
-      <div class="field top"><span>Share with</span>
-        <div class="flags">
-          {#each ADSB_AGGREGATORS as [id, label] (id)}<label class="tick"><input type="checkbox" value={id} bind:group={form.feeds.aggregators} /> {label}</label>{/each}
-        </div>
-      </div>
-      <p class="small dim form-buttons">readsb connects out to each one. Nothing is opened to the network. Each SDR is identified by its own random ID.</p>
-      <div class="field"><span>FlightRadar24, FlightAware</span><label class="tick"><input type="checkbox" bind:checked={form.feeds.beastOn} /> Offer data to fr24feed or piaware</label></div>
-      {#if form.feeds.beastOn}
-        <label class="field"><span>Local port</span>
-          <input class="mono" type="number" inputmode="numeric" min="1025" max="65535" bind:value={form.feeds.beastPort} required />
-          <span class="hint">Beast data on 127.0.0.1 only, on the machine with the SDR. Point fr24feed or piaware at 127.0.0.1 and this port. See the README for setup.</span>
-        </label>
-      {/if}
-    {/if}
-    {#if form.kind === 'ais'}
-      <div class="field"><span>aiscatcher.org</span><label class="tick"><input type="checkbox" bind:checked={form.feeds.community} /> Share with the aiscatcher.org community feed</label></div>
-      {#each AIS_SERVICES as [id, label] (id)}
-        <div class="field"><span>{label}</span><label class="tick"><input type="checkbox" bind:checked={form.feeds.udp[id].on} /> Send to {label}</label></div>
-        {#if form.feeds.udp[id].on}
-          <div class="field"><span>{label} address</span>
-            <div class="pair">
-              <input class="mono" aria-label={`${label} host`} placeholder="Host or IP" bind:value={form.feeds.udp[id].host} required maxlength="253" />
-              <input class="mono" type="number" inputmode="numeric" min="1" max="65535" aria-label={`${label} port`} placeholder="Port" bind:value={form.feeds.udp[id].port} required style="max-width:7rem" />
-            </div>
-            <span class="hint">The UDP address {label} gives you when you register a station.</span>
-          </div>
-        {/if}
-      {/each}
-    {/if}
     {#if form.kind === 'acars'}
       <div class="field top"><span>Channels (MHz)</span>
         <div>
@@ -249,8 +220,6 @@
       {:else}
         <p class="small dim form-buttons">One stick decodes every channel here at once, so they must fit within {MAX_SPAN_MHZ} MHz{sortedChannels.length > 1 ? ` (these span ${span.toFixed(3)} MHz)` : ''}.</p>
       {/if}
-      <div class="field"><span>airframes.io</span><label class="tick"><input type="checkbox" bind:checked={form.airframes_enabled} /> Feed messages to airframes.io</label></div>
-      {#if form.airframes_enabled}<p class="small dim form-buttons">Sent with the station ID set under Admin &gt; Settings. Nothing is sent until one is set.</p>{/if}
     {/if}
     {#if form.kind === 'audio'}
       <label class="field"><span>Frequency (MHz)</span><input class="mono" type="number" inputmode="decimal" step="0.0001" min="0.5" max="2200" bind:value={form.mhz} required /></label>
@@ -267,6 +236,54 @@
         <input class="mono" type="number" inputmode="decimal" min="-20" max="30" step="1" bind:value={form.volume_db} />
         <span class="hint">Applies to recordings, uploads and live audio, on any SDR. 0 leaves the audio unchanged. Too much boost clips loud voices.</span>
       </label>
+    {/if}
+  </fieldset>
+  {#if form.kind === 'adsb'}
+  <fieldset>
+    <legend>Sharing</legend>
+      <div class="field top"><span>Aggregators</span>
+        <div class="flags">
+          {#each ADSB_AGGREGATORS as [id, label] (id)}<label class="tick"><input type="checkbox" value={id} bind:group={form.feeds.aggregators} /> {label}</label>{/each}
+        </div>
+      </div>
+      <p class="small dim form-buttons">readsb connects out to each one. Nothing is opened to the network. Each SDR is identified by its own random ID.</p>
+      <div class="field"><span>FlightRadar24, FlightAware</span><label class="tick"><input type="checkbox" bind:checked={form.feeds.beastOn} /> Offer data to fr24feed or piaware</label></div>
+      {#if form.feeds.beastOn}
+        <label class="field"><span>Local port</span>
+          <input class="mono" type="number" inputmode="numeric" min="1025" max="65535" bind:value={form.feeds.beastPort} required />
+          <span class="hint">Beast data on 127.0.0.1 only, on the machine with the SDR. Point fr24feed or piaware at 127.0.0.1 and this port. See the README for setup.</span>
+        </label>
+      {/if}
+  </fieldset>
+  {/if}
+  {#if form.kind === 'ais'}
+  <fieldset>
+    <legend>Sharing</legend>
+      <div class="field"><span>aiscatcher.org</span><label class="tick"><input type="checkbox" bind:checked={form.feeds.community} /> Share with the aiscatcher.org community feed</label></div>
+      {#each AIS_SERVICES as [id, label] (id)}
+        <div class="field"><span>{label}</span><label class="tick"><input type="checkbox" bind:checked={form.feeds.udp[id].on} /> Send to {label}</label></div>
+        {#if form.feeds.udp[id].on}
+          <div class="field"><span>{label} address</span>
+            <div class="pair">
+              <input class="mono" aria-label={`${label} host`} placeholder="Host or IP" bind:value={form.feeds.udp[id].host} required maxlength="253" />
+              <input class="mono" type="number" inputmode="numeric" min="1" max="65535" aria-label={`${label} port`} placeholder="Port" bind:value={form.feeds.udp[id].port} required style="max-width:7rem" />
+            </div>
+            <span class="hint">The UDP address {label} gives you when you register a station.</span>
+          </div>
+        {/if}
+      {/each}
+  </fieldset>
+  {/if}
+  {#if form.kind === 'acars'}
+  <fieldset>
+    <legend>Sharing</legend>
+      <div class="field"><span>airframes.io</span><label class="tick"><input type="checkbox" bind:checked={form.airframes_enabled} /> Feed messages to airframes.io</label></div>
+      {#if form.airframes_enabled}<p class="small dim form-buttons">Sent with the station ID set under Admin &gt; Uploads and feeds. Nothing is sent until one is set.</p>{/if}
+  </fieldset>
+  {/if}
+  {#if form.kind === 'audio'}
+  <fieldset>
+    <legend>Uploads</legend>
       <div class="field"><span>ClearCut</span><label class="tick"><input type="checkbox" bind:checked={form.clearcut_enabled} /> Upload calls to ClearCut</label></div>
       {#if form.clearcut_enabled}
         <label class="field"><span>ClearCut system ID</span><input bind:value={form.clearcut_system} required maxlength="64" pattern="[A-Za-z0-9_.\-]+" /></label>
@@ -284,17 +301,17 @@
             <option value="">Choose a system</option>
             {#each systems as system (system.id)}<option value={system.id}>{system.name} (node {system.system_id})</option>{/each}
           </select>
-          {#if !systems.length}<span class="hint">An administrator adds systems under Admin &gt; Settings.</span>{/if}
+          {#if !systems.length}<span class="hint">An administrator adds systems under Admin &gt; Uploads and feeds.</span>{/if}
         </label>
         <label class="field"><span>Frequency slot</span>
           <input type="number" inputmode="numeric" min="1" bind:value={form.broadcastify_slot} required />
           <span class="hint">The Slot beside this frequency on Broadcastify's Manage Calls Systems page, under Node Frequencies.</span>
         </label>
       {/if}
-    {/if}
+  </fieldset>
+  {/if}
     <div class="buttons form-buttons">
       <button class="main">Save</button>
       {#if form.id}<button type="button" onclick={() => (form = blank())}>Cancel</button>{/if}
     </div>
-  </fieldset>
 </form>

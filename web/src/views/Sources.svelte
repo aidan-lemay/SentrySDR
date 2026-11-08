@@ -27,6 +27,9 @@
 
   const can = (permission) => user.permissions.includes(permission);
   const isAdmin = user.role === 'admin';
+  const canAssign = isAdmin || user.permissions.includes('assign');
+  // Only voice targets make calls. An idle SDR still offers the calls it made before.
+  const records = (source) => !source.active_target || source.active_target.kind === 'audio';
 
   async function refresh() {
     try {
@@ -211,11 +214,11 @@
                 {#if source.locked}<br /><span class="st-warn">Locked</span>{/if}
                 {#if source.error}<br /><span class="st-bad small">{source.error}</span>{/if}
                 {#if source.note}<br /><span class="st-warn small">{source.note}</span>{/if}
-                {#if source.feeds?.aggregators && Object.keys(source.feeds.aggregators).length}
+                {#if canAssign && source.feeds?.aggregators && Object.keys(source.feeds.aggregators).length}
                   <br /><span class="small">Feeding: {#each Object.entries(source.feeds.aggregators) as [key, up], i (key)}{i ? ', ' : ''}<span class={up ? 'st-ok' : 'st-warn'}>{feedLabel(key)} {up ? 'connected' : 'not connected'}</span>{/each}</span>
                 {/if}
-                {#if source.feeds?.local_clients != null}<br /><span class="small">Local port: {source.feeds.local_clients} program{source.feeds.local_clients === 1 ? '' : 's'} reading</span>{/if}
-                {#if source.feeds?.sending?.length}<br /><span class="small">Sending to {source.feeds.sending.map(feedLabel).join(', ')}</span>{/if}
+                {#if canAssign && source.feeds?.local_clients != null}<br /><span class="small">Local port: {source.feeds.local_clients} program{source.feeds.local_clients === 1 ? '' : 's'} reading</span>{/if}
+                {#if canAssign && source.feeds?.sending?.length}<br /><span class="small">Sending to {source.feeds.sending.map(feedLabel).join(', ')}</span>{/if}
               </div>
             </td>
             <td data-label="Last activity"><span class="small">{formatTime(source.last_call_at)}</span></td>
@@ -224,8 +227,11 @@
                 {#if can('listen_live') && source.active_target?.kind === 'audio'}
                   <button onclick={() => (listening = listening === source.id ? null : source.id)}>{listening === source.id ? 'Stop' : 'Listen'}</button>
                 {/if}
-                {#if can('listen_recordings')}
+                {#if can('listen_recordings') && records(source)}
                   <button onclick={() => toggleRecent(source)}>{recent[source.id] ? 'Hide calls' : 'Calls'}</button>
+                {/if}
+                {#if can('maps') && source.active_target?.kind === 'acars'}
+                  <a class="button" href="#/messages">Messages</a>
                 {/if}
               </div>
             </td>
@@ -254,7 +260,7 @@
               {#if (can('assign') || isAdmin) && draft}
                 <details>
                   <summary class="small" style="padding:.3rem 0">Change assignment{scheduleCount(source) ? ` (${scheduleCount(source)} on the schedule)` : ''}</summary>
-                  <label class="field"><span>Target</span>
+                  <label class="field wide"><span>Target</span>
                     <select bind:value={draft.target} onchange={() => (draft.editing = true)}>
                       <option value="">None</option>
                       {#each targets as target (target.id)}
@@ -268,16 +274,17 @@
                   <div class="buttons form-buttons"><button class="main" disabled={source.locked && !isAdmin} onclick={() => assign(source)}>Assign</button></div>
                   {#if source.locked && !isAdmin}<p class="small st-warn">This assignment is locked. Only an administrator can change it.</p>{/if}
                   {#if isAdmin}
-                    <div class="field">
+                    <div class="form-buttons">
                       <label class="tick"><input type="checkbox" checked={source.locked} disabled={!source.base_recorder_id} onchange={(event) => setLocked(source, event.target)} /> Lock this assignment, so only administrators can change it</label>
-                      {#if !source.base_recorder_id}<span class="hint">Assign a target first.</span>{/if}
+                      {#if !source.base_recorder_id}<span class="small dim">Assign a target first.</span>{/if}
                     </div>
                   {/if}
                 </details>
                 {@const m = measures[source.id]}
+                {#if !source.active_target || source.active_target.kind === 'audio' || source.profiles.length}
                 <details>
                   <summary class="small" style="padding:.3rem 0">Squelch profiles{source.profiles.length ? ` (${source.profiles.length} saved)` : ''}</summary>
-                  <p class="small dim">Noise differs by stick, frequency and gain. A saved profile sets the squelch and gain for one target on this SDR.</p>
+                  <p class="small dim form-buttons">Noise differs by stick, frequency and gain. A saved profile sets the squelch and gain for one target on this SDR.</p>
                   {#each source.profiles as saved (saved.target_id)}
                     <div class="small" style="margin:.4rem 0">
                       <strong>{targetName(saved.target_id)}</strong>: squelch {saved.squelch}, gain {gainLabel(saved.gain_db)}{saved.noise_level !== null ? `, noise ${Math.round(saved.noise_level)} on ${formatTime(saved.measured_at)}` : ''}
@@ -297,7 +304,7 @@
                     {#if nearestStep(source.gain_steps, m.gain) !== null}<span class="hint st-warn">Not one of this stick's gain steps. It will use {nearestStep(source.gain_steps, m.gain)} dB. Choose a step to save.</span>{/if}
                     <span class="hint">{source.gain_steps.length ? 'AGC is automatic gain.' : 'Leave empty for automatic gain (AGC). 0 means a real 0 dB, which may miss most calls.'} A fixed gain usually gives a steadier noise level.</span>
                   </label>
-                  <p class="small dim">Measure while nothing is transmitting on this frequency.</p>
+                  <p class="small dim form-buttons">Measure while nothing is transmitting on this frequency.</p>
                   <div class="buttons form-buttons"><button disabled={m.target === '' || m.busy} onclick={() => measure(source)}>{m.busy ? 'Measuring, about 10 seconds...' : 'Measure noise'}</button></div>
                   {#if m.result}
                     <div class="msg" role="status">
@@ -310,6 +317,7 @@
                   </label>
                   <div class="buttons form-buttons"><button class="main" disabled={m.target === '' || m.squelch === '' || m.squelch === null} onclick={() => saveProfile(source)}>Save profile</button></div>
                 </details>
+                {/if}
               {/if}
             </td>
           </tr>

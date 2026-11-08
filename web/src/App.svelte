@@ -16,7 +16,7 @@
   let menuOpen = $state(false);
   let route = $state(location.hash.slice(2) || 'sources');
 
-  const view = $derived(route.split('?')[0]);
+  const requested = $derived(route.split('?')[0]);
   const can = (permission) => user?.permissions.includes(permission);
   const links = $derived([
     { id: 'sources', label: 'Sources' },
@@ -28,6 +28,8 @@
     { id: 'admin', label: 'Admin', show: user?.role === 'admin' },
     { id: 'account', label: 'My account' },
   ].filter((link) => link.show !== false));
+  // Only pages in this user's menu open, even if typed into the address bar. Anything else shows Sources.
+  const view = $derived(links.some((link) => link.id === requested) ? requested : 'sources');
 
   async function refreshUser() {
     try {
@@ -98,7 +100,7 @@
       <Messages {route} />
     {:else if view === 'account'}
       <Account {user} onChange={refreshUser} />
-    {:else if view === 'admin' && user.role === 'admin'}
+    {:else if view === 'admin'}
       <Admin />
     {:else}
       <Sources {user} />

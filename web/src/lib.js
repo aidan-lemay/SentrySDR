@@ -66,7 +66,7 @@ export const formatRanges = (ranges) => (ranges?.length
 // An antenna with no ranges entered isn't judged, as on the server.
 export const antennaCovers = (ranges, hz) => !ranges?.length || ranges.some(([low, high]) => low <= hz && hz <= high);
 export const ANTENNA_UNITS = [['in', 'inches'], ['ft', 'feet'], ['cm', 'cm'], ['m', 'metres']];
-export const formatTime = (epoch) => (epoch ? new Date(epoch * 1000).toLocaleString() : 'None');
+export const formatTime = (epoch) => (epoch ? new Date(epoch * 1000).toLocaleString() : 'Never');
 
 export function formatDuration(seconds) {
   const total = Math.round(seconds ?? 0);
@@ -125,10 +125,8 @@ export function stickProblems(source, target) {
   if (!antennaCovers(source.antenna_ranges, hz)) found.push('outside antenna range');
   return found;
 }
-export const problemNote = (source, target) => {
-  const found = stickProblems(source, target);
-  return found.length ? `, ${found.join(', ')}` : '';
-};
+// Short, so a long target name still fits in a dropdown. The hint below it gives the reasons.
+export const problemNote = (source, target) => (stickProblems(source, target).length ? ' (may not suit)' : '');
 export const formatRange = (low, high) => (low == null && high == null ? 'Not set' : `${low == null ? '?' : plainMHz(low)} to ${high == null ? '?' : plainMHz(high)} MHz`);
 
 // Feeding other services. Keep in step with sentrysdr/feeds.py.

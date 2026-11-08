@@ -85,12 +85,13 @@
 {#if error}<div class="err" role="alert">{error}</div>{/if}
 
 <form onsubmit={applyFilters}>
-  <fieldset>
-    <legend>Search</legend>
-    <label class="field"><span>Flight, registration, label or text</span><input type="search" bind:value={search} /></label>
-    <div class="field"><span>Empty messages</span><label class="tick"><input type="checkbox" bind:checked={showEmpty} /> Show messages with no text</label></div>
-    <div class="buttons form-buttons"><button class="main">Search</button></div>
-  </fieldset>
+  <div class="search">
+    <div class="pair">
+      <input type="search" bind:value={search} aria-label="Search messages" placeholder="Flight, registration, label or text" />
+      <button class="main">Search</button>
+    </div>
+    <label class="tick small"><input type="checkbox" bind:checked={showEmpty} onchange={applyFilters} /> Show messages with no text</label>
+  </div>
 </form>
 
 <div class="box">
