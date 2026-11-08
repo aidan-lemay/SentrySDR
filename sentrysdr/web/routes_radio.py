@@ -248,6 +248,15 @@ def _validate_source(ctx: Context, db, body: SourceBody) -> Node:
     return node
 
 
+def _refuse_off_step(steps: list[float] | None, gain: float | None, unchanged: float | None = None) -> None:
+    """Once a stick's steps are known, only those can be chosen. A gain saved before then may stay."""
+    if gain is None or (unchanged is not None and abs(gain - unchanged) < 1e-9):
+        return
+    nearest = capabilities.nearest_step(steps, gain)
+    if nearest is not None:
+        raise HTTPException(422, f"{gain:g} dB isn't one of this stick's gain steps. The nearest is {nearest:g} dB.")
+
+
 def _gain_warning(source: Source) -> str | None:
     nearest = capabilities.nearest_step(source.gain_steps, source.gain_db)
     if nearest is None:
@@ -259,6 +268,7 @@ def _gain_warning(source: Source) -> str | None:
 def create_source(body: SourceBody, request: Request, admin: User = Depends(admin_user), db=Depends(get_db)):
     ctx = ctx_of(request)
     node = _validate_source(ctx, db, body)
+    _refuse_off_step(body.gain_steps, body.gain_db)
     if db.scalar(select(Source).where(Source.node_id == node.id, Source.serial == body.serial)):
         raise HTTPException(409, "That SDR is already defined")
     values = body.model_dump()
@@ -278,6 +288,7 @@ def update_source(source_id: int, body: SourceBody, request: Request, admin: Use
     if source is None:
         raise HTTPException(404, "Source not found")
     node = _validate_source(ctx, db, body)
+    _refuse_off_step(body.gain_steps, body.gain_db, source.gain_db)
     values = body.model_dump()
     values["node_id"] = node.id
     for key, value in values.items():
@@ -628,6 +639,7 @@ def save_profile(source_id: int, target_id: int, body: ProfileBody, request: Req
     source, target = _source_and_audio_target(db, source_id, target_id)
     _refuse_if_locked(db, user, source_id)
     profile = db.scalar(select(SdrProfile).where(SdrProfile.source_id == source_id, SdrProfile.target_id == target_id))
+    _refuse_off_step(source.gain_steps, body.gain_db, profile.gain_db if profile else None)
     if profile is None:
         profile = SdrProfile(source_id=source_id, target_id=target_id)
         db.add(profile)

@@ -1027,15 +1027,29 @@ def test_incompatible_targets_warn_but_still_assign(admin):
     assert listed["base_target_id"] == ais and listed["tuner"] == "FC0012" and listed["uses"] == ["adsb", "voice"]
 
 
-def test_gain_off_the_steps_warns_with_the_nearest(admin):
-    source = make_source(admin, gain_steps=[7.1, 17.9, 19.2], gain_db=40.2)
+def test_gain_must_be_a_step_once_steps_are_known(admin):
+    steps = [7.1, 17.9, 19.2]
+    refused = admin.post("/api/sources", json={"serial": "SER1", "name": "S", "gain_steps": steps, "gain_db": 18})
+    assert refused.status_code == 422 and "nearest is 17.9 dB" in refused.text
+    source = make_source(admin, gain_steps=steps, gain_db=17.9)
+    assert admin.post("/api/sources", json={"serial": "SER2", "name": "T", "gain_steps": steps}).status_code == 201  # AGC is fine
     target = make_target(admin)
+    assert admin.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": 80, "gain_db": 10}).status_code == 422
+    saved = admin.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": 80, "gain_db": 7.1})
+    assert saved.status_code == 200 and saved.json()["warning"] is None
+    assert admin.post(f"/api/sources/{source}/assign", json={"target_id": target}).json()["warning"] is None
+
+
+def test_a_gain_saved_before_detection_can_stay(admin):
+    source = make_source(admin, gain_db=40.2)  # no steps known yet
+    target = make_target(admin)
+    admin.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": 80, "gain_db": 33}).raise_for_status()
+    body = {"serial": "SER1", "name": "S", "gain_steps": [7.1, 17.9, 19.2]}
+    kept = admin.put(f"/api/sources/{source}", json={**body, "gain_db": 40.2})
+    assert kept.status_code == 200 and "will use 19.2 dB" in kept.json()["warning"]  # detected later: still saves
+    assert admin.put(f"/api/sources/{source}", json={**body, "gain_db": 30}).status_code == 422  # but not a new off-step value
+    assert admin.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": 90, "gain_db": 33}).status_code == 200
     assert "so it will get 19.2 dB" in admin.post(f"/api/sources/{source}/assign", json={"target_id": target}).json()["warning"]
-    reply = admin.put(f"/api/sources/{source}", json={"serial": "SER1", "name": "S", "gain_steps": [7.1, 17.9, 19.2], "gain_db": 18})
-    assert "will use 17.9 dB" in reply.json()["warning"]
-    profile = admin.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": 80, "gain_db": 7.1})
-    assert profile.json()["warning"] is None
-    assert admin.post(f"/api/sources/{source}/assign", json={"target_id": target}).json()["warning"] is None  # the profile's 7.1 is a step
 
 
 def test_unset_capabilities_are_not_judged(admin):

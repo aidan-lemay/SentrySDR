@@ -157,7 +157,8 @@ An older database's antenna type and frequency range on each source are turned i
 Under **Admin > SDR sources**, each SDR can record what it can do: its tuner, frequency range, gain steps and uses. **Detect from the stick** reads the tuner and gain steps from the stick itself, on the master or a slave, and fills in that tuner's usual range. It pauses the stick for a few seconds and saves nothing until you select **Save**. Every field can be edited by hand.
 
 - A target outside the stick's range, or of a kind the stick isn't ticked for, is marked in the target pickers and warns when assigned or scheduled. It still runs. Analog voice, digital voice, ADS-B and AIS are checked; the other uses, such as GOES, are labels only.
-- A gain between two of the stick's steps is rounded to the nearest by the stick. Gain boxes say which step it will use.
+- The sticks only support their own gain steps: anything in between is rounded to the nearest. Once a stick's steps are known, its gain boxes become a list of those steps plus AGC, and other values are refused. A gain saved before the steps were known stays until changed, shown with the step it really gets. Detect moves the gain to the nearest step.
+- Without steps, for example before Detect or when the stick is open in another program, the gain box takes any number.
 - Anything left blank isn't checked. The description shows on the Sources page under the SDR's name.
 
 ## Tuning call detection

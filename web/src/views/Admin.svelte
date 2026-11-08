@@ -3,6 +3,7 @@
   import { ANTENNA_UNITS, DEFAULT_GAIN_DB, OTHER_USES, RECORDED_USES, api, formatRange, formatRanges, formatTime, nearestStep } from '../lib.js';
   import Notice from '../Notice.svelte';
   import { clearAfter, NOTICE_MS } from '../notice.svelte.js';
+  import GainField from '../GainField.svelte';
 
   const TABS = [['users', 'Users'], ['sources', 'SDR sources'], ['antennas', 'Antennas'], ['nodes', 'Nodes'], ['bans', 'Bans'], ['audit', 'Audit log'], ['settings', 'Settings']];
   const PERMISSIONS = [
@@ -192,9 +193,12 @@
     if (!found) return;
     sourceForm.tuner = found.tuner;
     sourceForm.steps = found.gain_steps.join(' ');
+    const snapped = nearestStep(found.gain_steps, sourceForm.gain);
+    const moved = snapped === null ? '' : ` Gain moved from ${sourceForm.gain} to ${snapped} dB, the nearest step.`;
+    if (snapped !== null) sourceForm.gain = snapped;
     if (found.freq_min_hz != null) sourceForm.capMin = plain(found.freq_min_hz);
     if (found.freq_max_hz != null) sourceForm.capMax = plain(found.freq_max_hz);
-    message = `Found ${found.tuner} with ${found.gain_steps.length} gain steps${found.freq_min_hz == null ? '. Its range isn\'t known, so enter it if you want it checked' : ''}. Save to keep it.`;
+    message = `Found ${found.tuner} with ${found.gain_steps.length} gain steps${found.freq_min_hz == null ? '. Its range isn\'t known, so enter it if you want it checked' : ''}. Save to keep it.${moved}`;
   }
 
   // --- antennas
@@ -562,15 +566,19 @@
         <span class="hint">Add antennas under the Antennas section. One antenna can feed several SDRs.</span>
       </label>
       <label class="field"><span>Gain (dB)</span>
-        <input type="number" inputmode="decimal" step="0.1" min="0" max="60" placeholder="AGC" bind:value={sourceForm.gain} />
-        {#if formNearest !== null}<span class="hint st-warn">Not one of this stick's gain steps. It will use {formNearest} dB.</span>{/if}
-        <span class="hint">Starts at {DEFAULT_GAIN_DB} dB. Leave empty for automatic gain (AGC). 0 means a real 0 dB, which may miss most calls.</span>
+        <GainField steps={formSteps} bind:value={sourceForm.gain} />
+        {#if formNearest !== null}<span class="hint st-warn">Not one of this stick's gain steps. It will use {formNearest} dB. Choose a step to save.</span>{/if}
+        {#if formSteps.length}
+          <span class="hint">Only this stick's own steps can be used. AGC is automatic gain.</span>
+        {:else}
+          <span class="hint">Starts at {DEFAULT_GAIN_DB} dB. Leave empty for automatic gain (AGC). 0 means a real 0 dB, which may miss most calls. Detect the stick below to choose from its own steps.</span>
+        {/if}
       </label>
       <label class="field"><span>Frequency correction (ppm)</span><input type="number" min="-500" max="500" bind:value={sourceForm.ppm} /></label>
     </fieldset>
     <fieldset>
       <legend>What this stick can do</legend>
-      <p class="small dim form-buttons">Used only for warnings: a target this stick doesn't suit can still be assigned. Leave anything blank to skip that check.</p>
+      <p class="small dim form-buttons">The range and uses only warn: a target this stick doesn't suit can still be assigned. Gain steps limit the gain boxes to the stick's own steps. Leave anything blank to skip it.</p>
       <div class="buttons form-buttons">
         <button type="button" disabled={!sourceForm.key || detecting} onclick={detect}>{detecting ? 'Detecting...' : 'Detect from the stick'}</button>
       </div>
@@ -587,7 +595,7 @@
       </div>
       <label class="field"><span>Gain steps (dB)</span>
         <input class="mono" bind:value={sourceForm.steps} placeholder="0.0 0.9 1.4 ..." />
-        <span class="hint">Separated by spaces or commas. A gain between two steps is rounded to the nearest.</span>
+        <span class="hint">Separated by spaces or commas. These become the only gains you can choose for this stick.</span>
       </label>
       <div class="field top"><span>Uses</span>
         <div>

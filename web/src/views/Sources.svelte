@@ -3,6 +3,7 @@
   import { api, DEFAULT_GAIN_DB, formatMHz, formatTime, formatDuration, nearestStep, problemNote, STATE_LABELS, stickProblems } from '../lib.js';
   import Notice from '../Notice.svelte';
   import { NOTICE_MS } from '../notice.svelte.js';
+  import GainField from '../GainField.svelte';
 
   let { user } = $props();
   let sources = $state([]);
@@ -107,6 +108,7 @@
     const m = measures[source.id];
     const saved = profileFor(source, m.target);
     m.gain = saved ? (saved.gain_db ?? '') : (source.gain_db ?? DEFAULT_GAIN_DB);
+    if (!saved && source.gain_db == null) m.gain = nearestStep(source.gain_steps, m.gain) ?? m.gain;  // the default may not be a step
     m.squelch = saved ? saved.squelch : '';
     m.result = null;
   }
@@ -286,9 +288,9 @@
                     </select>
                   </label>
                   <label class="field"><span>Gain (dB)</span>
-                    <input class="mono" type="number" inputmode="decimal" min="0" max="60" step="0.1" placeholder="AGC" bind:value={m.gain} />
-                    {#if nearestStep(source.gain_steps, m.gain) !== null}<span class="hint st-warn">Not one of this stick's gain steps. It will use {nearestStep(source.gain_steps, m.gain)} dB.</span>{/if}
-                    <span class="hint">Leave empty for automatic gain (AGC). A fixed gain usually gives a steadier noise level. 0 means a real 0 dB, which may miss most calls.</span>
+                    <GainField steps={source.gain_steps} bind:value={m.gain} />
+                    {#if nearestStep(source.gain_steps, m.gain) !== null}<span class="hint st-warn">Not one of this stick's gain steps. It will use {nearestStep(source.gain_steps, m.gain)} dB. Choose a step to save.</span>{/if}
+                    <span class="hint">{source.gain_steps.length ? 'AGC is automatic gain.' : 'Leave empty for automatic gain (AGC). 0 means a real 0 dB, which may miss most calls.'} A fixed gain usually gives a steadier noise level.</span>
                   </label>
                   <p class="small dim">Measure while nothing is transmitting on this frequency.</p>
                   <div class="buttons form-buttons"><button disabled={m.target === '' || m.busy} onclick={() => measure(source)}>{m.busy ? 'Measuring, about 10 seconds...' : 'Measure noise'}</button></div>
