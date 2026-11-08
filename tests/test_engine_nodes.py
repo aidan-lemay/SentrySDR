@@ -841,3 +841,92 @@ def test_list_sdrs_with_nothing_usable_prints_no_line(tmp_path, monkeypatch, cap
         monkeypatch.setattr("sentrysdr.sdr.enumerate_serials", lambda: devices)
         cmd_list_sdrs(make_config(tmp_path))
         assert "serials = " not in capsys.readouterr().out
+
+
+# --- a stick that didn't open cleanly ---------------------------------------
+@pytest.mark.parametrize("line,flagged", [
+    ("rtlsdr_write_reg failed with -7", True), ("Resetting device...", True),
+    ("WARNING: Failed to set sample rate.", True), ("Found Rafael Micro R828D tuner", False),
+])
+async def test_usb_fault_lines(line, flagged):
+    stream = asyncio.StreamReader()
+    stream.feed_data(f"{line}\n".encode()); stream.feed_eof()
+    seen = []
+    await engine._log_stderr("S", stream, [], lambda: seen.append(1))
+    assert bool(seen) is flagged
+
+
+async def test_errors_while_exiting_are_ignored():
+    stream = asyncio.StreamReader()
+    stream.feed_data(b"Signal caught, exiting!\nUser cancel, exiting...\nrtlsdr_demod_write_reg failed with -9\nrtlsdr_write_reg failed with -7\n")
+    stream.feed_eof()
+    seen = []
+    await engine._log_stderr("S", stream, [], lambda: seen.append(1))
+    assert seen == []
+
+def resetting_tool(starts, resets_on):
+    """A fake rtl_fm that prints librtlsdr's reset message on the given starts (1-based)."""
+    return f"""#!/usr/bin/env python3
+import sys, time
+with open({str(starts)!r}, "a") as f: f.write("x")
+n = len(open({str(starts)!r}).read())
+if n in {sorted(resets_on)!r}:
+    sys.stderr.write("rtlsdr_write_reg failed with -7\\nResetting device...\\n"); sys.stderr.flush()
+time.sleep(60)
+"""
+
+
+@pytest.fixture
+def fast_reset(monkeypatch):
+    monkeypatch.setattr(engine, "RESET_SETTLE_SECONDS", 0.2)
+
+
+async def test_reset_on_open_restarts_once_and_notes_it(tmp_path, fast_reset):
+    bins, starts = tmp_path / "bin", tmp_path / "starts"
+    install_tool(bins, "rtl_fm", resetting_tool(starts, {1}))
+    sup = supervisor(make_config(tmp_path, bin_dirs=[bins]), [])
+    worker = sup.workers["SER1"]
+    try:
+        await sup.apply({"SER1": spec()})
+        assert await wait_for(lambda: starts.exists() and len(starts.read_text()) == 2)
+        assert await wait_for(lambda: worker.state == "listening")
+        await asyncio.sleep(1.5)
+        assert len(starts.read_text()) == 2  # one restart, then left alone
+        assert worker.error == "" and "so it was restarted" in worker.note and "USB errors" in worker.note
+        assert worker.snapshot()["note"] == worker.note
+    finally:
+        await sup.shutdown()
+
+
+async def test_reset_every_open_doesnt_loop(tmp_path, fast_reset):
+    bins, starts = tmp_path / "bin", tmp_path / "starts"
+    install_tool(bins, "rtl_fm", resetting_tool(starts, {1, 2, 3, 4, 5}))
+    sup = supervisor(make_config(tmp_path, bin_dirs=[bins]), [])
+    worker = sup.workers["SER1"]
+    try:
+        await sup.apply({"SER1": spec()})
+        assert await wait_for(lambda: "twice in a row" in worker.note)
+        await asyncio.sleep(2.0)
+        assert len(starts.read_text()) == 2 and worker.state == "listening"
+    finally:
+        await sup.shutdown()
+
+
+async def test_new_assignment_clears_the_note(tmp_path, fast_reset):
+    bins, starts = tmp_path / "bin", tmp_path / "starts"
+    install_tool(bins, "rtl_fm", resetting_tool(starts, {1}))
+    sup = supervisor(make_config(tmp_path, bin_dirs=[bins]), [])
+    worker = sup.workers["SER1"]
+    try:
+        await sup.apply({"SER1": spec()})
+        assert await wait_for(lambda: worker.note)
+        await sup.apply({"SER1": spec(frequency_hz=145_000_000)})
+        assert await wait_for(lambda: worker.state == "listening" and worker.note == "")
+    finally:
+        await sup.shutdown()
+
+
+async def test_reset_note_reaches_the_sources_page(ctx, admin):
+    admin.post("/api/sources", json={"serial": "SER1", "name": "S"}).raise_for_status()
+    ctx.status[(ctx.local_node_id, "SER1")] = {"state": "listening", "error": "", "note": "Reset itself on start"}
+    assert admin.get("/api/sources").json()[0]["note"] == "Reset itself on start"

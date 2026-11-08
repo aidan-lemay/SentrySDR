@@ -33,6 +33,14 @@ SQUELCH_STUCK_SECONDS = 600
 SQUELCH_STUCK_WARNING = "Squelch has been open for over 10 minutes. If nothing is transmitting, measure this SDR and raise its squelch."
 MEASURE_SECONDS = 6.0
 MEASURE_ATTEMPTS = 3
+# Signs that a stick didn't open cleanly: USB timeouts (-7), librtlsdr resetting it,
+# or a setup step failing. Seen on real hardware after a tool was killed without
+# closing the stick. It may then send nothing, which looks the same as a closed squelch.
+USB_FAULT_MARKERS = ("failed with -7", "Resetting device", "Failed to set")
+# A tool prints these as it exits, and the errors that follow them are normal.
+EXIT_MARKERS = ("User cancel", "Signal caught")
+RESET_SETTLE_SECONDS = 3.0
+RESET_RESTART_GAP = 60.0  # at most one automatic restart a minute, so a stick that always resets can't loop
 RADIO_KEYS = ("kind", "frequency_hz", "modulation", "squelch", "gain_db", "ppm")
 
 CallSink = Callable[[dict, Path], Awaitable[None]]
@@ -58,10 +66,11 @@ async def stop_process(proc: asyncio.subprocess.Process | None, timeout: float =
         await proc.wait()
 
 
-async def _log_stderr(serial: str, stream, tail: list[str]) -> None:
+async def _log_stderr(serial: str, stream, tail: list[str], on_reset: Callable[[], None] | None = None) -> None:
     # Reads chunks, not lines: readline fails on a very long line, and if this stops
     # draining the pipe fills and the tool hangs.
     pending = b""
+    exiting = False
     while chunk := await stream.read(4096):
         lines = (pending + chunk).split(b"\n")
         pending = lines.pop()[-4096:]
@@ -71,6 +80,9 @@ async def _log_stderr(serial: str, stream, tail: list[str]) -> None:
                 tail.append(text)
                 del tail[:-5]
                 log.debug("[%s] %s", serial, text)
+                exiting = exiting or any(marker in text for marker in EXIT_MARKERS)
+                if on_reset and not exiting and any(marker in text for marker in USB_FAULT_MARKERS):
+                    on_reset()
 
 
 class PcmFramer:
@@ -206,6 +218,10 @@ class Worker:
         self.in_call = False
         self.call_started: float | None = None
         self.last_call_at: float | None = None
+        self.note = ""  # an informational warning that outlives the error field
+        self.note_at: float | None = None
+        self._reset_seen = asyncio.Event()
+        self._last_reset_restart = -RESET_RESTART_GAP
 
     def snapshot(self) -> dict:
         return {
@@ -214,6 +230,8 @@ class Worker:
             "in_call": self.in_call,
             "call_started": self.call_started,
             "last_call_at": self.last_call_at,
+            "note": self.note,
+            "note_at": self.note_at,
             "recorder_id": self.spec["recorder_id"] if self.spec else None,
             "target_id": self.spec["target_id"] if self.spec else None,
         }
@@ -303,9 +321,49 @@ class Worker:
                 return pipelines.measure_summary(levels)
         raise MeasureError(f"No samples from the SDR. {tail[-1] if tail else ''}".strip()[:300])
 
+    def _on_reset(self) -> None:
+        self._reset_seen.set()
+
+    def _set_note(self, text: str) -> None:
+        self.note, self.note_at = text, (time.time() if text else None)
+        self._publish()
+
+    async def _watch_resets(self, pipeline: Awaitable[str]) -> str | None:
+        """Run a pipeline. If the stick had USB errors on open, restart it once so it opens cleanly.
+
+        Returns None to restart straight away, otherwise the pipeline's exit error.
+        """
+        self._reset_seen.clear()
+        task = asyncio.ensure_future(pipeline)
+        watcher = asyncio.create_task(self._reset_seen.wait())
+        try:
+            await asyncio.wait({task, watcher}, return_when=asyncio.FIRST_COMPLETED)
+            if task.done():
+                return task.result()
+            await asyncio.sleep(RESET_SETTLE_SECONDS)  # let the open finish before stopping it
+            clock = time.strftime("%H:%M")
+            if time.monotonic() - self._last_reset_restart < RESET_RESTART_GAP:
+                log.warning("[%s] USB errors again on start; left running", self.serial)
+                self._set_note(f"USB errors on start twice in a row at {clock}. If it records nothing, check its USB connection.")
+                return await task
+            self._last_reset_restart = time.monotonic()
+            log.warning("[%s] USB errors on start; restarting it so it opens cleanly", self.serial)
+            self._set_note(f"USB errors on start at {clock}, so it was restarted. If it records nothing, check its USB connection.")
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            return None
+        finally:
+            watcher.cancel()
+            if not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
     async def _run(self, spec: dict) -> None:
         delay = RESTART_MIN
         pipeline = {"adsb": self._run_adsb, "ais": self._run_ais}.get(spec["kind"], self._run_audio)
+        self._set_note("")  # a new assignment starts with a clean slate
         while True:
             started = time.monotonic()
             error = ""
@@ -318,7 +376,10 @@ class Worker:
                     else:
                         error = "SDR not connected"
                 else:
-                    error = await pipeline(index, spec)
+                    error = await self._watch_resets(pipeline(index, spec))
+                    if error is None:
+                        await asyncio.sleep(1.0)  # the stick can take a moment to be released
+                        continue
             except asyncio.CancelledError:
                 raise
             except FileNotFoundError as exc:
@@ -352,7 +413,7 @@ class Worker:
                         stdout=write_fd, stderr=asyncio.subprocess.PIPE,
                     )
                     procs.append(tuner)
-                    tasks.append(asyncio.create_task(_log_stderr(self.serial, tuner.stderr, tail)))
+                    tasks.append(asyncio.create_task(_log_stderr(self.serial, tuner.stderr, tail, self._on_reset)))
                     proc = await asyncio.create_subprocess_exec(
                         *pipelines.dsd_args(cfg, spec),
                         stdin=read_fd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
@@ -367,7 +428,7 @@ class Worker:
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                 )
             procs.append(proc)
-            tasks.append(asyncio.create_task(_log_stderr(self.serial, proc.stderr, tail)))
+            tasks.append(asyncio.create_task(_log_stderr(self.serial, proc.stderr, tail, self._on_reset)))
             self._publish("listening", "")
             open_since: float | None = None
             warn_stuck = spec["squelch"] > 0 and not digital
@@ -430,7 +491,7 @@ class Worker:
             *pipelines.readsb_args(self.cfg, index, spec, json_dir),
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE, env=self.cfg.tool_env(),
         )
-        reader = asyncio.create_task(_log_stderr(self.serial, proc.stderr, tail))
+        reader = asyncio.create_task(_log_stderr(self.serial, proc.stderr, tail, self._on_reset))
         path = Path(json_dir) / "aircraft.json"
         self._publish("listening", "")
         try:
@@ -455,7 +516,7 @@ class Worker:
             *pipelines.ais_args(self.cfg, index, spec),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=self.cfg.tool_env(),
         )
-        reader = asyncio.create_task(_log_stderr(self.serial, proc.stderr, tail))
+        reader = asyncio.create_task(_log_stderr(self.serial, proc.stderr, tail, self._on_reset))
         vessels: dict[str, dict] = {}
         last_push = 0.0
         self._publish("listening", "")

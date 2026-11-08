@@ -155,6 +155,7 @@ def _source_view(ctx: Context, db, source: Source, winners: dict, recorders: lis
         "gain_db": source.gain_db, "ppm": source.ppm,
         "state": status.get("state", "offline" if not online else "idle"),
         "error": status.get("error", ""), "in_call": status.get("in_call", False),
+        "note": status.get("note", ""),
         "call_started": status.get("call_started"), "last_call_at": status.get("last_call_at"),
         "locked": bool(base and base.locked),
         "base_recorder_id": base.id if base else None,

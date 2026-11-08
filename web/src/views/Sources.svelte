@@ -207,6 +207,7 @@
                 <span class={stateClass(source.state)}>{STATE_LABELS[source.state] ?? source.state}</span>
                 {#if source.locked}<br /><span class="st-warn">Locked</span>{/if}
                 {#if source.error}<br /><span class="st-bad small">{source.error}</span>{/if}
+                {#if source.note}<br /><span class="st-warn small">{source.note}</span>{/if}
               </div>
             </td>
             <td data-label="Last activity"><span class="small">{formatTime(source.last_call_at)}</span></td>
