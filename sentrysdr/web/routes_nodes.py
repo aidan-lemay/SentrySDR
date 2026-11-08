@@ -16,7 +16,7 @@ from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Reque
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 
-from .. import security
+from .. import feeds, security
 from ..config import SERIAL_RE
 from ..context import Context
 from ..models import Node, Source, Target, User
@@ -230,6 +230,20 @@ def decode_live_frame(frame: bytes) -> tuple[str, int, bytes] | None:
     return serial, rate, frame[5 + length:]
 
 
+def clean_feed_status(raw) -> dict:
+    """A slave's report of its feeds, keeping only what the page shows."""
+    if not isinstance(raw, dict):
+        return {}
+    clean = {}
+    if isinstance(raw.get("aggregators"), dict):
+        clean["aggregators"] = {k: bool(v) for k, v in raw["aggregators"].items() if k in feeds.ADSB_AGGREGATORS}
+    if isinstance(raw.get("local_clients"), int) and 0 <= raw["local_clients"] < 1000:
+        clean["local_clients"] = raw["local_clients"]
+    if isinstance(raw.get("sending"), list):
+        clean["sending"] = [s for s in raw["sending"] if s in feeds.AIS_SERVICES or s == "community"][:10]
+    return clean
+
+
 def handle_agent_message(ctx: Context, node_id: int, allowed: list[str], message: dict) -> None:
     kind = message.get("t")
     if kind == "status":
@@ -239,6 +253,7 @@ def handle_agent_message(ctx: Context, node_id: int, allowed: list[str], message
                     "state": str(status.get("state", ""))[:16], "error": str(status.get("error", ""))[:300],
                     "in_call": bool(status.get("in_call")), "call_started": status.get("call_started"),
                     "last_call_at": status.get("last_call_at"),
+                    "note": str(status.get("note") or "")[:300], "feeds": clean_feed_status(status.get("feeds")),
                 })
     elif kind == "measure_result":
         ctx.finish_measure(node_id, message)

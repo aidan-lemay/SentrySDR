@@ -248,6 +248,8 @@ class Context:
                         "gain_db": profile.gain_db if profile else source.gain_db,
                         "ppm": source.ppm, "volume_db": target.volume_db or 0,
                         "channels": target.acars_channels or [] if target.kind == "acars" else [],
+                        "feeds": target.feeds or {} if target.kind in ("adsb", "ais") else {},
+                        "feeder_uuid": source.feeder_uuid,
                     })
                 except pipelines.SpecError as exc:
                     log.error("recorder %s has an invalid configuration: %s", recorder.id, exc)

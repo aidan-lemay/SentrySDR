@@ -104,7 +104,8 @@ This can run alongside a proxy. Requests through the proxy still get Secure cook
 - **Secrets at rest:** TOTP seeds and upload API keys are encrypted with `secret.key` in the data folder. Back up that file with the database, and keep both private.
 - **Browser protections:** strict CSP, `HttpOnly` and `SameSite=Strict` cookies, and Host and Origin checks. tar1090 is the one exception: it needs inline scripts, so it gets a looser CSP on its own path.
 - **Radio tools:** run as argv lists, never through a shell, with all values validated first, including those arriving from the network. Decoders are started with no network options, so they open no ports.
-- **Outbound connections:** only the uploads you turn on, and the airframes.io feed for ACARS targets that have it on. That feed sends each message over UDP, with only acarsdec's own message fields and your station ID.
+- **Outbound connections:** only the uploads and feeds you turn on. Aggregator addresses are fixed in the code, so a master can switch a slave's feeds on or off but can't point them anywhere else. The airframes.io feed sends only acarsdec's own message fields and your station ID.
+- **Local data port:** the optional port for fr24feed and piaware is bound to 127.0.0.1 on the node with the SDR. readsb opens no other ports.
 - **SDRs:** only serials in `sdr.serials` are ever opened. Other dongles stay free for other software. Duplicate serials are refused; fix them with `rtl_eeprom -s`.
 - **Service:** runs unprivileged under a systemd sandbox, with only its data and log folders writable. If you move `recordings_dir` or `log_dir`, see [Storing recordings on another drive](#storing-recordings-on-another-drive).
 - **Encryption on the air:** encrypted digital traffic isn't decoded. Check the rules on recording and sharing radio traffic where you operate.
@@ -172,6 +173,21 @@ Messages appear on the **Messages** page, newest first, and update by themselves
 To feed [airframes.io](https://airframes.io), set a **Station ID** under **Admin > Settings**, for example `KE-KSEA-ACARS`: your initials, the nearest airport's ICAO code, then ACARS. Then tick **Feed messages to airframes.io** on the target. No account is needed. Messages are kept for 30 days by default, set under **Admin > Settings**. Messages from a slave are lost while its link to the master is down.
 
 acarsdec needs cJSON to build: `libcjson-dev` on Debian and Raspberry Pi OS, which `install.sh --with-decoders` installs.
+
+## Sharing ADS-B and AIS
+
+Turn sharing on per target, on the Targets page.
+
+**ADS-B aggregators:** ADS-B Exchange, airplanes.live, adsb.lol and adsb.fi. readsb connects out to each one, using the addresses from each service's own setup script. Each SDR has its own random ID, which the services use to tell feeders apart. The Sources page shows whether each one is connected; it checks every 10 seconds.
+
+**FlightRadar24 and FlightAware** need their own programs, `fr24feed` and `piaware`, installed on the machine with the ADS-B stick (the master or a slave). Tick **Offer data to fr24feed or piaware** on the ADS-B target, and choose a port (30005 is the usual one). SentrySDR then offers Beast data on `127.0.0.1` only. The Sources page shows how many programs are reading it.
+
+- **FlightAware:** install the `piaware` package with FlightAware's instructions, then run `sudo piaware-config receiver-type other`, `sudo piaware-config receiver-host 127.0.0.1` and `sudo piaware-config receiver-port 30005`, and restart piaware. Claim the feeder on FlightAware's site.
+- **FlightRadar24:** install `fr24feed` with FlightRadar24's instructions. In its sign-up, choose a Beast receiver over TCP (network), host `127.0.0.1`, port `30005`.
+- **Don't let either install its own decoder.** `dump1090-fa`, or a dump1090 that fr24feed sets up, would open an RTL-SDR itself and take a stick from SentrySDR. If one got installed, stop and disable it.
+- MLAT isn't set up by SentrySDR. Both programs do their own MLAT if you give them your antenna's location.
+
+**AIS:** aiscatcher.org's community feed is a single switch. MarineTraffic, AISHub and VesselFinder each give you a UDP host and port when you register a station; enter those on the target. UDP can't confirm delivery, so the Sources page only lists where data is being sent. Check the service's station page to confirm it's arriving.
 
 ## Tuning call detection
 

@@ -10,6 +10,7 @@ import sys
 from array import array
 from dataclasses import dataclass
 
+from . import feeds
 from .config import Config
 
 ANALOG = {"nfm", "am", "wfm"}
@@ -57,6 +58,8 @@ def sanitize_spec(spec: dict) -> dict:
             "ppm": int(spec.get("ppm", 0)),
             "volume_db": float(spec.get("volume_db") or 0),
             "channels": [int(hz) for hz in spec.get("channels") or []],
+            "feeds": spec.get("feeds") or {},
+            "feeder_uuid": feeds.valid_uuid(spec.get("feeder_uuid")),
         }
     except (KeyError, TypeError, ValueError) as exc:
         raise SpecError(f"bad assignment: {exc}") from exc
@@ -70,6 +73,10 @@ def sanitize_spec(spec: dict) -> dict:
             raise SpecError(problem)
     elif clean["channels"]:
         raise SpecError("only ACARS uses channels")
+    try:
+        clean["feeds"] = feeds.clean(clean["kind"], clean["feeds"])
+    except feeds.FeedError as exc:
+        raise SpecError(str(exc)) from exc
     if clean["modulation"] not in MODULATIONS:
         raise SpecError("bad modulation")
     if not FREQ_MIN_HZ <= clean["frequency_hz"] <= FREQ_MAX_HZ:
@@ -213,7 +220,7 @@ def acars_args(cfg: Config, index: int, spec: dict) -> list[str]:
 
 
 def readsb_args(cfg: Config, index: int, spec: dict, json_dir: str) -> list[str]:
-    # No --net options: readsb opens no listening ports.
+    # Networking only when feeding is on, and then outbound plus loopback only: see feeds.readsb_args.
     args = [
         cfg.binary("readsb") or "readsb", "--device-type", "rtlsdr", "--device", str(index),
         "--write-json", json_dir, "--write-json-every", "1", "--quiet",
@@ -222,7 +229,7 @@ def readsb_args(cfg: Config, index: int, spec: dict, json_dir: str) -> list[str]
         args += ["--gain", f"{spec['gain_db']:g}"]
     if spec.get("ppm"):
         args += ["--ppm", str(spec["ppm"])]
-    return args
+    return args + feeds.readsb_args(spec.get("feeds") or {}, spec.get("feeder_uuid"))
 
 
 def ais_args(cfg: Config, index: int, spec: dict) -> list[str]:
@@ -232,7 +239,7 @@ def ais_args(cfg: Config, index: int, spec: dict) -> list[str]:
         args += ["-p", str(spec["ppm"])]
     if spec.get("gain_db") is not None:
         args += ["-gr", "TUNER", f"{spec['gain_db']:g}"]
-    return args
+    return args + feeds.ais_args(spec.get("feeds") or {})
 
 
 def encode_args(cfg: Config, raw_path: str, rate: int, out_path: str) -> list[str]:

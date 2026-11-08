@@ -130,3 +130,8 @@ export const problemNote = (source, target) => {
   return found.length ? `, ${found.join(', ')}` : '';
 };
 export const formatRange = (low, high) => (low == null && high == null ? 'Not set' : `${low == null ? '?' : plainMHz(low)} to ${high == null ? '?' : plainMHz(high)} MHz`);
+
+// Feeding other services. Keep in step with sentrysdr/feeds.py.
+export const ADSB_AGGREGATORS = [['adsbx', 'ADS-B Exchange'], ['airplanes_live', 'airplanes.live'], ['adsb_lol', 'adsb.lol'], ['adsb_fi', 'adsb.fi']];
+export const AIS_SERVICES = [['marinetraffic', 'MarineTraffic'], ['aishub', 'AISHub'], ['vesselfinder', 'VesselFinder']];
+export const feedLabel = (key) => [...ADSB_AGGREGATORS, ...AIS_SERVICES, ['community', 'aiscatcher.org']].find(([id]) => id === key)?.[1] ?? key;

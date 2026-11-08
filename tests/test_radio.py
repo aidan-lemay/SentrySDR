@@ -16,7 +16,7 @@ import httpx
 import pytest
 from sqlalchemy import select
 
-from sentrysdr import capabilities, pipelines, schedule, sdr, uploaders
+from sentrysdr import capabilities, feeds, pipelines, schedule, sdr, uploaders
 from sentrysdr.context import BROADCASTIFY_RETRY_SECONDS, UPLOAD_MAX_ATTEMPTS
 from sentrysdr.engine import MeasureError, VolumeControl, merge_ais_message
 from sentrysdr.models import AcarsMessage, Antenna, BroadcastifySystem, Node, Recorder, Recording, SdrProfile, Source, Target, UploadJob, make_session_factory
@@ -1881,3 +1881,107 @@ def test_airframes_settings_saved(admin):
     assert reply.status_code == 200
     got = admin.get("/api/admin/settings").json()
     assert (got["airframes_station_id"], got["message_retention_days"]) == ("KE-KSEA-ACARS", "14")
+
+
+# --- ADS-B and AIS feeding ------------------------------------------------------------
+UUID = "0f6c4a8e-1b2d-4c3e-9f00-123456789abc"
+
+
+def test_readsb_feed_args_are_outbound_and_loopback_only():
+    args = feeds.readsb_args({"aggregators": ["adsb_lol", "adsbx"], "beast_port": 30005}, UUID)
+    assert args[:3] == ["--net", "--net-bind-address", "127.0.0.1"]
+    connectors = [args[i + 1] for i, a in enumerate(args) if a == "--net-connector"]
+    assert connectors == [
+        f"feed.adsb.lol,30004,beast_reduce_plus_out,in.adsb.lol,1337,uuid={UUID}",
+        "feed1.adsbexchange.com,30004,beast_reduce_out,feed2.adsbexchange.com,64004",
+    ]
+    assert args[args.index("--net-bo-port") + 1] == "30005" and args[args.index("--uuid") + 1] == UUID
+    for port_option in ("--net-ro-port", "--net-sbs-port", "--net-bi-port", "--net-ri-port", "--net-api-port"):
+        assert port_option not in args
+    assert feeds.readsb_args({}, UUID) == [] and feeds.readsb_args({"aggregators": []}, None) == []
+
+
+def test_readsb_args_without_feeds_has_no_networking():
+    cfg = SimpleNamespace(binary=lambda name: None)
+    args = pipelines.readsb_args(cfg, 0, {"feeds": {}}, "/tmp/x")
+    assert "--net" not in args
+    with_feed = pipelines.readsb_args(cfg, 0, {"feeds": {"aggregators": ["adsb_fi"]}, "feeder_uuid": UUID}, "/tmp/x")
+    assert "feed.adsb.fi,30004,beast_reduce_plus_out,feed.adsb.fi,64004" in with_feed
+
+
+def test_ais_feed_args():
+    cfg = SimpleNamespace(binary=lambda name: None)
+    spec = {"feeds": {"community": True, "udp": [{"service": "aishub", "host": "data.aishub.net", "port": 4321}]}}
+    args = pipelines.ais_args(cfg, 1, spec)
+    assert args[args.index("-u"):] == ["-u", "data.aishub.net", "4321", "-X"]
+
+
+@pytest.mark.parametrize("kind,raw,problem", [
+    ("adsb", {"aggregators": ["flightradar"]}, "Unknown aggregator"),
+    ("adsb", {"beast_port": 80}, "between 1025"),
+    ("adsb", {"beast_port": "x"}, "number"),
+    ("ais", {"udp": [{"service": "marinetraffic", "host": "evil host; rm", "port": 1}]}, "host name"),
+    ("ais", {"udp": [{"service": "nope", "host": "a.b", "port": 1}]}, "Unknown AIS"),
+    ("ais", {"udp": [{"service": "aishub", "host": "a.b", "port": 70000}]}, "between 1"),
+    ("ais", {"udp": [{"service": "aishub", "host": "a.b", "port": 1}] * 7}, "At most 6"),
+    ("audio", {"aggregators": ["adsbx"]}, "Only ADS-B and AIS"),
+    ("adsb", ["adsbx"], "object"),
+])
+def test_bad_feed_settings(kind, raw, problem):
+    with pytest.raises(feeds.FeedError, match=problem):
+        feeds.clean(kind, raw)
+
+
+def test_feed_settings_reach_the_spec_and_are_checked_again(ctx, admin):
+    source = make_source(admin)
+    body = {"name": "Planes", "kind": "adsb", "modulation": "adsb", "frequency_hz": 1_090_000_000,
+            "feeds": {"aggregators": ["adsbx", "adsb_fi", "adsbx"], "beast_port": 30005}}
+    made = admin.post("/api/targets", json=body)
+    assert made.status_code == 201 and made.json()["feeds"] == {"aggregators": ["adsb_fi", "adsbx"], "beast_port": 30005}
+    admin.post(f"/api/sources/{source}/assign", json={"target_id": made.json()["id"]}).raise_for_status()
+    spec = ctx.assignments()[ctx.local_node_id]["SER1"]
+    assert spec["feeds"]["aggregators"] == ["adsb_fi", "adsbx"] and feeds.valid_uuid(spec["feeder_uuid"])
+    assert pipelines.sanitize_spec(spec)["feeds"] == spec["feeds"]
+    with pytest.raises(pipelines.SpecError):
+        pipelines.sanitize_spec({**spec, "feeds": {"aggregators": ["attacker"]}})  # what a slave would refuse
+    assert pipelines.sanitize_spec({**spec, "feeder_uuid": "not-a-uuid"})["feeder_uuid"] is None
+    voice = admin.post("/api/targets", json={"name": "V", "frequency_hz": 444_000_000, "feeds": {"aggregators": ["adsbx"]}})
+    assert voice.status_code == 422
+
+
+def test_each_source_has_its_own_stable_feeder_id(ctx, admin):
+    first, second = make_source(admin), make_source(admin, "SER2", "Two")
+    with ctx.db() as session:
+        ids = [session.get(Source, first).feeder_uuid, session.get(Source, second).feeder_uuid]
+    assert all(feeds.valid_uuid(i) for i in ids) and ids[0] != ids[1]
+    admin.put(f"/api/sources/{first}", json={"serial": "SER1", "name": "Renamed"}).raise_for_status()
+    with ctx.db() as session:
+        assert session.get(Source, first).feeder_uuid == ids[0]
+
+
+def test_older_sources_get_a_feeder_id(tmp_path):
+    db = tmp_path / "f.db"
+    make_session_factory(db)
+    connection = sqlite3.connect(db)
+    connection.execute("INSERT INTO nodes (id, name, is_local, status, serials, created_at) VALUES (1, 'n', 1, 'active', '[]', 0)")
+    connection.execute("INSERT INTO sources (id, node_id, serial, name, description, antenna, ppm) VALUES (1, 1, 'S', 'S', '', '', 0)")
+    connection.commit()
+    connection.close()
+    with make_session_factory(db)() as session:
+        assert feeds.valid_uuid(session.get(Source, 1).feeder_uuid)
+
+
+def test_slave_status_keeps_note_and_feeds(ctx):
+    from sentrysdr.web.routes_nodes import handle_agent_message
+    handle_agent_message(ctx, 7, ["SER1"], {"t": "status", "sources": {"SER1": {
+        "state": "listening", "note": "USB errors on start", "feeds": {
+            "aggregators": {"adsbx": True, "evil": True}, "local_clients": 2, "sending": ["aishub", "x"]}}}})
+    status = ctx.status[(7, "SER1")]
+    assert status["note"] == "USB errors on start"
+    assert status["feeds"] == {"aggregators": {"adsbx": True}, "local_clients": 2, "sending": ["aishub"]}
+
+
+def test_ui_lists_the_same_feed_services():
+    lib = (Path(__file__).resolve().parent.parent / "web" / "src" / "lib.js").read_text()
+    for key in [*feeds.ADSB_AGGREGATORS, *feeds.AIS_SERVICES]:
+        assert f"['{key}'," in lib

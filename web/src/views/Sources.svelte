@@ -1,6 +1,6 @@
 <script>
   import { onMount } from 'svelte';
-  import { api, DEFAULT_GAIN_DB, formatMHz, formatTime, formatDuration, nearestStep, problemNote, STATE_LABELS, stickProblems } from '../lib.js';
+  import { api, DEFAULT_GAIN_DB, feedLabel, formatMHz, formatTime, formatDuration, nearestStep, problemNote, STATE_LABELS, stickProblems } from '../lib.js';
   import Notice from '../Notice.svelte';
   import { NOTICE_MS } from '../notice.svelte.js';
   import GainField from '../GainField.svelte';
@@ -211,6 +211,11 @@
                 {#if source.locked}<br /><span class="st-warn">Locked</span>{/if}
                 {#if source.error}<br /><span class="st-bad small">{source.error}</span>{/if}
                 {#if source.note}<br /><span class="st-warn small">{source.note}</span>{/if}
+                {#if source.feeds?.aggregators && Object.keys(source.feeds.aggregators).length}
+                  <br /><span class="small">Feeding: {#each Object.entries(source.feeds.aggregators) as [key, up], i (key)}{i ? ', ' : ''}<span class={up ? 'st-ok' : 'st-warn'}>{feedLabel(key)} {up ? 'connected' : 'not connected'}</span>{/each}</span>
+                {/if}
+                {#if source.feeds?.local_clients != null}<br /><span class="small">Local port: {source.feeds.local_clients} program{source.feeds.local_clients === 1 ? '' : 's'} reading</span>{/if}
+                {#if source.feeds?.sending?.length}<br /><span class="small">Sending to {source.feeds.sending.map(feedLabel).join(', ')}</span>{/if}
               </div>
             </td>
             <td data-label="Last activity"><span class="small">{formatTime(source.last_call_at)}</span></td>

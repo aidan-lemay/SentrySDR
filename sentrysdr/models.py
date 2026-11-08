@@ -106,6 +106,7 @@ class Source(Base):
     cap_min_hz: Mapped[int | None] = mapped_column(nullable=True)
     cap_max_hz: Mapped[int | None] = mapped_column(nullable=True)
     uses: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    feeder_uuid: Mapped[str | None] = mapped_column(String(36), nullable=True)  # identifies this receiver to aggregators
     __table_args__ = (Index("uq_source_node_serial", "node_id", "serial", unique=True),)
 
 
@@ -144,6 +145,7 @@ class Target(Base):
     broadcastify_slot: Mapped[int | None] = mapped_column(nullable=True)  # the node's frequency slot
     acars_channels: Mapped[list | None] = mapped_column(JSON, nullable=True)  # Hz; frequency_hz is the lowest
     airframes_enabled: Mapped[bool | None] = mapped_column(nullable=True)  # feed messages to airframes.io
+    feeds: Mapped[dict | None] = mapped_column(JSON, nullable=True)  # ADS-B and AIS sharing, see feeds.clean
 
 
 class BroadcastifySystem(Base):
@@ -319,6 +321,14 @@ def _drop_retired_uses(engine) -> None:
                 connection.execute(text("UPDATE sources SET uses = :u WHERE id = :s"), {"u": json.dumps(kept), "s": source_id})
 
 
+def _fill_feeder_uuids(engine) -> None:
+    """Each receiver gets a stable random ID, which aggregators use to tell feeders apart."""
+    import uuid
+    with engine.begin() as connection:
+        for (source_id,) in connection.execute(text("SELECT id FROM sources WHERE feeder_uuid IS NULL")).all():
+            connection.execute(text("UPDATE sources SET feeder_uuid = :u WHERE id = :s"), {"u": str(uuid.uuid4()), "s": source_id})
+
+
 def make_session_factory(db_path: Path):
     db_path.parent.mkdir(parents=True, exist_ok=True)
     engine = create_engine(
@@ -339,6 +349,7 @@ def make_session_factory(db_path: Path):
     _retire_lock_passwords(engine)
     _convert_source_antennas(engine)
     _drop_retired_uses(engine)
+    _fill_feeder_uuids(engine)
     try:
         db_path.chmod(0o600)
     except OSError:

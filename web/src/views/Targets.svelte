@@ -1,6 +1,6 @@
 <script>
   import { onMount } from 'svelte';
-  import { api, formatMHz, MODULATIONS } from '../lib.js';
+  import { ADSB_AGGREGATORS, AIS_SERVICES, api, feedLabel, formatMHz, MODULATIONS } from '../lib.js';
   import Notice from '../Notice.svelte';
   import { clearAfter } from '../notice.svelte.js';
 
@@ -8,8 +8,33 @@
     id: null, name: '', kind: 'audio', mhz: '', modulation: 'nfm', squelch: 50, volume_db: 0,
     clearcut_enabled: false, clearcut_system: '', clearcut_id: '', rdio_enabled: false, rdio_system: '', rdio_talkgroup: '',
     broadcastify_enabled: false, broadcastify_system_ref: '', broadcastify_slot: '',
-    channels: [], newChannel: '', airframes_enabled: false,
+    channels: [], newChannel: '', airframes_enabled: false, feeds: blankFeeds(),
   });
+  function blankFeeds(saved = {}) {
+    const udp = Object.fromEntries(AIS_SERVICES.map(([id]) => {
+      const found = (saved.udp ?? []).find((d) => d.service === id);
+      return [id, { on: Boolean(found), host: found?.host ?? '', port: found?.port ?? '' }];
+    }));
+    return {
+      aggregators: [...(saved.aggregators ?? [])], beastOn: saved.beast_port != null, beastPort: saved.beast_port ?? 30005,
+      community: Boolean(saved.community), udp,
+    };
+  }
+  function feedsBody(kind, feeds) {
+    if (kind === 'adsb') return { aggregators: feeds.aggregators, beast_port: feeds.beastOn ? Number(feeds.beastPort) : null };
+    if (kind === 'ais') {
+      return {
+        community: feeds.community,
+        udp: AIS_SERVICES.filter(([id]) => feeds.udp[id].on).map(([id]) => ({ service: id, host: feeds.udp[id].host.trim(), port: Number(feeds.udp[id].port) })),
+      };
+    }
+    return null;
+  }
+  function feedSummary(target) {
+    const f = target.feeds ?? {};
+    return [...(f.aggregators ?? []), ...(f.udp ?? []).map((d) => d.service), ...(f.community ? ['community'] : [])].map(feedLabel)
+      .concat(f.beast_port ? [`local port ${f.beast_port}`] : []);
+  }
   // The usual channels. North America's fifth, 129.125, doesn't fit on the same stick.
   const PRESETS = {
     na: ['North America', [130.025, 130.45, 131.125, 131.55]],
@@ -82,6 +107,7 @@
       frequency_hz: form.kind === 'acars' ? channelsHz[0] : Math.round(Number(fixed ? fixed.mhz : form.mhz) * 1e6),
       modulation: form.kind === 'acars' ? 'acars' : fixed ? fixed.modulation : form.modulation,
       acars_channels: channelsHz, airframes_enabled: form.kind === 'acars' && form.airframes_enabled,
+      feeds: feedsBody(form.kind, form.feeds),
       squelch: Number(form.squelch), volume_db: Number(form.volume_db || 0),
       clearcut_enabled: form.clearcut_enabled, clearcut_system: form.clearcut_system || null, clearcut_id: optionalInt(form.clearcut_id),
       rdio_enabled: form.rdio_enabled, rdio_system: optionalInt(form.rdio_system), rdio_talkgroup: optionalInt(form.rdio_talkgroup),
@@ -106,6 +132,7 @@
       rdio_system: target.rdio_system ?? '', rdio_talkgroup: target.rdio_talkgroup ?? '', volume_db: target.volume_db ?? 0,
       broadcastify_enabled: Boolean(target.broadcastify_enabled), broadcastify_system_ref: target.broadcastify_system_ref ?? '', broadcastify_slot: target.broadcastify_slot ?? '',
       channels: (target.acars_channels ?? []).map((hz) => +(hz / 1e6).toFixed(4)), newChannel: '', airframes_enabled: Boolean(target.airframes_enabled),
+      feeds: blankFeeds(target.feeds ?? {}),
     };
     channelProblem = '';
     document.getElementById('target-form')?.scrollIntoView();
@@ -129,7 +156,7 @@
 
 <div class="box">
   <table class="table">
-    <thead><tr><th>Name</th><th>Frequency</th><th>Mode</th><th>Squelch</th><th>Uploads to</th><th>Actions</th></tr></thead>
+    <thead><tr><th>Name</th><th>Frequency</th><th>Mode</th><th>Squelch</th><th>Sends to</th><th>Actions</th></tr></thead>
     <tbody>
       {#each targets as target (target.id)}
         <tr>
@@ -137,7 +164,7 @@
           <td data-label="Frequency"><span class="mono">{target.kind === 'acars' ? (target.acars_channels ?? []).map((hz) => +(hz / 1e6).toFixed(4)).join(', ') + ' MHz' : formatMHz(target.frequency_hz)}</span></td>
           <td data-label="Mode"><span>{target.modulation.toUpperCase()}</span></td>
           <td data-label="Squelch"><span class="mono">{target.kind === 'audio' ? target.squelch || 'Off' : 'n/a'}</span></td>
-          <td data-label="Uploads to"><span>{[target.clearcut_enabled && 'ClearCut', target.rdio_enabled && 'RDIO', target.broadcastify_enabled && 'Broadcastify', target.airframes_enabled && 'airframes.io'].filter(Boolean).join(', ') || 'None'}</span></td>
+          <td data-label="Sends to"><span>{[target.clearcut_enabled && 'ClearCut', target.rdio_enabled && 'RDIO', target.broadcastify_enabled && 'Broadcastify', target.airframes_enabled && 'airframes.io', ...feedSummary(target)].filter(Boolean).join(', ') || 'None'}</span></td>
           <td>
             <div class="buttons" style="margin:0">
               <button onclick={() => edit(target)}>Edit</button>
@@ -164,6 +191,36 @@
         <option value="acars">ACARS aircraft messages</option>
       </select>
     </label>
+    {#if form.kind === 'adsb'}
+      <div class="field top"><span>Share with</span>
+        <div class="flags">
+          {#each ADSB_AGGREGATORS as [id, label] (id)}<label class="tick"><input type="checkbox" value={id} bind:group={form.feeds.aggregators} /> {label}</label>{/each}
+        </div>
+      </div>
+      <p class="small dim form-buttons">readsb connects out to each one. Nothing is opened to the network. Each SDR is identified by its own random ID.</p>
+      <div class="field"><span>FlightRadar24, FlightAware</span><label class="tick"><input type="checkbox" bind:checked={form.feeds.beastOn} /> Offer data to fr24feed or piaware</label></div>
+      {#if form.feeds.beastOn}
+        <label class="field"><span>Local port</span>
+          <input class="mono" type="number" inputmode="numeric" min="1025" max="65535" bind:value={form.feeds.beastPort} required />
+          <span class="hint">Beast data on 127.0.0.1 only, on the machine with the SDR. Point fr24feed or piaware at 127.0.0.1 and this port. See the README for setup.</span>
+        </label>
+      {/if}
+    {/if}
+    {#if form.kind === 'ais'}
+      <div class="field"><span>aiscatcher.org</span><label class="tick"><input type="checkbox" bind:checked={form.feeds.community} /> Share with the aiscatcher.org community feed</label></div>
+      {#each AIS_SERVICES as [id, label] (id)}
+        <div class="field"><span>{label}</span><label class="tick"><input type="checkbox" bind:checked={form.feeds.udp[id].on} /> Send to {label}</label></div>
+        {#if form.feeds.udp[id].on}
+          <div class="field"><span>{label} address</span>
+            <div class="pair">
+              <input class="mono" aria-label={`${label} host`} placeholder="Host or IP" bind:value={form.feeds.udp[id].host} required maxlength="253" />
+              <input class="mono" type="number" inputmode="numeric" min="1" max="65535" aria-label={`${label} port`} placeholder="Port" bind:value={form.feeds.udp[id].port} required style="max-width:7rem" />
+            </div>
+            <span class="hint">The UDP address {label} gives you when you register a station.</span>
+          </div>
+        {/if}
+      {/each}
+    {/if}
     {#if form.kind === 'acars'}
       <div class="field top"><span>Channels (MHz)</span>
         <div>

@@ -1010,3 +1010,25 @@ async def test_acars_worker_passes_messages_on(tmp_path):
     assert kind == "acars" and serial == "SER1" and data["target_id"] == 1 and data["message"]["tail"] == ".N123UA"
     args = (bins / "acarsdec.args").read_text()
     assert args == "--output json:file:path=- --rtlsdr 0 -g 40.2 130.025 131.550"
+
+
+# --- feed connection checks -------------------------------------------------------
+def test_established_connections_are_found_and_sorted(tmp_path):
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen()
+    port = server.getsockname()[1]
+    client = socket.create_connection(("127.0.0.1", port))
+    accepted, _ = server.accept()
+    try:
+        cfg = make_config(tmp_path)
+        sup = supervisor(cfg, [])
+        worker = sup.workers["SER1"]
+        # In this process the client looks like an outbound feed, and the accepted side like a local reader.
+        worker._check_feeds(os.getpid(), {"adsbx": {"127.0.0.1"}, "adsb_fi": {"192.0.2.1"}}, port)
+        assert worker.feed_status["aggregators"] == {"adsbx": True, "adsb_fi": False}
+        assert worker.feed_status["local_clients"] == 1
+        assert worker.snapshot()["feeds"] == worker.feed_status
+    finally:
+        for s in (client, accepted, server):
+            s.close()

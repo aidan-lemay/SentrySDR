@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import uuid
 import time
 from datetime import datetime
 from pathlib import Path
@@ -12,7 +13,7 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 
-from .. import capabilities, pipelines, schedule
+from .. import capabilities, feeds, pipelines, schedule
 from ..config import SERIAL_RE
 from ..context import Context
 from ..engine import MeasureError
@@ -179,7 +180,7 @@ def _source_view(ctx: Context, db, source: Source, winners: dict, recorders: lis
         "cap_min_hz": source.cap_min_hz, "cap_max_hz": source.cap_max_hz, "uses": source.uses or [],
         "state": status.get("state", "offline" if not online else "idle"),
         "error": status.get("error", ""), "in_call": status.get("in_call", False),
-        "note": status.get("note", ""),
+        "note": status.get("note", ""), "feeds": status.get("feeds") or {},
         "call_started": status.get("call_started"), "last_call_at": status.get("last_call_at"),
         "locked": bool(base and base.locked),
         "base_recorder_id": base.id if base else None,
@@ -275,7 +276,7 @@ def create_source(body: SourceBody, request: Request, admin: User = Depends(admi
         raise HTTPException(409, "That SDR is already defined")
     values = body.model_dump()
     values["node_id"] = node.id
-    source = Source(**values)
+    source = Source(**values, feeder_uuid=str(uuid.uuid4()))
     db.add(source)
     db.commit()
     ctx.audit("source.created", user=admin, ip=ip_of(request), target=source.name)
@@ -334,6 +335,7 @@ class TargetBody(BaseModel):
     broadcastify_slot: int | None = Field(default=None, ge=1)
     acars_channels: list[int] | None = Field(default_factory=list, max_length=pipelines.ACARS_MAX_CHANNELS)
     airframes_enabled: bool = False
+    feeds: dict | None = None
 
 
 def _validate_target(body: TargetBody, db, target_id: int | None = None) -> None:
@@ -350,6 +352,10 @@ def _validate_target(body: TargetBody, db, target_id: int | None = None) -> None
         if body.acars_channels or body.airframes_enabled:  # None is fine too
             raise HTTPException(422, "Only ACARS targets have channels or feed airframes.io")
         body.acars_channels = None
+    try:
+        body.feeds = feeds.clean(body.kind, body.feeds) or None
+    except feeds.FeedError as exc:
+        raise HTTPException(422, str(exc)) from None
     if body.clearcut_enabled and (body.clearcut_id is None or not body.clearcut_system):
         raise HTTPException(422, "ClearCut upload needs a system ID and a talkgroup")
     if body.rdio_enabled and (body.rdio_system is None or body.rdio_talkgroup is None):

@@ -20,7 +20,7 @@ from array import array
 from pathlib import Path
 from typing import Awaitable, Callable
 
-from . import acars, capabilities, pipelines, sdr
+from . import acars, capabilities, feeds, pipelines, sdr
 from .config import Config
 
 log = logging.getLogger("sentrysdr.engine")
@@ -34,6 +34,7 @@ SQUELCH_STUCK_WARNING = "Squelch has been open for over 10 minutes. If nothing i
 MEASURE_SECONDS = 6.0
 MEASURE_ATTEMPTS = 3
 DETECT_SECONDS = 8.0
+FEED_CHECK_EVERY = 5  # ADS-B loop turns (2 s each) between feed connection checks
 # Signs that a stick didn't open cleanly: USB timeouts (-7), librtlsdr resetting it,
 # or a setup step failing. Seen on real hardware after a tool was killed without
 # closing the stick. It may then send nothing, which looks the same as a closed squelch.
@@ -220,6 +221,7 @@ class Worker:
         self.call_started: float | None = None
         self.last_call_at: float | None = None
         self.note = ""  # an informational warning that outlives the error field
+        self.feed_status: dict = {}
         self.note_at: float | None = None
         self._reset_seen = asyncio.Event()
         self._last_reset_restart = -RESET_RESTART_GAP
@@ -232,6 +234,7 @@ class Worker:
             "call_started": self.call_started,
             "last_call_at": self.last_call_at,
             "note": self.note,
+            "feeds": self.feed_status,
             "note_at": self.note_at,
             "recorder_id": self.spec["recorder_id"] if self.spec else None,
             "target_id": self.spec["target_id"] if self.spec else None,
@@ -407,6 +410,7 @@ class Worker:
         delay = RESTART_MIN
         pipeline = {"adsb": self._run_adsb, "ais": self._run_ais, "acars": self._run_acars}.get(spec["kind"], self._run_audio)
         self._set_note("")  # a new assignment starts with a clean slate
+        self.feed_status = {}
         while True:
             started = time.monotonic()
             error = ""
@@ -426,7 +430,8 @@ class Worker:
             except asyncio.CancelledError:
                 raise
             except FileNotFoundError as exc:
-                error = f"tool not installed: {exc.filename}"
+                # The filename can be missing here, so the whole message names the tool better.
+                error = f"tool not installed: {exc.filename or exc}"[:300]
             except Exception as exc:  # keep supervising through any fault
                 log.exception("[%s] pipeline failure", self.serial)
                 error = str(exc)[:300]
@@ -537,12 +542,19 @@ class Worker:
         reader = asyncio.create_task(_log_stderr(self.serial, proc.stderr, tail, self._on_reset))
         path = Path(json_dir) / "aircraft.json"
         self._publish("listening", "")
+        settings = spec.get("feeds") or {}
+        addresses = {key: await asyncio.to_thread(feeds.resolve, feeds.aggregator_hosts(key))
+                     for key in settings.get("aggregators") or []}
+        checks = 0
         try:
             while proc.returncode is None:
                 try:
                     await asyncio.wait_for(proc.wait(), 2.0)
                 except asyncio.TimeoutError:
                     pass
+                if (addresses or settings.get("beast_port")) and checks % FEED_CHECK_EVERY == 0:
+                    self._check_feeds(proc.pid, addresses, settings.get("beast_port"))
+                checks += 1
                 with contextlib.suppress(OSError, ValueError):
                     data = json.loads(await asyncio.to_thread(path.read_text))
                     self.sup.tracks("adsb", self.serial, {"aircraft": data.get("aircraft", [])})
@@ -581,6 +593,17 @@ class Worker:
             await stop_process(proc)
             reader.cancel()
 
+    def _check_feeds(self, pid: int, addresses: dict[str, set[str]], beast_port: int | None) -> None:
+        """Which aggregators readsb is connected to, and how many local programs read its Beast port."""
+        connections = feeds.established(pid)
+        remotes = {remote[0] for local, remote in connections if local[1] != beast_port}
+        status = {"aggregators": {key: bool(found & remotes) for key, found in addresses.items()}}
+        if beast_port:
+            status["local_clients"] = sum(1 for local, _ in connections if local[1] == beast_port)
+        if status != self.feed_status:
+            self.feed_status = status
+            self._publish()
+
     async def _run_ais(self, index: int, spec: dict) -> str:
         tail: list[str] = []
         proc = await asyncio.create_subprocess_exec(
@@ -588,6 +611,10 @@ class Worker:
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=self.cfg.tool_env(),
         )
         reader = asyncio.create_task(_log_stderr(self.serial, proc.stderr, tail, self._on_reset))
+        settings = spec.get("feeds") or {}
+        if settings.get("udp") or settings.get("community"):
+            # UDP has no connection to check, so this only says what is being sent.
+            self.feed_status = {"sending": [d["service"] for d in settings.get("udp") or []] + (["community"] if settings.get("community") else [])}
         vessels: dict[str, dict] = {}
         last_push = 0.0
         self._publish("listening", "")
