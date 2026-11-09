@@ -47,7 +47,8 @@ USB_FAULT_MARKERS = ("failed with -7", "Resetting device", "Failed to set")
 EXIT_MARKERS = ("User cancel", "Signal caught")
 RESET_SETTLE_SECONDS = 3.0
 RESET_RESTART_GAP = 60.0  # at most one automatic restart a minute, so a stick that always resets can't loop
-RADIO_KEYS = ("kind", "frequency_hz", "modulation", "squelch", "gain_db", "ppm")
+# Changing any of these restarts the tool: they are read when it starts. Volume is read live, and names are only labels.
+RADIO_KEYS = ("kind", "frequency_hz", "modulation", "squelch", "gain_db", "ppm", "channels", "feeds", "feeder_uuid", "rtl_tcp_port")
 
 CallSink = Callable[[dict, Path], Awaitable[None]]
 PcmSink = Callable[[str, bytes, int], None]

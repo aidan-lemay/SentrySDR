@@ -223,6 +223,32 @@ async def test_adsb_pipeline_reads_written_json(tmp_path):
     assert tracks[0][2]["aircraft"][0]["hex"] == "abc123"
 
 
+async def test_turning_on_a_feed_restarts_readsb_with_it(tmp_path):
+    """Ticking the local data port on an ADS-B target that was already running used to change nothing until a restart."""
+    bins = tmp_path / "bin"
+    runs = tmp_path / "runs"
+    install_tool(bins, "readsb", textwrap.dedent(f"""\
+        #!/usr/bin/env python3
+        import sys, time
+        with open({str(runs)!r}, "a") as f:
+            f.write(" ".join(sys.argv[1:]) + "\\n")
+        time.sleep(60)
+        """))
+    sup = supervisor(make_config(tmp_path, bin_dirs=[bins]), [])
+    adsb = dict(kind="adsb", modulation="adsb", frequency_hz=1_090_000_000)
+    try:
+        await sup.apply({"SER1": spec(**adsb)})
+        assert await wait_for(lambda: runs.exists() and runs.read_text().count("\n") == 1)
+        await sup.apply({"SER1": spec(**adsb, feeds={"beast_port": 30005})})
+        assert await wait_for(lambda: runs.read_text().count("\n") == 2)
+        assert "--net-bo-port 30005" in runs.read_text().splitlines()[-1]
+        await sup.apply({"SER1": spec(**adsb, feeds={"beast_port": 30005}, recorder_name="renamed")})
+        await asyncio.sleep(1.5)
+        assert runs.read_text().count("\n") == 2  # a new name alone still doesn't restart it
+    finally:
+        await sup.shutdown()
+
+
 # --- PCM framing -----------------------------------------------------------
 def test_framer_never_splits_a_sample():
     framer = PcmFramer()
