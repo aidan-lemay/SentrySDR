@@ -1,5 +1,7 @@
 <script>
   import { onMount, untrack } from 'svelte';
+  import NowPlaying from '../NowPlaying.svelte';
+  import { CallPlayer } from '../player.svelte.js';
   import { api, formatMHz, formatTime, formatDuration, formatSize } from '../lib.js';
 
   let { user, route } = $props();
@@ -16,6 +18,7 @@
   let error = $state('');
   let loaded = $state(false);
   let transcribing = $state({});
+  const player = new CallPlayer();
   let requested = $state({});
 
   const sourceFilter = $derived(new URLSearchParams(route.split('?')[1] ?? '').get('source_id'));
@@ -38,6 +41,7 @@
       if (mine !== generation) return;  // a newer search or page has been asked for
       items = reply.items;
       total = reply.total;
+      player.offer(reply.items);
       if (loadFailed) error = '';  // a failed action's error stays until the next action
       loadFailed = false;
     } catch (failure) {
@@ -80,8 +84,16 @@
 
   onMount(() => {
     const timer = setInterval(poll, 5000);
-    return () => clearInterval(timer);
+    return () => {
+      clearInterval(timer);
+      player.stop();  // leaving the page stops autoplay
+    };
   });
+
+  function toggleAutoplay() {
+    player.toggle();
+    if (player.on && offset !== 0) page(-offset);  // new calls arrive on the first page
+  }
 
   function page(delta) {
     offset = Math.max(0, offset + delta);
@@ -144,6 +156,7 @@
       <input type="search" bind:value={search} aria-label="Search recordings" placeholder="Target, source or transcript" />
       <button class="main">Search</button>
     </div>
+    <label class="tick small"><input type="checkbox" checked={player.on} onchange={toggleAutoplay} /> Autoplay new calls as they finish, matching this search</label>
     <details>
       <summary class="small">Date and other filters</summary>
       <label class="field"><span>From</span><input type="datetime-local" bind:value={start} /></label>
@@ -152,6 +165,8 @@
     </details>
   </div>
 </form>
+
+<NowPlaying {player} />
 
 <div class="box">
   {#each items as call (call.id)}

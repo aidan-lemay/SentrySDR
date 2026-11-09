@@ -217,6 +217,14 @@ Both work on slaves, need the slave to be online and running this version, and a
 
 A stick that stays connected but stops working may not show a fault, because it looks the same as a closed squelch. Try **Restart** first.
 
+## Listening
+
+- **Live:** **Listen** on the Sources page plays an SDR as it hears it.
+- **Autoplay:** tick **Autoplay new calls** on the Recordings page, or in an SDR's **Calls** list on the Sources page, and each new call plays once it's finished, one after another. On the Recordings page it follows the current search. Untick it, or leave the page, and it stops.
+- **Scanner:** the Scanner page plays new calls from the channels you tick, like a scanner. **Hold** stays on the channel that's playing, **Skip** moves to the next call, and **Just played** lists the last ten. Your channels are remembered in that browser.
+
+Only calls that finish after you start are played, never a backlog. Browsers only play sound after a click on the page, so autoplay starts from the tick or **Start scanning**; if one still blocks it, select **Play** once.
+
 ## Schedules
 
 On the Schedule page, a schedule puts an SDR on a target for a while. It **repeats every week** on chosen days and times, or runs **once** between two dates and times, such as 9:00 to 11:00 on 22 November. One-off schedules can last up to 31 days, and stay listed as finished afterwards. Times are in the master's time zone (`server.timezone`), whatever the browser's is.

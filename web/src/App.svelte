@@ -9,6 +9,7 @@
   import Targets from './views/Targets.svelte';
   import Maps from './views/Maps.svelte';
   import Messages from './views/Messages.svelte';
+  import Scanner from './views/Scanner.svelte';
   import Account from './views/Account.svelte';
   import Admin from './views/Admin.svelte';
 
@@ -23,6 +24,7 @@
     { id: 'sources', label: 'Sources' },
     { id: 'schedule', label: 'Schedule' },
     { id: 'recordings', label: 'Recordings', show: can('listen_recordings') },
+    { id: 'scanner', label: 'Scanner', show: can('listen_recordings') },
     { id: 'targets', label: 'Targets', show: can('manage_targets') },
     { id: 'maps', label: 'Maps', show: can('maps') },
     { id: 'messages', label: 'Messages', show: can('maps') },
@@ -98,6 +100,8 @@
       <Targets {user} />
     {:else if view === 'maps'}
       <Maps {user} />
+    {:else if view === 'scanner'}
+      <Scanner />
     {:else if view === 'messages'}
       <Messages {route} />
     {:else if view === 'account'}

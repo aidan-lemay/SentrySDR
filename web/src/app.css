@@ -96,6 +96,8 @@ main { padding: .6rem; max-width: 1100px; margin: 0 auto; }
 .warning-list { margin: .4rem 0 0; padding-left: 1.2rem; }
 .warning-list li { margin: .2rem 0; }
 .warning-list a, .warning-one { color: inherit; }
+.now-playing { position: sticky; top: env(safe-area-inset-top, 0px); z-index: 5; background: var(--box); border: 2px solid var(--ink); padding: .5rem .6rem; margin-bottom: .75rem; }
+.now-playing .buttons { margin-bottom: 0; }
 .copyable { user-select: all; overflow-wrap: anywhere; }
 .secret { font-family: Consolas, Menlo, monospace; overflow-wrap: anywhere; user-select: all; background: var(--page); border: 1px solid var(--rule); padding: .4rem; margin-top: .3rem; }
 

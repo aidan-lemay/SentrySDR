@@ -2369,3 +2369,17 @@ def test_a_schedule_that_ended_while_down_still_keeps(ctx, admin):
         session.commit()
     assert ctx.track_schedule_ends() == ["Source 1: Event"]
     assert ctx.track_schedule_ends() == []  # only once
+
+
+# --- playing calls as they arrive ------------------------------------------------------------
+def test_recordings_for_a_player(ctx, listener):
+    now_ = time.time()
+    with ctx.db() as session:
+        for i, (target, ended) in enumerate(((1, now_ - 100), (2, now_ - 50), (1, now_ - 10), (3, now_ - 5))):
+            session.add(Recording(id=str(uuid.uuid4()), target_id=target, target_name=f"T{target}", started_at=ended - 30 if i != 2 else now_ - 400,
+                                  ended_at=ended, duration=5, rel_path="x.mp3"))
+        session.commit()
+    items = listener.get(f"/api/recordings?targets=1,2&ended_after={now_ - 60}").json()["items"]
+    # Oldest first, and a long call that started long ago but just ended is included.
+    assert [(i["target_name"], round(now_ - i["ended_at"])) for i in items] == [("T2", 50), ("T1", 10)]
+    assert listener.get("/api/recordings?targets=1;DROP").status_code == 422

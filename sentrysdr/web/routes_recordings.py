@@ -42,6 +42,8 @@ def list_recordings(
     search: str | None = Query(default=None, max_length=120),
     source_id: int | None = None, target_id: int | None = None,
     start: float | None = None, end: float | None = None, protected: bool | None = None,
+    targets: str | None = Query(default=None, max_length=600, pattern=r"^\d+(,\d+){0,49}$"),
+    ended_after: float | None = None,  # for players: calls finished since then, oldest first
     limit: int = Query(default=50, ge=1, le=200), offset: int = Query(default=0, ge=0),
     _user: User = Depends(require("listen_recordings")), db=Depends(get_db),
 ):
@@ -62,10 +64,13 @@ def list_recordings(
         conditions.append(Recording.started_at <= end)
     if protected is not None:
         conditions.append(Recording.protected.is_(protected))
+    if targets:
+        conditions.append(Recording.target_id.in_([int(t) for t in targets.split(",")]))
+    if ended_after is not None:
+        conditions.append(Recording.ended_at > ended_after)
+    order = (Recording.ended_at.asc(),) if ended_after is not None else (Recording.started_at.desc(),)
     total = db.scalar(select(func.count()).select_from(Recording).where(*conditions))
-    rows = list(db.scalars(
-        select(Recording).where(*conditions).order_by(Recording.started_at.desc()).limit(limit).offset(offset)
-    ))
+    rows = list(db.scalars(select(Recording).where(*conditions).order_by(*order).limit(limit).offset(offset)))
     jobs: dict[str, list[UploadJob]] = {}
     if rows:
         for job in db.scalars(select(UploadJob).where(UploadJob.recording_id.in_([r.id for r in rows]))):
