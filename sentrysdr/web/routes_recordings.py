@@ -50,6 +50,7 @@ def list_recordings(
     targets: str | None = Query(default=None, max_length=600, pattern=r"^\d+(,\d+){0,49}$"),
     ended_after: float | None = None,  # for players: calls finished since then, oldest first
     important: bool = False,  # marked important, or matching this user's keywords
+    call: str | None = Query(default=None, max_length=36, pattern=r"^[0-9a-f-]{36}$"),  # one call, as linked from an alert email
     limit: int = Query(default=50, ge=1, le=200), offset: int = Query(default=0, ge=0),
     user: User = Depends(require("listen_recordings")), db=Depends(get_db),
 ):
@@ -63,6 +64,8 @@ def list_recordings(
             Recording.target_name.like(pattern, escape="\\"), Recording.source_name.like(pattern, escape="\\"),
             Recording.recorder_name.like(pattern, escape="\\"), Recording.transcript.like(pattern, escape="\\"),
         ))
+    if call:
+        conditions.append(Recording.id == call)
     if source_id is not None:
         conditions.append(Recording.source_id == source_id)
     if target_id is not None:

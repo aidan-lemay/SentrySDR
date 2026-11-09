@@ -34,12 +34,17 @@ def important_condition(text_column, flag_column, words: list[str]):
 class KeywordBody(BaseModel):
     word: str = Field(min_length=2, max_length=80)
     applies: str = "both"
+    email: bool = False
+
+
+def _keyword_view(k: UserKeyword) -> dict:
+    return {"id": k.id, "word": k.word, "applies": k.applies, "email": bool(k.email)}
 
 
 @router.get("/me/keywords")
 def list_keywords(user: User = Depends(current_user), db=Depends(get_db)):
     rows = db.scalars(select(UserKeyword).where(UserKeyword.user_id == user.id).order_by(UserKeyword.word))
-    return [{"id": k.id, "word": k.word, "applies": k.applies} for k in rows]
+    return [_keyword_view(k) for k in rows]
 
 
 @router.post("/me/keywords", status_code=201)
@@ -54,10 +59,24 @@ def add_keyword(body: KeywordBody, user: User = Depends(current_user), db=Depend
         raise HTTPException(409, f"At most {keywords.MAX_KEYWORDS} keywords each")
     if any(k.word == word for k in existing):
         raise HTTPException(409, "You already have that keyword")
-    keyword = UserKeyword(user_id=user.id, word=word, applies=body.applies)
+    keyword = UserKeyword(user_id=user.id, word=word, applies=body.applies, email=body.email or None)
     db.add(keyword)
     db.commit()
-    return {"id": keyword.id, "word": keyword.word, "applies": keyword.applies}
+    return _keyword_view(keyword)
+
+
+class KeywordEmailBody(BaseModel):
+    email: bool
+
+
+@router.patch("/me/keywords/{keyword_id}")
+def set_keyword_email(keyword_id: int, body: KeywordEmailBody, user: User = Depends(current_user), db=Depends(get_db)):
+    keyword = db.get(UserKeyword, keyword_id)
+    if keyword is None or keyword.user_id != user.id:
+        raise HTTPException(404, "Keyword not found")
+    keyword.email = body.email or None
+    db.commit()
+    return _keyword_view(keyword)
 
 
 @router.delete("/me/keywords/{keyword_id}")

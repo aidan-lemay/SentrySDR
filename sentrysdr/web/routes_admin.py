@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ipaddress
+import re
 import os
 import secrets as pysecrets
 import shutil
@@ -18,7 +19,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import or_, select
 
-from .. import acars, health, security, uploaders
+from .. import acars, health, notify, security, uploaders
 from ..context import SECRET_SETTINGS, SETTING_DEFAULTS
 from ..models import AuditLog, Ban, BroadcastifySystem, Target, User, UserSession
 from .deps import ALL_PERMISSIONS, admin_user, ctx_of, effective_permissions, get_db, ip_of
@@ -320,6 +321,14 @@ class SettingsBody(BaseModel):
     message_retention_days: int | None = Field(default=None, ge=0, le=36500)
     airframes_station_id: str | None = Field(default=None, max_length=40)
     airframes_feed: str | None = Field(default=None, max_length=260)
+    email_alerts_enabled: bool | None = None
+    email_daily_cap: int | None = Field(default=None, ge=1, le=1000)
+    smtp_host: str | None = Field(default=None, max_length=253, pattern=r"^[A-Za-z0-9.\-:\[\]]*$")
+    smtp_port: int | None = Field(default=None, ge=1, le=65535)
+    smtp_security: str | None = Field(default=None, pattern=r"^(starttls|tls|none)$")
+    smtp_username: str | None = Field(default=None, max_length=254)
+    smtp_password: str | None = Field(default=None, max_length=500)
+    smtp_from: str | None = Field(default=None, max_length=254)
 
 
 def _check_url(value: str) -> None:
@@ -335,6 +344,12 @@ def update_settings(body: SettingsBody, request: Request, admin: User = Depends(
         raise HTTPException(422, "A station ID is letters, numbers and dashes, like KE-KSEA-ACARS")
     if body.airframes_feed is not None and not acars.FEED_RE.match(body.airframes_feed):
         raise HTTPException(422, "The airframes.io address is host:port, like feed.acars.io:5550")
+    if body.smtp_from and not re.fullmatch(r"[^\r\n<>@]*<?[^\s<>@]+@[^\s<>@]+\.[^\s<>@]+>?", body.smtp_from.strip()):
+        raise HTTPException(422, "The From address should look like alerts@example.com, or SentrySDR <alerts@example.com>")
+    security_choice = body.smtp_security or ctx.get_setting("smtp_security")
+    host = body.smtp_host if body.smtp_host is not None else ctx.get_setting("smtp_host")
+    if security_choice == "none" and host and not notify.is_loopback(host.strip()):
+        raise HTTPException(422, "Without TLS, the mail server must be on this machine (localhost), or the password would cross the network unencrypted")
     for key, value in body.model_dump(exclude_none=True).items():
         if key in SECRET_SETTINGS:
             ctx.set_setting(key, ctx.secrets.seal(value) if value else "")

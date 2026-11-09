@@ -28,14 +28,16 @@ def _view(message: AcarsMessage, words: list[str] | None = None) -> dict:
 def list_messages(
     user: User = Depends(require("maps")), db=Depends(get_db),
     search: str = Query(default="", max_length=200), tail: str = Query(default="", max_length=16),
-    show_empty: bool = False, important: bool = False,
+    show_empty: bool = False, important: bool = False, id: int | None = None,  # one message, from an alert email
     limit: int = Query(default=50, ge=1, le=200), offset: int = Query(default=0, ge=0),
 ):
     words = user_words(db, user, "messages")
     conditions = []
     if important:
         conditions.append(important_condition(AcarsMessage.text, AcarsMessage.important, words))
-    if not show_empty:
+    if id is not None:
+        conditions.append(AcarsMessage.id == id)
+    elif not show_empty:
         conditions.append(AcarsMessage.has_text.is_(True))
     if tail:
         conditions.append(AcarsMessage.tail == normalize_tail(tail))

@@ -5,7 +5,7 @@
   import { clearAfter, NOTICE_MS } from '../notice.svelte.js';
   import GainField from '../GainField.svelte';
 
-  const TABS = [['users', 'Users'], ['sources', 'SDR sources'], ['antennas', 'Antennas'], ['nodes', 'Nodes'], ['bans', 'Bans'], ['audit', 'Audit log'], ['settings', 'Settings'], ['uploads', 'Uploads and feeds'], ['warnings', 'Warnings']];
+  const TABS = [['users', 'Users'], ['sources', 'SDR sources'], ['antennas', 'Antennas'], ['nodes', 'Nodes'], ['bans', 'Bans'], ['audit', 'Audit log'], ['settings', 'Settings'], ['uploads', 'Uploads and feeds'], ['email', 'Email'], ['warnings', 'Warnings']];
   const MUTE_CHOICES = [['1', '1 hour'], ['4', '4 hours'], ['8', '8 hours'], ['24', '1 day'], ['72', '3 days'], ['168', '1 week'], ['', 'Until I unmute it']];
   const PERMISSIONS = [
     ['listen_live', 'Listen live'], ['listen_recordings', 'Play recordings'], ['download', 'Download'],
@@ -90,6 +90,7 @@
     settings: async () => { settings = await api('admin/settings'); systems = await api('admin/broadcastify'); },
     uploads: async () => { settings = await api('admin/settings'); systems = await api('admin/broadcastify'); },
     warnings: async () => { warnings = await api('admin/warnings'); },
+    email: async () => { settings = await api('admin/settings'); smtpPassword = ''; },
   };
 
   function open(next) {
@@ -389,6 +390,33 @@
       settings = reply;
       keys = { rdio_api_key: '', clearcut_api_key: '' };
     }
+  }
+
+  // --- email
+  let smtpPassword = $state('');
+  let testing = $state(false);
+  const SMTP_PORTS = { starttls: 587, tls: 465, none: 25 };
+
+  async function saveEmail(event) {
+    event.preventDefault();
+    const body = {
+      email_alerts_enabled: settings.email_alerts_enabled === 'true' || settings.email_alerts_enabled === true,
+      email_daily_cap: Number(settings.email_daily_cap), smtp_host: settings.smtp_host.trim(), smtp_port: Number(settings.smtp_port),
+      smtp_security: settings.smtp_security, smtp_username: settings.smtp_username.trim(), smtp_from: settings.smtp_from.trim(),
+    };
+    if (smtpPassword) body.smtp_password = smtpPassword;
+    const reply = await run(() => api('admin/settings', { method: 'PATCH', body }), 'Email settings saved.');
+    if (reply) {
+      settings = reply;
+      smtpPassword = '';
+    }
+  }
+
+  async function testEmail() {
+    testing = true;
+    const reply = await run(() => api('admin/email/test', { method: 'POST' }));
+    if (reply) message = reply.detail;
+    testing = false;
   }
 
   // --- backup
@@ -1049,4 +1077,44 @@
       {/each}
     </div>
   {/if}
+{/if}
+
+{#if tab === 'email' && settings}
+  <form onsubmit={saveEmail}>
+    <fieldset>
+      <legend>Alert emails</legend>
+      <p class="small">Each user chooses their own alerts on the Alerts page, and gets them only at an address they've confirmed. Mail goes through the server below; SentrySDR doesn't run its own.</p>
+      <label class="tick"><input type="checkbox" checked={settings.email_alerts_enabled === 'true' || settings.email_alerts_enabled === true} onchange={(event) => (settings.email_alerts_enabled = event.target.checked)} /> Send alert emails</label>
+      <label class="field"><span>Most emails per person per day</span>
+        <input type="number" inputmode="numeric" min="1" max="1000" bind:value={settings.email_daily_cap} />
+        <span class="hint">Stops a noisy keyword filling an inbox, or getting this server's mail marked as spam. Confirmation emails don't count.</span>
+      </label>
+    </fieldset>
+    <fieldset>
+      <legend>Mail server (SMTP)</legend>
+      <label class="field"><span>Server</span><input class="mono" bind:value={settings.smtp_host} maxlength="253" placeholder="smtp.example.com" autocomplete="off" /></label>
+      <label class="field"><span>Encryption</span>
+        <select bind:value={settings.smtp_security} onchange={() => (settings.smtp_port = SMTP_PORTS[settings.smtp_security])}>
+          <option value="starttls">STARTTLS (port 587)</option>
+          <option value="tls">TLS (port 465)</option>
+          <option value="none">None (this machine)</option>
+        </select>
+      </label>
+      <label class="field"><span>Port</span><input class="mono" type="number" inputmode="numeric" min="1" max="65535" bind:value={settings.smtp_port} /></label>
+      <label class="field"><span>Username</span><input bind:value={settings.smtp_username} maxlength="254" autocomplete="off" /></label>
+      <label class="field"><span>Password {settings.smtp_password_set ? '(saved)' : '(not set)'}</span>
+        <input type="password" bind:value={smtpPassword} autocomplete="new-password" />
+        <span class="hint">Stored encrypted, and never shown again. Leave empty to keep the saved one. For Gmail or Outlook, use an app password.</span>
+      </label>
+      <label class="field"><span>From</span>
+        <input bind:value={settings.smtp_from} maxlength="254" placeholder="SentrySDR <alerts@example.com>" />
+        <span class="hint">An address the mail server is allowed to send as, or the email may be refused or land in spam.</span>
+      </label>
+      <div class="buttons form-buttons">
+        <button class="main">Save email settings</button>
+        <button type="button" disabled={testing || !settings.smtp_host} onclick={testEmail}>{testing ? 'Sending...' : 'Send me a test email'}</button>
+      </div>
+      <p class="small dim form-buttons">The test uses the saved settings, so save first. It goes to your own address.</p>
+    </fieldset>
+  </form>
 {/if}

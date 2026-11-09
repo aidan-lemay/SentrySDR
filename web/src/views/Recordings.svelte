@@ -23,6 +23,7 @@
   let requested = $state({});
 
   const sourceFilter = $derived(new URLSearchParams(route.split('?')[1] ?? '').get('source_id'));
+  const callFilter = $derived(new URLSearchParams(route.split('?')[1] ?? '').get('call'));  // from an alert email
 
   // The filters last searched with. Polling uses these, not what's half typed in the form.
   let applied = { search: '', start: '', end: '', protectedOnly: false, importantOnly: false };
@@ -33,6 +34,7 @@
     const params = new URLSearchParams({ limit: PAGE, offset });
     if (applied.search) params.set('search', applied.search);
     if (sourceFilter) params.set('source_id', sourceFilter);
+    if (callFilter) params.set('call', callFilter);
     if (applied.start) params.set('start', new Date(applied.start).getTime() / 1000);
     if (applied.end) params.set('end', new Date(applied.end).getTime() / 1000);
     if (applied.protectedOnly) params.set('protected', 'true');
@@ -58,6 +60,7 @@
   // Reload when the route's source changes, but not on each filter keystroke.
   $effect(() => {
     sourceFilter;
+    callFilter;
     untrack(() => {
       offset = 0;
       load();
@@ -158,7 +161,7 @@
 
 <h1>Recordings</h1>
 <p class="small">
-  {total} call{total === 1 ? '' : 's'}{#if sourceFilter}, from one source. <a href="#/recordings">Show all</a>{/if}
+  {total} call{total === 1 ? '' : 's'}{#if callFilter}, the one from your alert email. <a href="#/recordings">Show all</a>{:else if sourceFilter}, from one source. <a href="#/recordings">Show all</a>{/if}
   {#if user.clearcut_page_url}{' | '}<a href={user.clearcut_page_url} target="_blank" rel="noopener noreferrer">Open ClearCut</a>{/if}
 </p>
 

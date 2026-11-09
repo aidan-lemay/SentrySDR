@@ -21,7 +21,7 @@ import httpx
 from sqlalchemy import delete, func, or_, select
 
 from . import aio
-from . import BUILD_ID, __version__, acars, capabilities, coverage, health, pipelines, schedule, uploaders
+from . import BUILD_ID, __version__, acars, capabilities, coverage, health, notify, pipelines, schedule, uploaders
 from .config import Config
 from .engine import UNPLUGGED, MeasureError, Supervisor
 from .live import LiveHub
@@ -46,8 +46,17 @@ SETTING_DEFAULTS = {
     "recording_retention_gb": "0",
     "airframes_station_id": "",
     "airframes_feed": acars.AIRFRAMES_DEFAULT,
+    "email_alerts_enabled": "false",
+    "email_daily_cap": "50",
+    "smtp_host": "",
+    "smtp_port": "587",
+    "smtp_security": "starttls",
+    "smtp_username": "",
+    "smtp_from": "",
 }
-SECRET_SETTINGS = {"rdio_api_key", "clearcut_api_key"}
+SECRET_SETTINGS = {"rdio_api_key", "clearcut_api_key", "smtp_password"}
+EMAIL_SECONDS = 30
+EMAIL_RETRY_SECONDS = 300
 TRACK_EXPIRY_SECONDS = 60
 MAX_TRACK_ITEMS = 3000
 # Per SDR, one-minute window. Busy ACARS sites reach a few messages a minute; this is far above that.
@@ -140,6 +149,8 @@ class Context:
         self.loop: asyncio.AbstractEventLoop | None = None
         self.wake: asyncio.Event | None = None
         self.tasks: list[asyncio.Task] = []
+        self.email_error = ""  # the last alert email failure, until one succeeds
+        self.email_retry_at = 0.0
         self.http_transport = None  # replaced in tests so nothing reaches a real server
         self.audit_log = logging.getLogger("sentrysdr.audit")
 
@@ -494,7 +505,7 @@ class Context:
             status=lambda serial, data: self.set_status(node_id, serial, data),
             enumerate_fn=self.enumerate,
         )
-        for coroutine in (self._scheduler_loop, self._upload_loop, self._transcript_loop, self._retention_loop):
+        for coroutine in (self._scheduler_loop, self._upload_loop, self._transcript_loop, self._retention_loop, self._email_loop):
             self.tasks.append(asyncio.create_task(coroutine(), name=coroutine.__name__))
 
     async def stop(self) -> None:
@@ -506,6 +517,34 @@ class Context:
         await self.live.shutdown()
         if self.supervisor:
             await self.supervisor.shutdown()
+
+    async def _email_loop(self) -> None:
+        """Alert emails. A mail server that fails is left alone for a few minutes, and an admin is warned."""
+        while True:
+            await asyncio.sleep(EMAIL_SECONDS)
+            try:
+                await asyncio.to_thread(self.send_alert_emails)
+            except Exception:
+                log.exception("alert email pass failed")
+
+    def send_alert_emails(self, send=None) -> int:
+        if time.time() < self.email_retry_at:
+            return 0
+        failures: list[str] = []
+
+        def deliver(settings, message):
+            try:
+                (send or notify.deliver)(settings, message)
+            except notify.EmailError as exc:
+                failures.append(str(exc))
+                raise
+
+        sent = notify.send_due(self, deliver)
+        if failures:
+            self.email_error, self.email_retry_at = failures[-1], time.time() + EMAIL_RETRY_SECONDS
+        elif sent:
+            self.email_error = ""
+        return sent
 
     async def _scheduler_loop(self) -> None:
         while True:
@@ -805,6 +844,8 @@ class Context:
             if failed:
                 add("uploads.failed", "warn", f"{failed} upload{'s' if failed != 1 else ''} failed in the last day. The reason shows on each recording.",
                     "#/recordings")
+            if self.email_error and self.get_setting("email_alerts_enabled") == "true":
+                add("email.failing", "warn", f"Alert emails aren't being sent. {self.email_error}", "#/admin?tab=email")
             limit_gb = float(self.get_setting("recording_retention_gb") or 0)
             if limit_gb > 0:
                 protected = session.scalar(select(func.coalesce(func.sum(Recording.size_bytes), 0)).where(Recording.protected.is_(True)))

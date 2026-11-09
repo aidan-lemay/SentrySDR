@@ -36,6 +36,16 @@ class User(Base):
     last_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
     signup_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
     alerts_seen_at: Mapped[float | None] = mapped_column(nullable=True)
+    # Email alerts: sent only to an address this user has confirmed (email_verified == email).
+    email_alerts: Mapped[bool | None] = mapped_column(nullable=True)
+    email_verified: Mapped[str | None] = mapped_column(String(254), nullable=True)
+    email_confirm_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    email_confirm_address: Mapped[str | None] = mapped_column(String(254), nullable=True)
+    email_confirm_expires: Mapped[float | None] = mapped_column(nullable=True)
+    email_window: Mapped[int | None] = mapped_column(nullable=True)  # minutes between emails
+    email_important: Mapped[bool | None] = mapped_column(nullable=True)  # also things marked important
+    email_since: Mapped[float | None] = mapped_column(nullable=True)  # nothing older is emailed
+    email_last_sent_at: Mapped[float | None] = mapped_column(nullable=True)
 
 
 class UserSession(Base):
@@ -270,7 +280,39 @@ class UserKeyword(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     word: Mapped[str] = mapped_column(String(80))
     applies: Mapped[str] = mapped_column(String(8), default="both")  # calls|messages|both
+    email: Mapped[bool | None] = mapped_column(nullable=True)  # also emailed, not only flagged
     created_at: Mapped[float] = mapped_column(default=now)
+
+
+class UserWatch(Base):
+    """Email one user about every call on a channel, or every ACARS message from an aircraft."""
+    __tablename__ = "user_watches"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    kind: Mapped[str] = mapped_column(String(8))  # channel|aircraft
+    target_id: Mapped[int | None] = mapped_column(ForeignKey("targets.id", ondelete="CASCADE"), nullable=True)
+    value: Mapped[str] = mapped_column(String(16), default="")  # a registration or flight, for aircraft
+    created_at: Mapped[float] = mapped_column(default=now)
+
+
+class AlertSent(Base):
+    """A call or message already emailed to a user, so it goes once."""
+    __tablename__ = "alerts_sent"
+    __table_args__ = (UniqueConstraint("user_id", "kind", "item_id"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    kind: Mapped[str] = mapped_column(String(8))  # call|message
+    item_id: Mapped[str] = mapped_column(String(64))
+    sent_at: Mapped[float] = mapped_column(default=now, index=True)
+
+
+class EmailLog(Base):
+    """Each email sent to a user, for the daily limit."""
+    __tablename__ = "email_log"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    kind: Mapped[str] = mapped_column(String(12))  # alert|confirm|test
+    sent_at: Mapped[float] = mapped_column(default=now, index=True)
 
 
 class WarningMute(Base):

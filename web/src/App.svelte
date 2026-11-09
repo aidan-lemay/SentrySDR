@@ -11,6 +11,7 @@
   import Messages from './views/Messages.svelte';
   import Scanner from './views/Scanner.svelte';
   import Alerts from './views/Alerts.svelte';
+  import EmailLink from './EmailLink.svelte';
   import Account from './views/Account.svelte';
   import Admin from './views/Admin.svelte';
 
@@ -78,7 +79,9 @@
   });
 </script>
 
-{#if loading}
+{#if requested === 'email-confirm' || requested === 'email-off'}
+  <EmailLink {route} />
+{:else if loading}
   <p class="pad">Loading...</p>
 {:else if !user}
   <Auth onSignedIn={refreshUser} />
@@ -118,7 +121,7 @@
     {:else if view === 'maps'}
       <Maps {user} />
     {:else if view === 'alerts'}
-      <Alerts onSeen={refreshAlerts} />
+      <Alerts {route} onSeen={refreshAlerts} />
     {:else if view === 'scanner'}
       <Scanner />
     {:else if view === 'messages'}

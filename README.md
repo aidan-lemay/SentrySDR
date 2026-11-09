@@ -148,8 +148,10 @@ Each permission except the admin-only ones can be allowed or denied per user, un
 | Nodes | Slaves: create a one-time enrolment token, or revoke a slave |
 | Settings | How long recordings, ACARS messages and audit logs are kept (0 keeps them forever); a size limit for recordings; sign-ups; the map tile server; a backup download |
 | Uploads and feeds | RDIO and ClearCut servers and keys; the Broadcastify upload address and systems; the airframes.io station ID and address |
+| Email | The mail server for alert emails, and the daily limit. See [Email alerts](#email-alerts) |
+| Warnings | Every current health warning, including muted and hidden ones |
 
-Upload API keys are never shown again once saved. Leave a key's box blank to keep it.
+Upload API keys and the mail server password are never shown again once saved. Leave a key's box blank to keep it.
 
 ## Security model
 
@@ -158,11 +160,12 @@ Upload API keys are never shown again once saved. Leave a key's box blank to kee
 - **Two-factor sign-in:** TOTP, optional per user. Each code works once. Turning it off needs the password and a current code.
 - **Sessions:** random tokens stored only as hashes, which expire after 14 days without use. Changing a password signs out your other sessions; an admin disabling an account or resetting its password signs it out everywhere. Expired sessions are deleted hourly.
 - **Least privilege:** what each role can do is in [Users and permissions](#users-and-permissions). Users who can't manage targets don't receive upload IDs or feed addresses, and only those who can assign SDRs see who assigned them.
-- **Secrets at rest:** TOTP seeds and upload API keys are encrypted with `secret.key` in the data folder. Back up that file with the database, and keep both private.
+- **Secrets at rest:** TOTP seeds, upload API keys and the mail server password are encrypted with `secret.key` in the data folder. Back up that file with the database, and keep both private.
 - **Browser protections:** strict CSP, `HttpOnly`, `Secure` and `SameSite=Strict` cookies (not `Secure` over a plain-http local address), Host and Origin checks, and a custom header on every change, so other sites can't make requests as you. tar1090 is the one exception: it needs inline scripts, so it gets a looser CSP on its own path. Aircraft data it shows is cleaned of anything but plain characters first, because it can come from a slave.
 - **Radio tools:** run as argv lists, never through a shell, with all values validated first, including those arriving from the network. Decoders open no ports, with one opt-in exception: the local data port below.
 - **Slaves:** each enrols with a one-time token that expires in 24 hours, then uses its own key, stored only as a hash on the master and revocable from **Admin > Nodes**. A slave can only report on its own SDRs. What it sends is checked: call details and times, and limits on aircraft and ship lists (3,000 each) and ACARS messages (600 a minute per SDR), so a compromised slave can't fill the master's memory or database. Recordings are limited to 256 MB and must be MP3.
-- **Outbound connections:** only the uploads and feeds you turn on. Aggregator addresses are fixed in the code, so a master can switch a slave's feeds on or off but can't point them anywhere else. The airframes.io feed sends only acarsdec's own message fields and your station ID.
+- **Email:** alerts go only to an address its owner confirmed with a link sent to it, so nobody can sign up with someone else's address and have mail sent there. Confirmation and turn-off links carry a random or keyed token, checked in constant time, and are rate limited per address. Names in a subject can't add mail headers. Each user is limited to 3 confirmations an hour and the daily cap of alerts.
+- **Outbound connections:** only the uploads, feeds and mail server you turn on. Aggregator addresses are fixed in the code, so a master can switch a slave's feeds on or off but can't point them anywhere else. The airframes.io feed sends only acarsdec's own message fields and your station ID.
 - **Local data port:** the optional port for fr24feed and piaware is bound to 127.0.0.1 on the node with the SDR. readsb opens no other ports.
 - **rtl_tcp:** has no password, so its address is set only in each machine's own configuration file, defaulting to loopback, and every interface or a public address needs `allow_public`. Only administrators can put an SDR on it. A slave never takes the address from the master.
 - **SDRs:** only serials in `sdr.serials` are ever opened. Other dongles stay free for other software. Duplicate serials are refused; fix them with `rtl_eeprom -s`.
@@ -237,11 +240,48 @@ Trails and coverage can each be turned off above the map.
 
 ## Keyword alerts
 
-Under **My account > Keywords**, each user keeps their own words and phrases to watch for, in call transcripts, ACARS messages, or both. Matching ignores case and takes whole words: "fire" matches "Fire!" but not "firefighter", and a phrase matches across a line break. Only you see your keywords.
+Under **Alerts > Keywords and email**, each user keeps their own words and phrases to watch for, in call transcripts, ACARS messages, or both. Matching ignores case and takes whole words: "fire" matches "Fire!" but not "firefighter", and a phrase matches across a line break. Only you see your keywords.
 
 - **Alerts:** the menu shows how many new calls and messages matched since you last looked, including a call whose transcript arrived later. The **Alerts** page lists them; **Mark all seen** clears the count.
 - **Important:** matching calls and messages are outlined in red with the words they matched, and **Important only** on the Recordings and Messages pages shows just those. Anyone with the Protect permission can also **Mark important** by hand, which everyone then sees as important, and which protects a call from automatic deletion.
-- Alerts stay inside SentrySDR for now: nothing is sent by email or other notification.
+- **Email:** see [Email alerts](#email-alerts).
+
+## Email alerts
+
+Each user sets up their own, under **Alerts > Keywords and email**, and they go only to that user's own account address. Nobody else sees what you watch for.
+
+What can send you an email:
+
+- **Keywords** ticked **Email**. A call matches once its ClearCut transcript arrives, so its email comes then, not when the call ends.
+- **Channels:** every call on a target you pick, with or without a transcript.
+- **Aircraft:** every ACARS message from a registration or flight, typed as the Messages page shows it (N123UA, UA0123).
+- **Marked important**, if you tick it: a call or message someone marks important by hand.
+
+You only get what your permissions let you see: calls need **Play recordings**, ACARS needs **Maps**. Losing a permission stops those emails. Nothing from before you turned emails on is sent.
+
+**Confirming your address.** Turning emails on sends a confirmation link to your address, good for 24 hours; nothing else is sent until you open it. Changing your email address under **My account** needs a new confirmation, and old links stop working. At most 3 confirmation emails an hour per user.
+
+**How often.** The first alert is emailed at once. After that you get at most one email every 5, 15 or 60 minutes (your choice), with everything since in it, up to 25 items, and a link to the Alerts page for the rest. The server also caps how many alert emails anyone gets a day (50 by default); the last one says so.
+
+**What's in an email.** For each call or message: the channel or flight, the time (in the master's time zone), why it matched, the transcript or message text, and a link straight to it in SentrySDR. Opening the call still needs signing in, and the audio stays on your server.
+
+**Turning them off.** Untick **Email me alerts**, or use the link at the bottom of any email. That link opens a page with a button rather than turning emails off at once, because mail scanners open every link in an email. Mail apps that offer one-click unsubscribe (Gmail, Outlook, Apple Mail) turn them off directly. Your keywords and watches stay either way.
+
+**Watches follow the target.** A channel watch is on the target, not the SDR: renaming it, changing its frequency, or moving it to another SDR (or removing the SDR) keeps the watch. Deleting the target removes the watch with it.
+
+### Setting up email (admins)
+
+Under **Admin > Email**, give SentrySDR an SMTP server to send through. It doesn't run its own mail server.
+
+| Setting | Notes |
+|---|---|
+| Send alert emails | The switch for everyone. Off by default |
+| Most emails per person per day | 1 to 1000. Confirmation emails don't count |
+| Server, Encryption, Port | STARTTLS on 587 or TLS on 465. Certificates are checked. **None** is only allowed for a mail server on the same machine (localhost), so a password never crosses the network unencrypted |
+| Username, Password | The password is stored encrypted with `secret.key` and never shown again. For Gmail or Outlook, make an app password |
+| From | An address the server may send as, like `SentrySDR <alerts@example.com>`. Mail from an address the server doesn't own is often refused or marked as spam |
+
+**Send me a test email** sends to your own address with the saved settings. If the mail server starts refusing alerts, admins and operators see a warning, and SentrySDR waits 5 minutes before trying again; nothing is lost, the waiting alerts go once it works.
 
 ## Schedules
 
@@ -407,7 +447,7 @@ Admins and operators see a banner at the top of every page when something needs 
 - a recordings disk with less than 2 GB or 5% free
 - protected recordings that alone exceed the recordings size limit
 
-Each warning links to the page to look at. Warnings only appear in SentrySDR for now; nothing is sent by email or other notification.
+Each warning links to the page to look at. Health warnings only appear in SentrySDR; they aren't emailed.
 
 **Muting.** **Admin > Warnings** lists every current warning, including hidden ones, and says why each is hidden. An admin can mute any warning for 1 hour to 1 week, or until they unmute it. A mute is that admin's own: other admins and operators still see the warning. A mute follows what the warning is about (that slave being offline, that SDR's fault, failed uploads), so it still applies if the warning clears and comes back, until it runs out. Mutes for warnings that have cleared are listed there too, so they can be removed. The banner's **Mute** link opens that section.
 
@@ -436,7 +476,7 @@ Keep `/etc/sentrysdr/sentrysdr.toml` too. A slave only holds calls waiting to up
 | Local data port for fr24feed or piaware | The port you choose, on 127.0.0.1 only | Only programs on the same machine |
 | rtl_tcp, while an SDR is on an rtl_tcp target | That SDR's port (1234 and up), on `rtl_tcp.bind` | The devices running GQRX or SDR++. Loopback by default |
 
-Outbound, the master connects to the upload and feed services you turn on; slaves connect to the master and, if you turn them on, the ADS-B and AIS services. [nftables.example.conf](deploy/nftables.example.conf) is a default-deny firewall for the master.
+Outbound, the master connects to the upload and feed services you turn on, and to your mail server (usually port 587 or 465) if email alerts are on; slaves connect to the master and, if you turn them on, the ADS-B and AIS services. [nftables.example.conf](deploy/nftables.example.conf) is a default-deny firewall for the master.
 
 ## Logs and troubleshooting
 

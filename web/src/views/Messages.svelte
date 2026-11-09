@@ -16,6 +16,7 @@
   let loaded = $state(false);
 
   const tailFilter = $derived(new URLSearchParams(route.split('?')[1] ?? '').get('tail'));
+  const idFilter = $derived(new URLSearchParams(route.split('?')[1] ?? '').get('id'));  // from an alert email
 
   // The filters last searched with. Polling uses these, not what's half typed.
   let applied = { search: '', showEmpty: false, importantOnly: false };
@@ -27,6 +28,7 @@
     if (applied.showEmpty) params.set('show_empty', 'true');
     if (applied.importantOnly) params.set('important', 'true');
     if (tailFilter) params.set('tail', tailFilter);
+    if (idFilter) params.set('id', idFilter);
     const mine = ++generation;
     try {
       const reply = await api(`messages?${params}`);
@@ -43,6 +45,7 @@
 
   $effect(() => {
     tailFilter;
+    idFilter;
     untrack(() => {
       offset = 0;
       load();
@@ -90,7 +93,7 @@
 
 <h1>Messages</h1>
 <p class="small">
-  {total} ACARS message{total === 1 ? '' : 's'}{#if tailFilter}, from <span class="mono">{tailFilter}</span>. <a href="#/messages">Show all</a>{/if}
+  {total} ACARS message{total === 1 ? '' : 's'}{#if idFilter}, the one from your alert email. <a href="#/messages">Show all</a>{:else if tailFilter}, from <span class="mono">{tailFilter}</span>. <a href="#/messages">Show all</a>{/if}
 </p>
 
 {#if error}<div class="err" role="alert">{error}</div>{/if}

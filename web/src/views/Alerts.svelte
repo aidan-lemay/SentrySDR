@@ -2,8 +2,10 @@
   // Calls and messages that matched your keywords, or were marked important, since you last looked.
   import { onMount } from 'svelte';
   import { api, formatDuration, formatTime } from '../lib.js';
+  import AlertSettings from './AlertSettings.svelte';
 
-  let { onSeen } = $props();
+  let { route = '', onSeen } = $props();
+  const settingsTab = $derived(new URLSearchParams(route.split('?')[1] ?? '').get('tab') === 'settings');
   let data = $state(null);
   let error = $state('');
 
@@ -30,7 +32,15 @@
 </script>
 
 <h1>Alerts</h1>
-<p class="small">Calls and ACARS messages that match your keywords, or that someone marked important{data ? `, since ${formatTime(data.since)}` : ''}. Set your keywords under <a href="#/account">My account</a>.</p>
+<nav class="page-tabs" aria-label="Alerts">
+  <a href="#/alerts" aria-current={settingsTab ? undefined : 'page'}>New alerts</a>
+  <a href="#/alerts?tab=settings" aria-current={settingsTab ? 'page' : undefined}>Keywords and email</a>
+</nav>
+
+{#if settingsTab}
+  <AlertSettings />
+{:else}
+<p class="small">Calls and ACARS messages that match your keywords, or that someone marked important{data ? `, since ${formatTime(data.since)}` : ''}.</p>
 {#if error}<div class="err" role="alert">{error}</div>{/if}
 
 {#if data}
@@ -58,4 +68,5 @@
       <p class="pad dim">Nothing new.</p>
     {/each}
   </div>
+{/if}
 {/if}
