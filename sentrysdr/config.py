@@ -47,6 +47,9 @@ class Config:
     min_call_seconds: float = 0.5
     max_call_seconds: int = 1800
     bin_dirs: list[Path] = field(default_factory=list)
+    # rtl_tcp has no password: whoever reaches this address controls the stick.
+    rtl_tcp_bind: str = "127.0.0.1"
+    rtl_tcp_allow_public: bool = False
 
     @property
     def tz(self) -> ZoneInfo:
@@ -145,6 +148,7 @@ def load_config(path: str | Path) -> Config:
     sdr = raw.get("sdr", {})
     master = raw.get("master", {})
     calls = raw.get("calls", {})
+    rtl_tcp = raw.get("rtl_tcp", {})
 
     data_dir = Path(storage.get("data_dir", "./data"))
     cfg = Config(
@@ -170,6 +174,8 @@ def load_config(path: str | Path) -> Config:
         min_call_seconds=float(calls.get("min_call_seconds", 0.5)),
         max_call_seconds=int(calls.get("max_call_seconds", 1800)),
         bin_dirs=[Path(p) for p in raw.get("binaries", {}).get("search_dirs", [])],
+        rtl_tcp_bind=str(rtl_tcp.get("bind", "127.0.0.1")),
+        rtl_tcp_allow_public=bool(rtl_tcp.get("allow_public", False)),
     )
     validate(cfg)
     return cfg
@@ -187,6 +193,7 @@ def validate(cfg: Config) -> None:
         ZoneInfo(cfg.timezone)
     except Exception as exc:
         raise ConfigError(f"unknown timezone {cfg.timezone!r}") from exc
+    _validate_rtl_tcp(cfg)
 
     if cfg.role == "slave":
         parts = urlsplit(cfg.master_url)
@@ -226,6 +233,19 @@ def validate(cfg: Config) -> None:
         cfg.trusted_networks
     except ValueError as exc:
         raise ConfigError(f"invalid proxy.trusted_proxies entry: {exc}") from exc
+
+
+def _validate_rtl_tcp(cfg: Config) -> None:
+    """Set here, on each machine, so the master's web interface can't expose a stick to the internet."""
+    try:
+        addr = ipaddress.ip_address(cfg.rtl_tcp_bind)
+    except ValueError:
+        raise ConfigError("rtl_tcp.bind must be an IP address, such as 127.0.0.1 or this machine's LAN or Tailscale address") from None
+    if (addr.is_unspecified or not is_local_ip(cfg.rtl_tcp_bind)) and not cfg.rtl_tcp_allow_public:
+        raise ConfigError(
+            "rtl_tcp.bind would listen on every network or a public address, and rtl_tcp has no password. "
+            "Use loopback, a private or Tailscale address, or set rtl_tcp.allow_public = true if you really mean it"
+        )
 
 
 def _private_transport(host: str) -> bool:

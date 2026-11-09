@@ -27,7 +27,7 @@
   let nodes = $state([]);
   const blankSource = () => ({
     id: null, key: '', name: '', description: '', antenna_id: '', gain: DEFAULT_GAIN_DB, ppm: 0,
-    tuner: '', steps: '', capMin: '', capMax: '', uses: [],
+    tuner: '', steps: '', capMin: '', capMax: '', uses: [], rtlTcpPort: '',
   });
   const TUNERS = ['R820T', 'R820T2', 'R828D', 'FC0012', 'FC0013', 'FC2580', 'E4000'];
   let detecting = $state(false);
@@ -154,6 +154,7 @@
       tuner: sourceForm.tuner.trim() || null, gain_steps: parseSteps(sourceForm.steps),
       cap_min_hz: filled(sourceForm.capMin) ? toHz(sourceForm.capMin) : null,
       cap_max_hz: filled(sourceForm.capMax) ? toHz(sourceForm.capMax) : null, uses: sourceForm.uses,
+      rtl_tcp_port: filled(sourceForm.rtlTcpPort) ? Number(sourceForm.rtlTcpPort) : null,
     };
     if (body.gain_steps.some(Number.isNaN)) {
       error = 'Gain steps must be numbers, separated by spaces or commas.';
@@ -175,7 +176,7 @@
       antenna_id: source.antenna_id ?? '', gain: source.gain_db ?? '', ppm: source.ppm, feederId: source.feeder_uuid ?? '',
       tuner: source.tuner, steps: source.gain_steps.join(' '),
       capMin: source.cap_min_hz == null ? '' : plain(source.cap_min_hz), capMax: source.cap_max_hz == null ? '' : plain(source.cap_max_hz),
-      uses: [...source.uses],
+      uses: [...source.uses], rtlTcpPort: source.rtl_tcp_port ?? '',
     };
     document.getElementById('source-form')?.scrollIntoView();
   }
@@ -293,6 +294,15 @@
       await loaders.nodes();
     }
   }
+
+  const restartSource = (source) => confirm(`Restart ${source.name}? Its tool stops and starts again, which takes a few seconds. A call in progress is saved.`) && run(async () => {
+    await api(`sources/${source.id}/restart`, { method: 'POST' });
+    await loaders.sources();
+  }, `${source.name} restarted.`);
+
+  const restartService = (node) => confirm(`Restart SentrySDR on ${node.name}? Every SDR on it stops for about 10 seconds. Calls in progress are saved.${node.is_local ? ' This page reconnects when it\'s back.' : ''}`) && run(async () => {
+    await api(`nodes/${node.id}/restart`, { method: 'POST' });
+  }, `${node.name} is restarting. It should be back in about 10 seconds.`);
 
   const revokeNode = (node) => confirm(`Revoke ${node.name}? It will disconnect, and need a new token to come back.`) && run(async () => {
     await api(`nodes/${node.id}`, { method: 'DELETE' });
@@ -534,6 +544,7 @@
             <td>
               <div class="buttons" style="margin:0">
                 <button onclick={() => editSource(source)}>Edit</button>
+                <button onclick={() => restartSource(source)} disabled={!source.node_online} title="Stop and start this SDR's tool, for a stick that was unplugged">Restart</button>
                 <button class="bad" onclick={() => removeSource(source)}>Remove</button>
               </div>
             </td>
@@ -585,6 +596,10 @@
         {/if}
       </label>
       <label class="field"><span>Frequency correction (ppm)</span><input type="number" min="-500" max="500" bind:value={sourceForm.ppm} /></label>
+      <label class="field"><span>rtl_tcp port</span>
+        <input class="mono" type="number" inputmode="numeric" min="1024" max="65535" placeholder="Picked for you" bind:value={sourceForm.rtlTcpPort} />
+        <span class="hint">Used when this SDR is on an rtl_tcp target. Each SDR on one machine needs its own. The address is set in that machine's configuration file.</span>
+      </label>
     </fieldset>
     <fieldset>
       <legend>What this stick can do</legend>
@@ -718,7 +733,12 @@
             </td>
             <td data-label="SDRs"><span class="mono small">{node.serials.join(', ') || 'None'}</span></td>
             <td data-label="Last address"><span class="mono small">{node.last_ip ?? 'None'}</span></td>
-            <td>{#if !node.is_local && node.status !== 'revoked'}<button class="bad" onclick={() => revokeNode(node)}>Revoke</button>{/if}</td>
+            <td>
+              <div class="buttons" style="margin:0">
+                {#if node.status === 'active'}<button onclick={() => restartService(node)} disabled={!node.online && !node.is_local}>Restart service</button>{/if}
+                {#if !node.is_local && node.status !== 'revoked'}<button class="bad" onclick={() => revokeNode(node)}>Revoke</button>{/if}
+              </div>
+            </td>
           </tr>
         </tbody>
       {/each}

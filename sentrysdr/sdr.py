@@ -59,3 +59,32 @@ def index_for_serial(serial: str, devices: list[str] | None = None) -> int | Non
 
 def has_duplicate(serial: str, devices: list[str]) -> bool:
     return devices.count(serial) > 1
+
+
+RTL_USB_IDS = {("0bda", "2832"), ("0bda", "2838")}
+SYSFS_USB = "/sys/bus/usb/devices"
+
+
+def present_serials(root: str = SYSFS_USB) -> set[str] | None:
+    """Serials of RTL-SDRs plugged in now, read from sysfs without opening anything.
+
+    Cheap enough to check every few seconds. None when sysfs isn't available
+    (not Linux), in which case nobody should conclude a stick is gone.
+    """
+    import os
+    try:
+        entries = os.listdir(root)
+    except OSError:
+        return None
+    found = set()
+    for entry in entries:
+        base = os.path.join(root, entry)
+        try:
+            with open(os.path.join(base, "idVendor")) as v, open(os.path.join(base, "idProduct")) as p:
+                if (v.read().strip(), p.read().strip()) not in RTL_USB_IDS:
+                    continue
+            with open(os.path.join(base, "serial")) as s:
+                found.add(s.read().strip())
+        except OSError:
+            continue
+    return found

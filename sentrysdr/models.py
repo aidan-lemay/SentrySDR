@@ -107,6 +107,7 @@ class Source(Base):
     cap_max_hz: Mapped[int | None] = mapped_column(nullable=True)
     uses: Mapped[list | None] = mapped_column(JSON, nullable=True)
     feeder_uuid: Mapped[str | None] = mapped_column(String(36), nullable=True)  # identifies this receiver to aggregators
+    rtl_tcp_port: Mapped[int | None] = mapped_column(nullable=True)  # unique per node; the address is in each node's config
     __table_args__ = (Index("uq_source_node_serial", "node_id", "serial", unique=True),)
 
 
@@ -329,6 +330,31 @@ def _fill_feeder_uuids(engine) -> None:
             connection.execute(text("UPDATE sources SET feeder_uuid = :u WHERE id = :s"), {"u": str(uuid.uuid4()), "s": source_id})
 
 
+RTL_TCP_FIRST_PORT = 1234
+
+
+def free_rtl_tcp_port(taken: set[int]) -> int:
+    port = RTL_TCP_FIRST_PORT
+    while port in taken:
+        port += 1
+    return port
+
+
+def _fill_rtl_tcp_ports(engine) -> None:
+    """Each SDR gets its own rtl_tcp port, so several can serve rtl_tcp on one machine at once."""
+    with engine.begin() as connection:
+        rows = connection.execute(text("SELECT id, node_id, rtl_tcp_port FROM sources ORDER BY id")).all()
+        taken: dict[int, set[int]] = {}
+        for _, node_id, port in rows:
+            if port:
+                taken.setdefault(node_id, set()).add(port)
+        for source_id, node_id, port in rows:
+            if not port:
+                port = free_rtl_tcp_port(taken.setdefault(node_id, set()))
+                taken[node_id].add(port)
+                connection.execute(text("UPDATE sources SET rtl_tcp_port = :p WHERE id = :s"), {"p": port, "s": source_id})
+
+
 def make_session_factory(db_path: Path):
     db_path.parent.mkdir(parents=True, exist_ok=True)
     engine = create_engine(
@@ -350,6 +376,7 @@ def make_session_factory(db_path: Path):
     _convert_source_antennas(engine)
     _drop_retired_uses(engine)
     _fill_feeder_uuids(engine)
+    _fill_rtl_tcp_ports(engine)
     try:
         db_path.chmod(0o600)
     except OSError:

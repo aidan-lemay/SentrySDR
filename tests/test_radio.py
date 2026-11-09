@@ -19,7 +19,7 @@ from sqlalchemy import select
 from sentrysdr import capabilities, feeds, pipelines, schedule, sdr, uploaders
 from sentrysdr.context import BROADCASTIFY_RETRY_SECONDS, UPLOAD_MAX_ATTEMPTS
 from sentrysdr.engine import MeasureError, VolumeControl, merge_ais_message
-from sentrysdr.models import AcarsMessage, Antenna, BroadcastifySystem, Node, Recorder, Recording, SdrProfile, Source, Target, UploadJob, make_session_factory
+from sentrysdr.models import AcarsMessage, Antenna, AuditLog, BroadcastifySystem, Node, Recorder, Recording, SdrProfile, Source, Target, UploadJob, make_session_factory
 
 from .conftest import ADMIN_EMAIL, PASSWORD, add_user, client_for
 
@@ -2001,3 +2001,127 @@ def test_message_search_treats_wildcards_literally(ctx, listener):
     add_message(ctx, text="NOTHING HERE")
     assert listener.get("/api/messages?search=%25").json()["total"] == 1
     assert listener.get("/api/messages?search=_").json()["total"] == 0
+
+
+# --- rtl_tcp ------------------------------------------------------------------------
+@pytest.mark.parametrize("bind,allow,ok", [
+    ("127.0.0.1", False, True), ("192.168.1.20", False, True), ("100.80.1.2", False, True), ("::1", False, True),
+    ("0.0.0.0", False, False), ("8.8.8.8", False, False), ("pi.local", False, False), ("0.0.0.0", True, True),
+])
+def test_rtl_tcp_bind_is_checked(bind, allow, ok):
+    from sentrysdr.config import Config, ConfigError, validate
+    cfg = Config(rtl_tcp_bind=bind, rtl_tcp_allow_public=allow)
+    if ok:
+        validate(cfg)
+    else:
+        with pytest.raises(ConfigError):
+            validate(cfg)
+
+
+def test_rtl_tcp_args_use_the_local_address():
+    cfg = SimpleNamespace(binary=lambda name: None, rtl_tcp_bind="192.168.1.20")
+    args = pipelines.rtltcp_args(cfg, 2, {"rtl_tcp_port": 1235, "frequency_hz": 162_550_000, "gain_db": 40.2, "ppm": -3})
+    assert args == ["rtl_tcp", "-a", "192.168.1.20", "-p", "1235", "-d", "2", "-f", "162550000", "-g", "40.2", "-P", "-3"]
+    assert "-g" not in pipelines.rtltcp_args(cfg, 0, {"rtl_tcp_port": 1234, "frequency_hz": 1, "gain_db": None})
+
+
+def test_rtl_tcp_spec_needs_a_port():
+    base = {"recorder_id": 1, "source_id": 1, "target_id": 1, "frequency_hz": 100_000_000, "modulation": "rtltcp", "kind": "rtltcp"}
+    assert pipelines.sanitize_spec({**base, "rtl_tcp_port": 1234})["rtl_tcp_port"] == 1234
+    for bad in (None, 80, 70000, "x"):
+        with pytest.raises(pipelines.SpecError):
+            pipelines.sanitize_spec({**base, "rtl_tcp_port": bad})
+    voice = {**base, "kind": "audio", "modulation": "nfm", "rtl_tcp_port": 1234}
+    assert pipelines.sanitize_spec(voice)["rtl_tcp_port"] is None
+
+
+def rtltcp_target(client, name="Raw IQ", hz=162_550_000):
+    return client.post("/api/targets", json={"name": name, "kind": "rtltcp", "modulation": "rtltcp", "frequency_hz": hz})
+
+
+def test_each_sdr_gets_its_own_rtl_tcp_port(ctx, admin):
+    first, second = make_source(admin), make_source(admin, "SER2", "Two")
+    ports = {s["id"]: s["rtl_tcp_port"] for s in admin.get("/api/sources").json()}
+    assert ports == {first: 1234, second: 1235}
+    clash = admin.put(f"/api/sources/{second}", json={"serial": "SER2", "name": "Two", "rtl_tcp_port": 1234})
+    assert clash.status_code == 409 and "already used by Source 1" in clash.text
+    assert admin.put(f"/api/sources/{second}", json={"serial": "SER2", "name": "Two", "rtl_tcp_port": 1300}).status_code == 200
+    assert admin.put(f"/api/sources/{second}", json={"serial": "SER2", "name": "Two"}).status_code == 200  # blank keeps it
+    assert {s["id"]: s["rtl_tcp_port"] for s in admin.get("/api/sources").json()}[second] == 1300
+    target = rtltcp_target(admin).json()["id"]
+    admin.post(f"/api/sources/{second}/assign", json={"target_id": target}).raise_for_status()
+    spec = ctx.assignments()[ctx.local_node_id]["SER2"]
+    assert spec["kind"] == "rtltcp" and spec["rtl_tcp_port"] == 1300
+    assert pipelines.sanitize_spec(spec)["rtl_tcp_port"] == 1300
+
+
+def test_ports_are_per_machine(ctx, admin):
+    with ctx.db() as session:
+        session.add(Node(name="Field", status="active", serials=["FIELD1"]))
+        session.commit()
+        field = session.scalar(select(Node).where(Node.name == "Field")).id
+    make_source(admin)
+    admin.post("/api/sources", json={"node_id": field, "serial": "FIELD1", "name": "Far"}).raise_for_status()
+    assert sorted(s["rtl_tcp_port"] for s in admin.get("/api/sources").json()) == [1234, 1234]
+
+
+def test_only_admins_use_rtl_tcp(ctx, admin, operator):
+    source = make_source(admin)
+    assert rtltcp_target(operator).status_code == 403
+    target = rtltcp_target(admin).json()["id"]
+    voice = make_target(admin)
+    assert operator.post(f"/api/sources/{source}/assign", json={"target_id": target}).status_code == 403
+    schedule = {"name": "Night", "source_id": source, "target_id": target, "schedule_days": [1], "schedule_start": "22:00", "schedule_end": "23:00"}
+    assert operator.post("/api/recorders", json=schedule).status_code == 403
+    assert operator.put(f"/api/targets/{target}", json={"name": "Mine", "kind": "rtltcp", "modulation": "rtltcp", "frequency_hz": 100_000_000}).status_code == 403
+    assert operator.delete(f"/api/targets/{target}").status_code == 403
+    assert admin.post(f"/api/sources/{source}/assign", json={"target_id": target}).status_code == 200
+    # An operator can still take the stick off rtl_tcp, which closes the port.
+    assert operator.post(f"/api/sources/{source}/assign", json={"target_id": voice}).status_code == 200
+    made = admin.post("/api/recorders", json=schedule)
+    assert made.status_code == 201
+    assert operator.delete(f"/api/recorders/{made.json()['id']}").status_code == 403
+
+
+def test_older_sources_get_rtl_tcp_ports(tmp_path):
+    db = tmp_path / "p.db"
+    make_session_factory(db)
+    connection = sqlite3.connect(db)
+    connection.execute("INSERT INTO nodes (id, name, is_local, status, serials, created_at) VALUES (1, 'n', 1, 'active', '[]', 0)")
+    for i in (1, 2):
+        connection.execute("INSERT INTO sources (id, node_id, serial, name, description, antenna, ppm) VALUES (?, 1, ?, 'S', '', '', 0)", (i, f"S{i}"))
+    connection.commit()
+    connection.close()
+    with make_session_factory(db)() as session:
+        assert sorted(s.rtl_tcp_port for s in session.scalars(select(Source))) == [1234, 1235]
+
+
+def test_slave_rtl_tcp_status_is_cleaned(ctx):
+    from sentrysdr.web.routes_nodes import handle_agent_message
+    for raw, expected in (({"address": "192.168.1.20:1234", "client": 1}, {"address": "192.168.1.20:1234", "client": True}),
+                          ({"address": "<b>evil</b>:1234", "client": True}, {}), ({"address": "10.0.0.1:99999"}, {}), ("x", {})):
+        handle_agent_message(ctx, 7, ["S"], {"t": "status", "sources": {"S": {"state": "listening", "rtl_tcp": raw}}})
+        assert ctx.status[(7, "S")]["rtl_tcp"] == expected
+
+
+# --- restarting by hand ---------------------------------------------------------------
+def test_restart_routes_are_admin_only_and_reach_the_node(ctx, admin, operator):
+    source = make_source(admin)
+    assert operator.post(f"/api/sources/{source}/restart").status_code == 403
+    assert operator.post(f"/api/nodes/{ctx.local_node_id}/restart").status_code == 403
+    # Radios aren't running in these tests, which is reported, not a crash.
+    assert admin.post(f"/api/sources/{source}/restart").status_code == 409
+    sent = []
+    with ctx.db() as session:
+        session.add(Node(name="Field", status="active", serials=["FIELD1"]))
+        session.commit()
+        field = session.scalar(select(Node).where(Node.name == "Field")).id
+    far = admin.post("/api/sources", json={"node_id": field, "serial": "FIELD1", "name": "Far"}).json()["id"]
+    assert admin.post(f"/api/sources/{far}/restart").status_code == 409  # offline
+    ctx.node_links[field] = SimpleNamespace(send=sent.append)
+    assert admin.post(f"/api/sources/{far}/restart").status_code == 200
+    assert admin.post(f"/api/nodes/{field}/restart").status_code == 200
+    assert sent == [{"t": "restart", "serial": "FIELD1"}, {"t": "restart_service"}]
+    with ctx.db() as session:
+        actions = [a.action for a in session.scalars(select(AuditLog))]
+    assert "source.restarted" in actions and "node.service_restarted" in actions

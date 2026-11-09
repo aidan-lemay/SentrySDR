@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import shutil
+import signal
 import time
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
@@ -262,6 +263,17 @@ class Slave:
             task = asyncio.create_task(self._measure(message))
             self.measure_tasks.add(task)
             task.add_done_callback(self.measure_tasks.discard)
+        elif kind == "restart":
+            serial = message.get("serial")
+            if serial in self.cfg.serials:
+                log.warning("master asked to restart SDR %s", serial)
+                task = asyncio.create_task(self.supervisor.restart(serial))
+                self.measure_tasks.add(task)
+                task.add_done_callback(self.measure_tasks.discard)
+        elif kind == "restart_service":
+            # Stops the way SIGTERM always does, saving the call in progress. systemd starts it again.
+            log.warning("master asked this service to restart")
+            asyncio.get_running_loop().call_later(1.0, os.kill, os.getpid(), signal.SIGTERM)
         elif kind == "revoked":
             log.error("master revoked this node; removing the device key")
             self.key_file.unlink(missing_ok=True)

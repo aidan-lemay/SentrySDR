@@ -5,6 +5,7 @@ Agent routes authenticate with a per-node bearer key, never a browser cookie.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
 import math
@@ -20,6 +21,7 @@ from sqlalchemy import select
 from .. import aio, feeds, security
 from ..config import SERIAL_RE
 from ..context import Context
+from ..engine import MeasureError
 from ..models import Node, Source, Target, User
 from .deps import admin_user, ctx_of, get_db, ip_of
 
@@ -80,6 +82,29 @@ def revoke_node(node_id: int, request: Request, admin: User = Depends(admin_user
         ctx.loop.call_soon_threadsafe(link.disconnect)
     ctx.audit("node.revoked", user=admin, ip=ip_of(request), target=node.name)
     return {"detail": "Revoked"}
+
+
+SERVICE_RESTART_LIMIT = 10
+SERVICE_RESTART_WINDOW = 3600
+
+
+@router.post("/{node_id}/restart")
+def restart_node_service(node_id: int, request: Request, admin: User = Depends(admin_user), db=Depends(get_db)):
+    """Restart SentrySDR on a node. It saves calls in progress first; systemd starts it again."""
+    ctx = ctx_of(request)
+    node = db.get(Node, node_id)
+    if node is None or node.status != "active":
+        raise HTTPException(404, "Node not found")
+    key = f"service-restart:{admin.id}"
+    if ctx.limiter.blocked(key, SERVICE_RESTART_LIMIT, SERVICE_RESTART_WINDOW):
+        raise HTTPException(429, "Too many restarts. Try again later.")
+    ctx.limiter.hit(key, SERVICE_RESTART_WINDOW)
+    ctx.audit("node.service_restarted", user=admin, ip=ip_of(request), target=node.name)
+    try:
+        ctx.restart_service(node)
+    except MeasureError as exc:
+        raise HTTPException(409, str(exc)) from None
+    return {"detail": f"{node.name} is restarting"}
 
 
 # --- agent endpoints -------------------------------------------------------
@@ -196,6 +221,9 @@ class NodeLink:
     def request_measure(self, request_id: str, serial: str, request: dict) -> None:
         self._queue({"t": "measure", "id": request_id, "serial": serial, **request})
 
+    def send(self, message: dict) -> None:
+        self._queue(message)
+
     def _queue(self, message: dict) -> None:
         try:
             self.outbox.put_nowait(json.dumps(message))
@@ -243,6 +271,20 @@ def _epoch(value) -> float | None:
     return value if math.isfinite(value) and 0 < value < 32503680000 else None
 
 
+def clean_rtl_tcp_status(raw) -> dict:
+    """The address a slave's rtl_tcp listens on, and whether a client is connected."""
+    if not isinstance(raw, dict):
+        return {}
+    address = str(raw.get("address") or "")
+    host, _, port = address.rpartition(":")
+    try:
+        ipaddress.ip_address(host)
+        valid = port.isdigit() and 0 < int(port) < 65536
+    except ValueError:
+        valid = False
+    return {"address": address, "client": bool(raw.get("client"))} if valid else {}
+
+
 def clean_feed_status(raw) -> dict:
     """A slave's report of its feeds, keeping only what the page shows."""
     if not isinstance(raw, dict):
@@ -267,6 +309,7 @@ def handle_agent_message(ctx: Context, node_id: int, allowed: list[str], message
                     "in_call": bool(status.get("in_call")), "call_started": _epoch(status.get("call_started")),
                     "last_call_at": _epoch(status.get("last_call_at")),
                     "note": str(status.get("note") or "")[:300], "feeds": clean_feed_status(status.get("feeds")),
+                    "rtl_tcp": clean_rtl_tcp_status(status.get("rtl_tcp")),
                 })
     elif kind == "measure_result":
         ctx.finish_measure(node_id, message)

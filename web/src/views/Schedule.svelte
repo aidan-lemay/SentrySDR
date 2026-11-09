@@ -145,7 +145,7 @@
       <label class="field wide"><span>Target</span>
         <select bind:value={form.target_id} required>
           <option value="" disabled>Choose...</option>
-          {#each targets as target (target.id)}<option value={target.id}>{target.name} ({formatMHz(target.frequency_hz)}){problemNote(chosenSource, target)}</option>{/each}
+          {#each targets.filter((t) => t.kind !== 'rtltcp' || user.role === 'admin' || t.id === Number(form.target_id)) as target (target.id)}<option value={target.id}>{target.name} ({formatMHz(target.frequency_hz)}){problemNote(chosenSource, target)}</option>{/each}
         </select>
         {#if form.target_id !== '' && stickProblems(chosenSource, targets.find((t) => t.id === Number(form.target_id))).length}
           <span class="hint st-warn">{chosenSource.name} may not suit that target: {stickProblems(chosenSource, targets.find((t) => t.id === Number(form.target_id))).join(', ')}. You can still schedule it.</span>

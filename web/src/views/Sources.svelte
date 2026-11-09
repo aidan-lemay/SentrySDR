@@ -28,6 +28,12 @@
   const can = (permission) => user.permissions.includes(permission);
   const isAdmin = user.role === 'admin';
   const canAssign = isAdmin || user.permissions.includes('assign');
+  const MODE_LABELS = { adsb: 'ADS-B', rtltcp: 'rtl_tcp' };
+  // What to paste into GQRX's Device string. The buffer settings help over a network.
+  const gqrxString = (address) => `rtl_tcp=${address},buffers=16,psize=16384`;
+  const wildcard = (address) => /^(0\.0\.0\.0|::|\[::\]):/.test(address);
+  // Only administrators can put an SDR on rtl_tcp. The current one stays listed so the picker shows it.
+  const assignable = (source) => targets.filter((t) => t.kind !== 'rtltcp' || isAdmin || t.id === source.base_target_id);
   // Only voice targets make calls. An idle SDR still offers the calls it made before.
   const records = (source) => !source.active_target || source.active_target.kind === 'audio';
 
@@ -93,6 +99,11 @@
       draft.editing = false;
       await refresh();
     }
+  }
+
+  function restart(source) {
+    if (!confirm(`Restart ${source.name}? Its tool stops and starts again, which takes a few seconds.`)) return;
+    act(source, `sources/${source.id}/restart`, { method: 'POST' }, 'Restarted. It may take a few seconds to show Listening.');
   }
 
   async function setLocked(source, box) {
@@ -197,7 +208,7 @@
               <div>
                 {#if source.active_target}
                   <span class="mono nowrap">{formatMHz(source.active_target.frequency_hz)}</span><br />
-                  {source.active_target.name} ({source.active_target.modulation.toUpperCase()})
+                  {source.active_target.name} ({MODE_LABELS[source.active_target.modulation] ?? source.active_target.modulation.toUpperCase()})
                   {#if source.active_target.kind === 'audio'}
                     <br /><span class="small">Squelch {source.active_target.squelch || 'off'}, gain {gainLabel(source.active_target.gain_db)}{source.active_target.from_profile ? ', saved profile' : ''}</span>
                   {/if}
@@ -218,17 +229,25 @@
                   <br /><span class="small">Feeding: {#each Object.entries(source.feeds.aggregators) as [key, up], i (key)}{i ? ', ' : ''}<span class={up ? 'st-ok' : 'st-warn'}>{feedLabel(key)} {up ? 'connected' : 'not connected'}</span>{/each}</span>
                 {/if}
                 {#if canAssign && source.feeds?.local_clients != null}<br /><span class="small">Local port: {source.feeds.local_clients} program{source.feeds.local_clients === 1 ? '' : 's'} reading</span>{/if}
+                {#if canAssign && source.rtl_tcp?.address}
+                  <br /><span class="small">rtl_tcp, <span class={source.rtl_tcp.client ? 'st-ok' : ''}>{source.rtl_tcp.client ? 'a program is connected' : 'waiting for a program to connect'}</span>. GQRX device string:</span>
+                  <br /><span class="mono small copyable" title="Double-click to select">{gqrxString(source.rtl_tcp.address)}</span>
+                  {#if wildcard(source.rtl_tcp.address)}<br /><span class="small st-warn">It listens on every address, so replace {source.rtl_tcp.address.replace(/:\d+$/, '')} with this machine's own.</span>{/if}
+                {/if}
                 {#if canAssign && source.feeds?.sending?.length}<br /><span class="small">Sending to {source.feeds.sending.map(feedLabel).join(', ')}</span>{/if}
               </div>
             </td>
             <td data-label="Last activity"><span class="small">{formatTime(source.last_call_at)}</span></td>
-            <td>
-              <div class="buttons" style="margin:0">
+            <td class="actions">
+              <div class="buttons">
                 {#if can('listen_live') && source.active_target?.kind === 'audio'}
                   <button onclick={() => (listening = listening === source.id ? null : source.id)}>{listening === source.id ? 'Stop' : 'Listen'}</button>
                 {/if}
                 {#if can('listen_recordings') && records(source)}
                   <button onclick={() => toggleRecent(source)}>{recent[source.id] ? 'Hide calls' : 'Calls'}</button>
+                {/if}
+                {#if isAdmin && source.state === 'error' && source.node_online}
+                  <button onclick={() => restart(source)} title="Stop and start this SDR's tool">Restart</button>
                 {/if}
                 {#if can('maps') && source.active_target?.kind === 'acars'}
                   <a class="button" href="#/messages">Messages</a>
@@ -263,7 +282,7 @@
                   <label class="field wide"><span>Target</span>
                     <select bind:value={draft.target} onchange={() => (draft.editing = true)}>
                       <option value="">None</option>
-                      {#each targets as target (target.id)}
+                      {#each assignable(source) as target (target.id)}
                         <option value={target.id}>{target.name} ({formatMHz(target.frequency_hz)}){problemNote(source, target)}</option>
                       {/each}
                     </select>

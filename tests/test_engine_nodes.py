@@ -1093,3 +1093,148 @@ def test_app_never_uses_asyncio_wait_for():
     root = Path(__file__).resolve().parent.parent / "sentrysdr"
     offenders = [str(p) for p in root.rglob("*.py") if p.name != "aio.py" and "asyncio.wait_for(" in p.read_text()]
     assert offenders == []
+
+
+# --- rtl_tcp ------------------------------------------------------------------------------
+FAKE_RTL_TCP = """#!/usr/bin/env python3
+import socket, sys, time
+open(sys.argv[0] + ".args", "w").write(" ".join(sys.argv[1:]))
+host, port = sys.argv[sys.argv.index("-a") + 1], int(sys.argv[sys.argv.index("-p") + 1])
+server = socket.socket(); server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); server.bind((host, port)); server.listen(1)
+while True:
+    conn, _ = server.accept()
+    while conn.recv(1024):
+        pass
+    conn.close()
+"""
+
+
+async def test_rtl_tcp_worker_reports_clients(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "RTL_TCP_CHECK_SECONDS", 0.2)
+    bins = tmp_path / "bin"
+    install_tool(bins, "rtl_tcp", FAKE_RTL_TCP)
+    probe = socket.socket(); probe.bind(("127.0.0.1", 0)); port = probe.getsockname()[1]; probe.close()
+    cfg = make_config(tmp_path, bin_dirs=[bins], rtl_tcp_bind="127.0.0.1")
+    sup = supervisor(cfg, [])
+    worker = sup.workers["SER1"]
+    try:
+        await sup.apply({"SER1": spec(kind="rtltcp", modulation="rtltcp", frequency_hz=162_550_000, squelch=0, rtl_tcp_port=port)})
+        assert await wait_for(lambda: worker.state == "listening")
+        assert worker.rtl_tcp == {"address": f"127.0.0.1:{port}", "client": False}
+        await asyncio.sleep(0.5)
+        client = socket.create_connection(("127.0.0.1", port))
+        assert await wait_for(lambda: worker.rtl_tcp.get("client") is True, 5)
+        assert worker.snapshot()["rtl_tcp"]["client"] is True
+        client.close()
+        assert await wait_for(lambda: worker.rtl_tcp.get("client") is False, 5)
+        assert (bins / "rtl_tcp.args").read_text() == f"-a 127.0.0.1 -p {port} -d 0 -f 162550000"
+    finally:
+        await sup.shutdown()
+
+
+async def test_going_idle_clears_old_feed_and_rtl_tcp_status(tmp_path):
+    bins = tmp_path / "bin"
+    install_tool(bins, "rtl_tcp", FAKE_RTL_TCP)
+    sup = supervisor(make_config(tmp_path, bin_dirs=[bins]), [])
+    worker = sup.workers["SER1"]
+    try:
+        await sup.apply({"SER1": spec(kind="rtltcp", modulation="rtltcp", frequency_hz=162_550_000, squelch=0, rtl_tcp_port=31251)})
+        assert await wait_for(lambda: worker.rtl_tcp)
+        worker.feed_status = {"aggregators": {"adsbx": False}}
+        await sup.apply({"SER1": None})
+        assert worker.state == "idle" and worker.snapshot()["rtl_tcp"] == {} and worker.snapshot()["feeds"] == {}
+    finally:
+        await sup.shutdown()
+
+
+# --- an unplugged stick, and restarting by hand ---------------------------------------------
+HANGING_TOOL = """#!/usr/bin/env python3
+import os, sys, time
+open(sys.argv[0] + ".pids", "a").write(str(os.getpid()) + "\\n")
+time.sleep(100000)  # like a decoder that hangs instead of exiting when its stick is pulled
+"""
+
+
+async def test_unplugged_stick_stops_a_hung_tool_and_recovers(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "PRESENCE_SECONDS", 0.2)
+    monkeypatch.setattr(engine, "RESTART_MIN", 0.3)
+    bins = tmp_path / "bin"
+    install_tool(bins, "rtl_fm", HANGING_TOOL)
+    plugged = {"SER1"}
+    cfg = make_config(tmp_path, bin_dirs=[bins])
+    sup = Supervisor(cfg, lambda *a: None, lambda *a: None, lambda *a: None, lambda *a: None,
+                     enumerate_fn=lambda: sorted(plugged), present_fn=lambda: set(plugged))
+    worker = sup.workers["SER1"]
+    pids = lambda: (bins / "rtl_fm.pids").read_text().split() if (bins / "rtl_fm.pids").exists() else []
+    try:
+        await sup.apply({"SER1": spec()})
+        assert await wait_for(lambda: worker.state == "listening" and len(pids()) == 1)
+        plugged.clear()  # pulled out
+        assert await wait_for(lambda: worker.state == "error" and worker.error in engine.UNPLUGGED, 5)
+        first = int(pids()[0])
+        assert await wait_for(lambda: not os.path.exists(f"/proc/{first}") or open(f"/proc/{first}/stat").read().split()[2] == "Z", 5)
+        plugged.add("SER1")  # plugged back in
+        assert await wait_for(lambda: worker.state == "listening" and len(pids()) == 2, 5)
+        assert worker.error == ""
+    finally:
+        await sup.shutdown()
+
+
+async def test_presence_unknown_never_counts_as_unplugged(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "PRESENCE_SECONDS", 0.1)
+    bins = tmp_path / "bin"
+    install_tool(bins, "rtl_fm", HANGING_TOOL)
+    sup = Supervisor(make_config(tmp_path, bin_dirs=[bins]), lambda *a: None, lambda *a: None, lambda *a: None, lambda *a: None,
+                     enumerate_fn=lambda: ["SER1"], present_fn=lambda: None)  # not Linux: can't tell
+    worker = sup.workers["SER1"]
+    try:
+        await sup.apply({"SER1": spec()})
+        assert await wait_for(lambda: worker.state == "listening")
+        await asyncio.sleep(0.6)
+        assert worker.state == "listening"
+    finally:
+        await sup.shutdown()
+
+
+async def test_restart_starts_the_tool_again(tmp_path):
+    bins = tmp_path / "bin"
+    install_tool(bins, "rtl_fm", HANGING_TOOL)
+    sup = supervisor(make_config(tmp_path, bin_dirs=[bins]), [])
+    worker = sup.workers["SER1"]
+    pids = lambda: (bins / "rtl_fm.pids").read_text().split() if (bins / "rtl_fm.pids").exists() else []
+    try:
+        await sup.apply({"SER1": spec()})
+        assert await wait_for(lambda: len(pids()) == 1)
+        await sup.restart("SER1")
+        assert await wait_for(lambda: len(pids()) == 2 and worker.state == "listening")
+        with pytest.raises(engine.MeasureError):
+            await sup.restart("NOT-MINE")
+    finally:
+        await sup.shutdown()
+
+
+async def test_real_sysfs_reading(tmp_path):
+    from sentrysdr import sdr
+    for name, vendor, product, serial in (("1-1", "0bda", "2838", "AAA"), ("1-2", "0bda", "2832", "BBB"), ("1-3", "046d", "c52b", "MOUSE"), ("1-4", "0bda", "2838", None)):
+        d = tmp_path / name; d.mkdir()
+        (d / "idVendor").write_text(vendor + "\n"); (d / "idProduct").write_text(product + "\n")
+        if serial:
+            (d / "serial").write_text(serial + "\n")
+    assert sdr.present_serials(str(tmp_path)) == {"AAA", "BBB"}
+    assert sdr.present_serials(str(tmp_path / "missing")) is None
+
+
+async def test_slave_obeys_restart_messages(tmp_path, monkeypatch):
+    cfg = make_config(tmp_path, role="slave", master_url="https://sentry.example.com", serials=["FIELD1"])
+    slave = Slave(cfg, enumerate_fn=lambda: ["FIELD1"])
+    restarted, killed = [], []
+    async def fake_restart(serial):
+        restarted.append(serial)
+    monkeypatch.setattr(slave.supervisor, "restart", fake_restart)
+    monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append(sig))
+    await slave.handle_message({"t": "restart", "serial": "FIELD1"})
+    await slave.handle_message({"t": "restart", "serial": "NOT-MINE"})
+    await slave.handle_message({"t": "restart_service"})
+    await asyncio.sleep(1.3)
+    assert restarted == ["FIELD1"] and killed == [signal.SIGTERM]
+    await slave.supervisor.shutdown()
