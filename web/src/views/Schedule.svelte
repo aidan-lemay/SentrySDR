@@ -185,10 +185,10 @@
       {/if}
       <label class="field"><span>When it ends</span>
         <select bind:value={form.onEnd}>
-          <option value="return">{chosenSource?.base_target_id ? 'Go back to the target it had before' : 'Go back to what it had before (nothing, if unassigned)'}</option>
-          <option value="keep">Keep this target assigned</option>
+          <option value="return">Go back</option>
+          <option value="keep">Keep this target</option>
         </select>
-        <span class="hint">{form.onEnd === 'keep' ? 'When the time runs out, this target becomes the source\'s normal assignment, even if it had none. Turning the schedule off early doesn\'t.' : 'The source returns to its normal assignment, or to unassigned if it had none.'}</span>
+        <span class="hint">{form.onEnd === 'keep' ? 'When the time runs out, this target becomes the source\'s normal assignment, even if it had none. Turning the schedule off early doesn\'t.' : (chosenSource && !chosenSource.base_target_id ? 'The source goes back to having no assignment.' : 'The source goes back to its normal assignment.')}</span>
       </label>
       <div class="field">
         <span>Enabled</span>
