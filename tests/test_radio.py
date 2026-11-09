@@ -2193,6 +2193,73 @@ def test_sdr_faults_and_failed_uploads_warn(ctx, admin, monkeypatch):
     assert "2 uploads failed in the last day" in warnings_text(admin)
 
 
+def test_admin_mutes_a_warning_for_themselves_only(ctx, admin, operator, monkeypatch):
+    monkeypatch.setattr(health_module, "clock_synced", lambda: True)
+    monkeypatch.setattr(health_module, "disk", lambda path: {"free": 10**12, "total": 2 * 10**12})
+    gone = add_slave(ctx, "Gone", online=False, last_seen=time.time() - 3600)
+    key = f"node.offline:{gone}"
+    assert any(w["key"] == key for w in admin.get("/api/warnings").json())
+    assert admin.post("/api/admin/warnings/mute", json={"key": key, "hours": 2}).status_code == 200
+    assert "Gone is offline" not in warnings_text(admin)
+    assert "Gone is offline" in warnings_text(operator)  # mutes are each admin's own
+    listed = {w["key"]: w for w in admin.get("/api/admin/warnings").json()["current"]}
+    assert listed[key]["muted"] and listed[key]["muted_until"] > time.time() + 7000
+    # Indefinitely, then back.
+    admin.post("/api/admin/warnings/mute", json={"key": key, "hours": None}).raise_for_status()
+    listed = {w["key"]: w for w in admin.get("/api/admin/warnings").json()["current"]}
+    assert listed[key]["muted"] and listed[key]["muted_until"] is None
+    admin.post("/api/admin/warnings/unmute", json={"key": key}).raise_for_status()
+    assert "Gone is offline" in warnings_text(admin)
+
+
+def test_a_mute_runs_out_and_survives_the_warning_clearing(ctx, admin, monkeypatch):
+    monkeypatch.setattr(health_module, "clock_synced", lambda: True)
+    monkeypatch.setattr(health_module, "disk", lambda path: {"free": 10**12, "total": 2 * 10**12})
+    gone = add_slave(ctx, "Gone", online=False, last_seen=time.time() - 3600)
+    key = f"node.offline:{gone}"
+    admin.post("/api/admin/warnings/mute", json={"key": key, "hours": 1}).raise_for_status()
+    ctx.node_links[gone] = SimpleNamespace(send=lambda m: None)  # back online: the warning clears
+    reply = admin.get("/api/admin/warnings").json()
+    assert reply["cleared"] == [{"key": key, "text": reply["cleared"][0]["text"], "muted_until": reply["cleared"][0]["muted_until"]}]
+    assert "Gone is offline" in reply["cleared"][0]["text"]
+    del ctx.node_links[gone]
+    real = time.time
+    monkeypatch.setattr(time, "time", lambda: real() + 2 * 3600)
+    assert "Gone is offline" in warnings_text(admin)
+    assert admin.get("/api/admin/warnings").json()["cleared"] == []
+
+
+def test_muting_needs_an_admin_and_a_current_warning(ctx, admin, operator, monkeypatch):
+    monkeypatch.setattr(health_module, "clock_synced", lambda: True)
+    monkeypatch.setattr(health_module, "disk", lambda path: {"free": 10**12, "total": 2 * 10**12})
+    gone = add_slave(ctx, "Gone", online=False, last_seen=time.time() - 3600)
+    assert operator.post("/api/admin/warnings/mute", json={"key": f"node.offline:{gone}"}).status_code == 403
+    assert operator.get("/api/admin/warnings").status_code == 403
+    assert admin.post("/api/admin/warnings/mute", json={"key": "node.offline:9999"}).status_code == 404
+    assert admin.post("/api/admin/warnings/mute", json={"key": f"node.offline:{gone}", "hours": 0}).status_code == 422
+
+
+def test_quiet_offline_node_and_source(ctx, admin, operator, monkeypatch):
+    monkeypatch.setattr(health_module, "clock_synced", lambda: True)
+    monkeypatch.setattr(health_module, "disk", lambda path: {"free": 10**12, "total": 2 * 10**12})
+    gone = add_slave(ctx, "Gone", online=False, last_seen=time.time() - 3600)
+    assert admin.post(f"/api/nodes/{gone}/quiet", json={"quiet": True}).json() == {"quiet_offline": True}
+    assert operator.post(f"/api/nodes/{gone}/quiet", json={"quiet": False}).status_code == 403
+    assert admin.post(f"/api/nodes/{ctx.local_node_id}/quiet", json={"quiet": True}).status_code == 404
+    assert "Gone" not in warnings_text(admin) and "Gone" not in warnings_text(operator)  # for everyone
+    listed = {w["key"]: w for w in admin.get("/api/admin/warnings").json()["current"]}
+    assert listed[f"node.offline:{gone}"]["quiet"]  # still on the admin list, saying why it's quiet
+    assert next(n for n in admin.get("/api/nodes").json() if n["id"] == gone)["quiet_offline"] is True
+
+    source = make_source(admin, name="Roof stick", quiet_offline=True)
+    admin.post(f"/api/sources/{source}/assign", json={"target_id": make_target(admin)}).raise_for_status()
+    assert source_row(admin, source)["quiet_offline"] is True
+    ctx.set_status(ctx.local_node_id, "SER1", {"state": "error", "error": "SDR disconnected"})
+    assert "Roof stick" not in warnings_text(admin)
+    ctx.set_status(ctx.local_node_id, "SER1", {"state": "error", "error": "tool not installed: rtl_fm"})
+    assert "Roof stick: tool not installed" in warnings_text(operator)  # other faults still warn
+
+
 def test_clean_health_report():
     report = clean_health({"time": "nonsense", "clock_synced": "yes", "disk": {"free": -1, "total": 5}})
     assert report["skew"] is None and report["clock_synced"] is None and "disk" not in report
@@ -2461,35 +2528,6 @@ def test_marking_a_message_important(ctx, operator, listener):
         message_id = session.scalars(select(AcarsMessage)).first().id
     assert operator.post(f"/api/messages/{message_id}/important", json={"important": True}).json() == {"important": True}
     assert [m["id"] for m in listener.get("/api/messages?important=true").json()["items"]] == [message_id]
-
-
-# --- activity --------------------------------------------------------------------------------
-def test_activity_stats(ctx, admin, listener):
-    tz = ctx.cfg.tz
-    today_noon = datetime.now(tz).replace(hour=12, minute=0, second=0, microsecond=0)
-    with ctx.db() as session:
-        for offset_days, hour, target, source, duration in ((0, 12, "Fire", "Roof", 30), (0, 12, "Fire", "Roof", 30),
-                                                            (1, 9, "Net", "Field", 60), (40, 9, "Old", "Roof", 10)):
-            moment = (today_noon - timedelta(days=offset_days)).replace(hour=hour)
-            session.add(Recording(id=str(uuid.uuid4()), started_at=moment.timestamp(), ended_at=moment.timestamp() + duration,
-                                  duration=duration, target_name=target, source_name=source, rel_path="x.mp3"))
-        session.flush()
-        first = session.scalars(select(Recording).where(Recording.target_name == "Fire")).first()
-        session.add_all([UploadJob(recording_id=first.id, destination="broadcastify", status="done"),
-                         UploadJob(recording_id=first.id, destination="rdio", status="failed")])
-        session.commit()
-    got = listener.get("/api/stats?days=7").json()
-    assert got["totals"]["calls"] == 3 and got["totals"]["today"] == 2 and len(got["per_day"]) == 7
-    assert got["per_day"][-1]["calls"] == 2 and got["per_day"][-2]["calls"] == 1
-    assert got["by_hour"][today_noon.weekday()][12] == 2
-    assert [c["name"] for c in got["channels"]] == ["Fire", "Net"] and got["channels"][0]["seconds"] == 60
-    assert got["sdrs"][0]["name"] in ("Roof", "Field") and 0 < got["sdrs"][0]["busy"] < 1
-    assert "uploads" not in got  # listeners don't see upload results
-    uploads = {u["destination"]: u for u in admin.get("/api/stats?days=7").json()["uploads"]}
-    assert uploads["broadcastify"]["sent"] == 1 and uploads["rdio"]["failed"] == 1
-    assert admin.get("/api/stats?days=30").json()["totals"]["calls"] == 3
-    assert admin.get("/api/stats?days=90").json()["totals"]["calls"] == 4
-    assert admin.get("/api/stats?days=12345").json()["days"] == 30
 
 
 # --- map: trails, receivers and coverage -------------------------------------------------------

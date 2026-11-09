@@ -5,7 +5,7 @@ import json
 import time
 from pathlib import Path
 
-from sqlalchemy import JSON, ForeignKey, Index, String, create_engine, event, inspect, text
+from sqlalchemy import JSON, ForeignKey, Index, String, create_engine, event, inspect, text, UniqueConstraint
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
@@ -86,6 +86,7 @@ class Node(Base):
     created_at: Mapped[float] = mapped_column(default=now)
     version: Mapped[str | None] = mapped_column(String(32), nullable=True)  # as the node reported it
     build: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    quiet_offline: Mapped[bool | None] = mapped_column(nullable=True)  # known to be offline at times: no warning
 
 
 class Source(Base):
@@ -115,6 +116,7 @@ class Source(Base):
     lat: Mapped[float | None] = mapped_column(nullable=True)
     lon: Mapped[float | None] = mapped_column(nullable=True)
     alt_m: Mapped[float | None] = mapped_column(nullable=True)
+    quiet_offline: Mapped[bool | None] = mapped_column(nullable=True)  # no warning while its stick is unplugged
     __table_args__ = (Index("uq_source_node_serial", "node_id", "serial", unique=True),)
 
 
@@ -268,6 +270,18 @@ class UserKeyword(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     word: Mapped[str] = mapped_column(String(80))
     applies: Mapped[str] = mapped_column(String(8), default="both")  # calls|messages|both
+    created_at: Mapped[float] = mapped_column(default=now)
+
+
+class WarningMute(Base):
+    """One admin's choice not to see one warning, until a time or (until None) for good."""
+    __tablename__ = "warning_mutes"
+    __table_args__ = (UniqueConstraint("user_id", "key"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    key: Mapped[str] = mapped_column(String(120))
+    text: Mapped[str] = mapped_column(String(500), default="")  # the warning as it was, for when it's gone
+    until: Mapped[float | None] = mapped_column(nullable=True)
     created_at: Mapped[float] = mapped_column(default=now)
 
 

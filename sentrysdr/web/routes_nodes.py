@@ -49,7 +49,7 @@ def _view(ctx: Context, node: Node) -> dict:
         "id": node.id, "name": node.name, "is_local": node.is_local, "status": node.status,
         "online": ctx.node_online(node) and node.status == "active",
         "serials": node.serials or [], "last_seen_at": node.last_seen_at, "last_ip": node.last_ip,
-        "enroll_expires_at": node.enroll_expires_at,
+        "enroll_expires_at": node.enroll_expires_at, "quiet_offline": bool(node.quiet_offline),
     }
 
 
@@ -91,6 +91,22 @@ def revoke_node(node_id: int, request: Request, admin: User = Depends(admin_user
         ctx.loop.call_soon_threadsafe(link.disconnect)
     ctx.audit("node.revoked", user=admin, ip=ip_of(request), target=node.name)
     return {"detail": "Revoked"}
+
+
+class QuietBody(BaseModel):
+    quiet: bool
+
+
+@router.post("/{node_id}/quiet")
+def set_quiet(node_id: int, body: QuietBody, request: Request, admin: User = Depends(admin_user), db=Depends(get_db)):
+    """For a slave that's offline on purpose at times: no warning about it being offline, for anyone."""
+    node = db.get(Node, node_id)
+    if node is None or node.is_local:
+        raise HTTPException(404, "Node not found")
+    node.quiet_offline = body.quiet or None
+    db.commit()
+    ctx_of(request).audit("node.quiet_offline", user=admin, ip=ip_of(request), target=node.name, details={"quiet": body.quiet})
+    return {"quiet_offline": bool(node.quiet_offline)}
 
 
 SERVICE_RESTART_LIMIT = 10

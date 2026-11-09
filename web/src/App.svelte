@@ -11,7 +11,6 @@
   import Messages from './views/Messages.svelte';
   import Scanner from './views/Scanner.svelte';
   import Alerts from './views/Alerts.svelte';
-  import Activity from './views/Activity.svelte';
   import Account from './views/Account.svelte';
   import Admin from './views/Admin.svelte';
 
@@ -28,7 +27,6 @@
     { id: 'recordings', label: 'Recordings', show: can('listen_recordings') },
     { id: 'scanner', label: 'Scanner', show: can('listen_recordings') },
     { id: 'targets', label: 'Targets', show: can('manage_targets') },
-    { id: 'activity', label: 'Activity', show: can('listen_recordings') },
     { id: 'maps', label: 'Maps', show: can('maps') },
     { id: 'messages', label: 'Messages', show: can('maps') },
     { id: 'alerts', label: 'Alerts', show: can('listen_recordings') || can('maps'), count: alertCount },
@@ -108,7 +106,7 @@
     {/if}
   </header>
   <main>
-    {#if !user.must_change_password && (user.role === 'admin' || user.role === 'operator')}<Warnings />{/if}
+    {#if !user.must_change_password && (user.role === 'admin' || user.role === 'operator')}<Warnings admin={user.role === 'admin'} />{/if}
     {#if user.must_change_password}
       <Account {user} onChange={refreshUser} forced />
     {:else if view === 'schedule'}
@@ -119,8 +117,6 @@
       <Targets {user} />
     {:else if view === 'maps'}
       <Maps {user} />
-    {:else if view === 'activity'}
-      <Activity />
     {:else if view === 'alerts'}
       <Alerts onSeen={refreshAlerts} />
     {:else if view === 'scanner'}

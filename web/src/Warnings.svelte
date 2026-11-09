@@ -4,6 +4,8 @@
   import { onMount } from 'svelte';
   import { api } from './lib.js';
 
+  let { admin = false } = $props();
+
   let warnings = $state([]);
   let open = $state(false);
 
@@ -19,7 +21,11 @@
   onMount(() => {
     load();
     const timer = setInterval(load, 30000);
-    return () => clearInterval(timer);
+    addEventListener('warnings-changed', load);  // a mute or a node set quiet, from the Admin page
+    return () => {
+      clearInterval(timer);
+      removeEventListener('warnings-changed', load);
+    };
   });
 
   const bad = $derived(warnings.some((w) => w.level === 'bad'));
@@ -39,5 +45,6 @@
     {:else if warnings.length > 1}
       <span class="small"> (show)</span>
     {/if}
+    {#if admin}<a class="small warning-manage" href="#/admin?tab=warnings">Mute</a>{/if}
   </div>
 {/if}

@@ -23,7 +23,7 @@ from sqlalchemy import delete, func, or_, select
 from . import aio
 from . import BUILD_ID, __version__, acars, capabilities, coverage, health, pipelines, schedule, uploaders
 from .config import Config
-from .engine import MeasureError, Supervisor
+from .engine import UNPLUGGED, MeasureError, Supervisor
 from .live import LiveHub
 from .models import AcarsMessage, AuditLog, BroadcastifySystem, Node, Recorder, Recording, SdrProfile, Setting, Source, Target, UploadJob, UserSession, make_session_factory
 from .sdr import enumerate_serials
@@ -758,50 +758,58 @@ class Context:
 
     # --- health ------------------------------------------------------------
     def health_warnings(self) -> list[dict]:
-        """Problems an admin or operator should know about. Each has a level, text and a page to look at."""
+        """Problems an admin or operator should know about, muted or not.
+
+        Each has a stable key (what it's about, so a mute follows it), a level, text and a page to look at.
+        quiet says why nobody is warned, when a node or source is set not to warn while it's offline.
+        """
         warnings: list[dict] = []
         now_ = time.time()
 
-        def add(level: str, text: str, page: str) -> None:
-            warnings.append({"level": level, "text": text, "page": page})
+        def add(key: str, level: str, text: str, page: str, quiet: str | None = None) -> None:
+            warnings.append({"key": key, "level": level, "text": text, "page": page, "quiet": quiet})
 
         with self.db() as session:
             for node in session.scalars(select(Node).where(Node.status == "active")):
                 online = self.node_online(node)
                 if not node.is_local and not online and (now_ - (node.last_seen_at or 0)) > NODE_OFFLINE_WARN_SECONDS:
                     since = f" since {datetime.fromtimestamp(node.last_seen_at, self.cfg.tz):%Y-%m-%d %H:%M}" if node.last_seen_at else ""
-                    add("bad", f"{node.name} is offline{since}.", "#/admin")
+                    add(f"node.offline:{node.id}", "bad", f"{node.name} is offline{since}.", "#/admin",
+                        "Set not to warn when it's offline, under Nodes." if node.quiet_offline else None)
                 if not node.is_local and online and node.build != BUILD_ID:
-                    add("warn", f"{node.name} runs a different version ({node.version or 'unknown'}) from this server "
+                    add(f"node.version:{node.id}", "warn", f"{node.name} runs a different version ({node.version or 'unknown'}) from this server "
                                 f"({__version__}). Upgrade it so measuring, detecting and restarts work.", "#/admin")
                 report = {"clock_synced": health.clock_synced(), "disk": health.disk(self.cfg.recordings_dir), "skew": 0} \
                     if node.is_local else (self.node_health.get(node.id) if online else None)
                 if not report:
                     continue
                 if report.get("clock_synced") is False:
-                    add("warn", f"{node.name}'s clock isn't synced. Broadcastify rejects calls with wrong times; check timedatectl.", "#/admin")
+                    add(f"node.clock:{node.id}", "warn", f"{node.name}'s clock isn't synced. Broadcastify rejects calls with wrong times; check timedatectl.", "#/admin")
                 elif report.get("skew") is not None and abs(report["skew"]) > CLOCK_SKEW_WARN_SECONDS:
-                    add("warn", f"{node.name}'s clock is {abs(report['skew']):.0f} seconds off this server's.", "#/admin")
+                    add(f"node.clock:{node.id}", "warn", f"{node.name}'s clock is {abs(report['skew']):.0f} seconds off this server's.", "#/admin")
                 disk = report.get("disk")
                 if disk and (disk["free"] < DISK_WARN_BYTES or disk["free"] < disk["total"] * DISK_WARN_FRACTION):
-                    add("bad", f"{node.name} has {disk['free'] / 1e9:.1f} GB free of {disk['total'] / 1e9:.0f} GB."
+                    add(f"node.disk:{node.id}", "bad", f"{node.name} has {disk['free'] / 1e9:.1f} GB free of {disk['total'] / 1e9:.0f} GB."
                                f"{' Set a size limit for recordings under Admin > Settings.' if node.is_local else ''}", "#/admin")
             winners = schedule.resolve(list(session.scalars(select(Recorder))), datetime.now(self.cfg.tz))
             for source in session.scalars(select(Source).order_by(Source.name)):
                 node = session.get(Node, source.node_id)
                 status = self.status.get((source.node_id, source.serial), {})
                 if source.id in winners and node and self.node_online(node) and status.get("state") == "error":
-                    add("bad", f"{source.name}: {status.get('error') or 'fault'}", "#/sources")
+                    error = status.get("error") or "fault"
+                    quiet = "Set not to warn while its stick is unplugged, under SDR sources." \
+                        if source.quiet_offline and error in UNPLUGGED else None
+                    add(f"source.fault:{source.id}", "bad", f"{source.name}: {error}", "#/sources", quiet)
             failed = session.scalar(select(func.count()).select_from(UploadJob).join(Recording).where(
                 UploadJob.status == "failed", Recording.started_at > now_ - 86400))
             if failed:
-                add("warn", f"{failed} upload{'s' if failed != 1 else ''} failed in the last day. The reason shows on each recording.",
+                add("uploads.failed", "warn", f"{failed} upload{'s' if failed != 1 else ''} failed in the last day. The reason shows on each recording.",
                     "#/recordings")
             limit_gb = float(self.get_setting("recording_retention_gb") or 0)
             if limit_gb > 0:
                 protected = session.scalar(select(func.coalesce(func.sum(Recording.size_bytes), 0)).where(Recording.protected.is_(True)))
                 if protected > limit_gb * 1e9:
-                    add("warn", f"Protected recordings alone ({protected / 1e9:.1f} GB) exceed the {limit_gb:g} GB limit, "
+                    add("recordings.limit", "warn", f"Protected recordings alone ({protected / 1e9:.1f} GB) exceed the {limit_gb:g} GB limit, "
                                 "so nothing more can be removed to stay under it.", "#/recordings")
         return warnings
 

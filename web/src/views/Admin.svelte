@@ -5,7 +5,8 @@
   import { clearAfter, NOTICE_MS } from '../notice.svelte.js';
   import GainField from '../GainField.svelte';
 
-  const TABS = [['users', 'Users'], ['sources', 'SDR sources'], ['antennas', 'Antennas'], ['nodes', 'Nodes'], ['bans', 'Bans'], ['audit', 'Audit log'], ['settings', 'Settings'], ['uploads', 'Uploads and feeds']];
+  const TABS = [['users', 'Users'], ['sources', 'SDR sources'], ['antennas', 'Antennas'], ['nodes', 'Nodes'], ['bans', 'Bans'], ['audit', 'Audit log'], ['settings', 'Settings'], ['uploads', 'Uploads and feeds'], ['warnings', 'Warnings']];
+  const MUTE_CHOICES = [['1', '1 hour'], ['4', '4 hours'], ['8', '8 hours'], ['24', '1 day'], ['72', '3 days'], ['168', '1 week'], ['', 'Until I unmute it']];
   const PERMISSIONS = [
     ['listen_live', 'Listen live'], ['listen_recordings', 'Play recordings'], ['download', 'Download'],
     ['assign', 'Assign and schedule'], ['manage_targets', 'Manage targets'], ['protect', 'Protect recordings'],
@@ -27,7 +28,7 @@
   let nodes = $state([]);
   const blankSource = () => ({
     id: null, key: '', name: '', description: '', antenna_id: '', gain: DEFAULT_GAIN_DB, ppm: 0,
-    tuner: '', steps: '', capMin: '', capMax: '', uses: [], rtlTcpPort: '', lat: '', lon: '', alt: '',
+    tuner: '', steps: '', capMin: '', capMax: '', uses: [], rtlTcpPort: '', lat: '', lon: '', alt: '', quiet: false,
   });
   const TUNERS = ['R820T', 'R820T2', 'R828D', 'FC0012', 'FC0013', 'FC2580', 'E4000'];
   let detecting = $state(false);
@@ -44,6 +45,9 @@
 
   let bans = $state([]);
   let ban = $state({ kind: 'ip', value: '', reason: '' });
+
+  let warnings = $state({ current: [], cleared: [] });
+  let muteFor = $state({});
 
   let audit = $state([]);
   let auditSearch = $state('');
@@ -85,6 +89,7 @@
     audit: async () => { audit = await api(`admin/audit?limit=200${auditSearch ? `&search=${encodeURIComponent(auditSearch)}` : ''}`); },
     settings: async () => { settings = await api('admin/settings'); systems = await api('admin/broadcastify'); },
     uploads: async () => { settings = await api('admin/settings'); systems = await api('admin/broadcastify'); },
+    warnings: async () => { warnings = await api('admin/warnings'); },
   };
 
   function open(next) {
@@ -93,10 +98,22 @@
     selected = null;
     oneTimeSecret = null;
     enrolment = null;
+    if (location.hash !== `#/admin?tab=${next}`) history.replaceState(null, '', `#/admin?tab=${next}`);
     run(loaders[next]);
   }
 
-  onMount(() => open('users'));
+  // The address names the section, so #/admin?tab=warnings (from the warnings banner) opens it.
+  function openFromAddress() {
+    if (!location.hash.startsWith('#/admin')) return;
+    const wanted = new URLSearchParams(location.hash.split('?')[1] ?? '').get('tab');
+    open(TABS.some(([id]) => id === wanted) ? wanted : 'users');
+  }
+
+  onMount(() => {
+    openFromAddress();
+    addEventListener('hashchange', openFromAddress);
+    return () => removeEventListener('hashchange', openFromAddress);
+  });
 
   // --- users
   async function updateUser(user, body, success) {
@@ -156,7 +173,7 @@
       cap_max_hz: filled(sourceForm.capMax) ? toHz(sourceForm.capMax) : null, uses: sourceForm.uses,
       rtl_tcp_port: filled(sourceForm.rtlTcpPort) ? Number(sourceForm.rtlTcpPort) : null,
       lat: filled(sourceForm.lat) ? Number(sourceForm.lat) : null, lon: filled(sourceForm.lon) ? Number(sourceForm.lon) : null,
-      alt_m: filled(sourceForm.alt) ? Number(sourceForm.alt) : null,
+      alt_m: filled(sourceForm.alt) ? Number(sourceForm.alt) : null, quiet_offline: sourceForm.quiet,
     };
     if (body.gain_steps.some(Number.isNaN)) {
       error = 'Gain steps must be numbers, separated by spaces or commas.';
@@ -179,7 +196,7 @@
       tuner: source.tuner, steps: source.gain_steps.join(' '),
       capMin: source.cap_min_hz == null ? '' : plain(source.cap_min_hz), capMax: source.cap_max_hz == null ? '' : plain(source.cap_max_hz),
       uses: [...source.uses], rtlTcpPort: source.rtl_tcp_port ?? '',
-      lat: source.lat ?? '', lon: source.lon ?? '', alt: source.alt_m ?? '',
+      lat: source.lat ?? '', lon: source.lon ?? '', alt: source.alt_m ?? '', quiet: !!source.quiet_offline,
     };
     document.getElementById('source-form')?.scrollIntoView();
   }
@@ -311,6 +328,29 @@
     await api(`nodes/${node.id}`, { method: 'DELETE' });
     await loaders.nodes();
   }, `${node.name} revoked.`);
+
+  // --- nodes: no warning while offline
+  const setNodeQuiet = (node, quiet) => run(async () => {
+    await api(`nodes/${node.id}/quiet`, { method: 'POST', body: { quiet } });
+    await loaders.nodes();
+    dispatchEvent(new Event('warnings-changed'));
+  }, quiet ? `No warnings when ${node.name} is offline.` : `${node.name} warns when offline again.`);
+
+  // --- warnings: muted for this admin only
+  const muteWarning = (warning) => run(async () => {
+    const hours = muteFor[warning.key] ?? '8';
+    await api('admin/warnings/mute', { method: 'POST', body: { key: warning.key, hours: hours === '' ? null : Number(hours) } });
+    await loaders.warnings();
+    dispatchEvent(new Event('warnings-changed'));
+  }, 'Warning muted for you.');
+
+  const unmuteWarning = (key) => run(async () => {
+    await api('admin/warnings/unmute', { method: 'POST', body: { key } });
+    await loaders.warnings();
+    dispatchEvent(new Event('warnings-changed'));
+  }, 'Warning unmuted.');
+
+  const muteText = (until) => (until ? `Muted for you until ${formatTime(until)}` : 'Muted for you until you unmute it');
 
   // --- bans
   async function addBan(event) {
@@ -646,6 +686,10 @@
         <input class="mono" type="number" inputmode="numeric" min="1024" max="65535" placeholder="Picked for you" bind:value={sourceForm.rtlTcpPort} />
         <span class="hint">Used when this SDR is on an rtl_tcp target. Each SDR on one machine needs its own. The address is set in that machine's configuration file.</span>
       </label>
+      <div class="field"><span>Warnings</span>
+        <label class="tick"><input type="checkbox" bind:checked={sourceForm.quiet} /> Don't warn if its stick is unplugged</label>
+        <span class="hint">For everyone. Other faults still warn. The warning still shows under Admin, Warnings.</span>
+      </div>
     </fieldset>
     <fieldset>
       <legend>What this stick can do</legend>
@@ -775,6 +819,9 @@
             <td data-label="Status">
               <span>
                 <span class={statusClass(node.status)}>{node.status}</span>{#if node.status === 'active'}, <span class={node.online ? 'st-ok' : 'st-warn'}>{node.online ? 'online' : 'offline'}</span>{/if}
+                {#if !node.is_local && node.status !== 'revoked'}
+                  <label class="tick small"><input type="checkbox" checked={node.quiet_offline} onchange={(event) => setNodeQuiet(node, event.target.checked)} /> Don't warn if offline</label>
+                {/if}
               </span>
             </td>
             <td data-label="Version">
@@ -962,5 +1009,44 @@
       </div>
     </fieldset>
   </form>
+  {/if}
+{/if}
+
+{#if tab === 'warnings'}
+  <p class="small dim">Everything that needs attention now, including what's hidden. Muting is for you only: other admins and operators still see it. To stop a warning for everyone, set <strong>Don't warn if offline</strong> on the slave under Nodes, or on the SDR under SDR sources.</p>
+  <div class="box">
+    {#each warnings.current as warning (warning.key)}
+      <div class="call">
+        <div><span class={warning.level === 'bad' ? 'st-bad' : 'st-warn'}>{warning.level === 'bad' ? 'Problem' : 'Warning'}</span>: <a href={warning.page}>{warning.text}</a></div>
+        {#if warning.quiet}
+          <div class="small dim">Not shown to anyone. {warning.quiet}</div>
+        {:else if warning.muted}
+          <div class="small dim">{muteText(warning.muted_until)}.</div>
+          <div class="buttons" style="margin:.3rem 0 0"><button onclick={() => unmuteWarning(warning.key)}>Unmute</button></div>
+        {:else}
+          <div class="pair" style="margin-top:.3rem">
+            <select aria-label="Mute for how long" value={muteFor[warning.key] ?? '8'} onchange={(event) => (muteFor[warning.key] = event.target.value)}>
+              {#each MUTE_CHOICES as [hours, label] (hours)}<option value={hours}>{label}</option>{/each}
+            </select>
+            <button onclick={() => muteWarning(warning)}>Mute</button>
+          </div>
+        {/if}
+      </div>
+    {:else}
+      <p class="pad dim">Nothing needs attention.</p>
+    {/each}
+  </div>
+  {#if warnings.cleared.length}
+    <h2>Muted, but cleared for now</h2>
+    <p class="small dim">These have stopped for now. The mute still applies if they come back.</p>
+    <div class="box">
+      {#each warnings.cleared as mute (mute.key)}
+        <div class="call">
+          <div>{mute.text}</div>
+          <div class="small dim">{muteText(mute.muted_until)}.</div>
+          <div class="buttons" style="margin:.3rem 0 0"><button onclick={() => unmuteWarning(mute.key)}>Unmute</button></div>
+        </div>
+      {/each}
+    </div>
   {/if}
 {/if}

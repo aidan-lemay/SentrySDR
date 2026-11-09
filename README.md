@@ -225,10 +225,6 @@ A stick that stays connected but stops working may not show a fault, because it 
 
 Only calls that finish after you start are played, never a backlog. Browsers only play sound after a click on the page, so autoplay starts from the tick or **Start scanning**; if one still blocks it, select **Play** once.
 
-## Activity
-
-The Activity page shows the last 7, 30 or 90 days: calls and airtime, calls per day, the busiest hours of the week as a heatmap (in the master's time zone), the busiest channels, and how much of the time each SDR spent in a call. Admins and operators also see upload results per service: sent, skipped as duplicates, failed and waiting. Hover or tab to a column or cell for its numbers, and each chart has **Show as a table**. Anyone who can play recordings can open it.
-
 ## Map
 
 The Maps page shows aircraft from every ADS-B receiver, and ships from every AIS one, merged.
@@ -411,7 +407,13 @@ Admins and operators see a banner at the top of every page when something needs 
 - a recordings disk with less than 2 GB or 5% free
 - protected recordings that alone exceed the recordings size limit
 
-Each warning links to the page to look at. Warnings only appear in SentrySDR for now; nothing is sent by email or other notification. A recordings **size limit** under **Admin > Settings** (0 means none) deletes the oldest unprotected recordings once all of them together pass it, as well as the limit in days.
+Each warning links to the page to look at. Warnings only appear in SentrySDR for now; nothing is sent by email or other notification.
+
+**Muting.** **Admin > Warnings** lists every current warning, including hidden ones, and says why each is hidden. An admin can mute any warning for 1 hour to 1 week, or until they unmute it. A mute is that admin's own: other admins and operators still see the warning. A mute follows what the warning is about (that slave being offline, that SDR's fault, failed uploads), so it still applies if the warning clears and comes back, until it runs out. Mutes for warnings that have cleared are listed there too, so they can be removed. The banner's **Mute** link opens that section.
+
+**Don't warn if offline.** For a slave or SDR that is offline on purpose at times, tick **Don't warn if offline** on the slave under **Admin > Nodes**, or **Don't warn if its stick is unplugged** on the SDR under **Admin > SDR sources**. This hides the warning for everyone, admins and operators alike. On an SDR it covers only an unplugged or missing stick: other faults still warn. Hidden warnings still show under **Admin > Warnings**.
+
+A recordings **size limit** under **Admin > Settings** (0 means none) deletes the oldest unprotected recordings once all of them together pass it, as well as the limit in days.
 
 ## Backups
 

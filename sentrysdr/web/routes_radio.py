@@ -31,15 +31,6 @@ MAX_ANTENNA_RANGES = 20
 _live_counts: dict[int, int] = {}
 
 
-# --- health ----------------------------------------------------------------
-@router.get("/warnings")
-def health_warnings(request: Request, user: User = Depends(current_user)):
-    """Machine problems, for admins and operators. Others see an empty list."""
-    if user.role not in ("admin", "operator"):
-        return []
-    return ctx_of(request).health_warnings()
-
-
 # --- antennas --------------------------------------------------------------
 class RangeBody(BaseModel):
     low_hz: int = Field(ge=0, le=10_000_000_000)
@@ -148,6 +139,7 @@ class SourceBody(BaseModel):
     lat: float | None = Field(default=None, ge=-90, le=90)
     lon: float | None = Field(default=None, ge=-180, le=180)
     alt_m: float | None = Field(default=None, ge=-500, le=10000)
+    quiet_offline: bool = False  # no warning while its stick is unplugged
 
     @field_validator("gain_steps")
     @classmethod
@@ -238,7 +230,7 @@ def list_sources(request: Request, user: User = Depends(current_user), db=Depend
         if user.role == "admin":
             view["feeder_uuid"] = source.feeder_uuid
             view["rtl_tcp_port"] = source.rtl_tcp_port
-            view.update(lat=source.lat, lon=source.lon, alt_m=source.alt_m)
+            view.update(lat=source.lat, lon=source.lon, alt_m=source.alt_m, quiet_offline=bool(source.quiet_offline))
         if "assign" not in effective_permissions(user):
             view["assigned_by"] = ""  # other people's email addresses
         views.append(view)
