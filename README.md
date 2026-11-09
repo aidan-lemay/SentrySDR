@@ -9,7 +9,7 @@ It supervises existing tools instead of reimplementing them: `rtl_fm`, `ffmpeg`,
 - **One application, two roles.** `node.role` in the configuration file selects `master` or `slave`.
 - **Master:** holds users, recordings and ACARS messages, serves the web UI, runs schedules, and uploads calls to Broadcastify Calls, RDIO Scanner and ClearCut. By default it listens on loopback only, so publish it through a tunnel or reverse proxy. Direct access by local IP is opt-in.
 - **Slave:** opens no listening ports. It dials out to the master, takes its configuration from the master's UI, and sends everything back. If the link drops, it keeps recording its last assignment and uploads the calls when the link returns.
-- **One target per SDR at a time.** A schedule takes over its source for the window, then the source returns to its assigned target.
+- **One target per SDR at a time.** A schedule takes over its source for its window. See [Schedules](#schedules).
 - **Locks.** An administrator can tick **Lock this assignment** on the Sources page. Other users then can't change that SDR's assignment or schedules, its target, or its squelch profiles, and can't measure it. There's no password. Locks set with a password in an older version stay locked, and their passwords are deleted on upgrade.
 - **Recordings stand alone.** Each keeps its own copy of the source and target names, so it stays searchable after that setup is deleted.
 
@@ -216,6 +216,17 @@ If an SDR still seems stuck, administrators have two buttons:
 Both work on slaves, need the slave to be online and running this version, and are recorded in the audit log.
 
 A stick that stays connected but stops working may not show a fault, because it looks the same as a closed squelch. Try **Restart** first.
+
+## Schedules
+
+On the Schedule page, a schedule puts an SDR on a target for a while. It **repeats every week** on chosen days and times, or runs **once** between two dates and times, such as 9:00 to 11:00 on 22 November. One-off schedules can last up to 31 days, and stay listed as finished afterwards. Times are in the master's time zone (`server.timezone`), whatever the browser's is.
+
+**When it ends,** each schedule either:
+
+- **goes back:** the SDR returns to its normal assignment, or to nothing if it had none. This is the default.
+- **keeps this target:** the schedule's target becomes the SDR's normal assignment, even if it had none before.
+
+Keeping only happens when the time runs out, not when someone turns the schedule off early. It still happens if the service was down at the end time, once it's back. If an administrator has locked the SDR's assignment since, it's left alone and the audit log says so. If two schedules overlap on one SDR, the one created first wins.
 
 ## Antennas
 

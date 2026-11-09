@@ -80,8 +80,29 @@ export function formatSize(bytes) {
   return `${(bytes / 1048576).toFixed(1)} MB`;
 }
 
-export function formatSchedule(recorder) {
+// A moment as the master's time zone sees it, since schedules run on the master's clock.
+export function inZone(epoch, timeZone, options) {
+  return new Intl.DateTimeFormat(undefined, { timeZone: timeZone || undefined, ...options }).format(new Date(epoch * 1000));
+}
+
+// The value a datetime-local input shows for a moment, in the master's time zone.
+export function zonedInputValue(epoch, timeZone) {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-CA', {
+    timeZone: timeZone || undefined, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+  }).formatToParts(new Date(epoch * 1000)).map((p) => [p.type, p.value]));
+  return `${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}`;
+}
+
+export function formatSchedule(recorder, timeZone) {
   if (!recorder.schedule_days) return 'Always on';
+  if (recorder.repeat === 'once') {
+    const day = inZone(recorder.once_start, timeZone, { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric' });
+    const time = (epoch) => inZone(epoch, timeZone, { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
+    const sameDay = recorder.once_end - recorder.once_start < 86400
+      && inZone(recorder.once_start, timeZone, { dateStyle: 'short' }) === inZone(recorder.once_end - 1, timeZone, { dateStyle: 'short' });
+    return sameDay ? `${day}, ${time(recorder.once_start)}–${time(recorder.once_end)}`
+      : `${day} ${time(recorder.once_start)} to ${inZone(recorder.once_end, timeZone, { weekday: 'short', day: 'numeric', month: 'short' })} ${time(recorder.once_end)}`;
+  }
   const days = recorder.schedule_days.map((day) => DAYS[day]).join(', ');
   return `${days} · ${recorder.schedule_start}–${recorder.schedule_end}`;
 }

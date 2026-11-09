@@ -190,6 +190,11 @@ class Recorder(Base):
     schedule_start: Mapped[str | None] = mapped_column(String(5), nullable=True)  # HH:MM
     schedule_end: Mapped[str | None] = mapped_column(String(5), nullable=True)
     locked: Mapped[bool | None] = mapped_column(nullable=True)  # only admins may change it
+    # One-off schedules: a window in epoch seconds, with schedule_days empty. Weekly ones leave these empty.
+    once_start: Mapped[float | None] = mapped_column(nullable=True)
+    once_end: Mapped[float | None] = mapped_column(nullable=True)
+    on_end: Mapped[str | None] = mapped_column(String(8), nullable=True)  # "keep": the target stays assigned afterwards
+    active_since: Mapped[float | None] = mapped_column(nullable=True)  # set while this schedule controls its source
     assigned_by: Mapped[str] = mapped_column(String(254), default="")
     assigned_at: Mapped[float] = mapped_column(default=now)
 

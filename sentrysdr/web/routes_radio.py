@@ -778,21 +778,52 @@ def delete_profile(source_id: int, target_id: int, request: Request, user: User 
 
 
 # --- scheduled recorders ---------------------------------------------------
+ONCE_MAX_SECONDS = 31 * 86400
+
+
 class RecorderBody(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     source_id: int
     target_id: int
     enabled: bool = True
-    schedule_days: list[int] = Field(min_length=1, max_length=7)
-    schedule_start: str
-    schedule_end: str
+    repeat: str = "weekly"  # or "once"
+    schedule_days: list[int] = Field(default_factory=list, max_length=7)
+    schedule_start: str | None = None
+    schedule_end: str | None = None
+    once_start: str | None = Field(default=None, max_length=16)  # YYYY-MM-DDTHH:MM, in the master's time zone
+    once_end: str | None = Field(default=None, max_length=16)
+    on_end: str = "return"  # or "keep"
 
 
-def _validate_schedule(body: RecorderBody) -> None:
-    if any(day not in range(7) for day in body.schedule_days):
-        raise HTTPException(422, "Days must be 0 (Monday) to 6 (Sunday)")
-    if not schedule.valid_time(body.schedule_start) or not schedule.valid_time(body.schedule_end):
+def _local_moment(ctx: Context, text: str | None, label: str) -> float:
+    try:
+        moment = datetime.strptime(text or "", "%Y-%m-%dT%H:%M")
+    except ValueError:
+        raise HTTPException(422, f"{label} must be a date and time") from None
+    return moment.replace(tzinfo=ctx.cfg.tz).timestamp()
+
+
+def _validate_schedule(ctx: Context, body: RecorderBody, recorder: Recorder | None) -> tuple[float | None, float | None]:
+    """Checks the times. Returns a one-off window in epoch seconds, or (None, None) for a weekly one."""
+    if body.on_end not in ("return", "keep"):
+        raise HTTPException(422, "When it ends must be return or keep")
+    if body.repeat == "once":
+        start, end = _local_moment(ctx, body.once_start, "Start"), _local_moment(ctx, body.once_end, "End")
+        if end <= start:
+            raise HTTPException(422, "The end must be after the start")
+        if end - start > ONCE_MAX_SECONDS:
+            raise HTTPException(422, "A one-off schedule can last at most 31 days")
+        unchanged = recorder is not None and (recorder.once_start, recorder.once_end) == (start, end)
+        if end <= time.time() and not unchanged:
+            raise HTTPException(422, "That time has already passed")
+        return start, end
+    if body.repeat != "weekly":
+        raise HTTPException(422, "A schedule repeats weekly or runs once")
+    if not body.schedule_days or any(day not in range(7) for day in body.schedule_days):
+        raise HTTPException(422, "Choose at least one day, 0 (Monday) to 6 (Sunday)")
+    if not schedule.valid_time(body.schedule_start or "") or not schedule.valid_time(body.schedule_end or ""):
         raise HTTPException(422, "Times must be HH:MM")
+    return None, None
 
 
 def _recorder_view(db, recorder: Recorder) -> dict:
@@ -804,6 +835,10 @@ def _recorder_view(db, recorder: Recorder) -> dict:
         "frequency_hz": target.frequency_hz if target else None,
         "schedule_days": recorder.schedule_days, "schedule_start": recorder.schedule_start,
         "schedule_end": recorder.schedule_end, "assigned_by": recorder.assigned_by,
+        "repeat": "once" if recorder.once_start is not None else "weekly",
+        "once_start": recorder.once_start, "once_end": recorder.once_end, "on_end": recorder.on_end or "return",
+        "finished": recorder.once_end is not None and recorder.once_end <= time.time(),
+        "running": recorder.active_since is not None,
     }
 
 
@@ -817,7 +852,7 @@ def list_recorders(user: User = Depends(current_user), db=Depends(get_db)):
 
 
 def _save_recorder(ctx, request, user, db, body: RecorderBody, recorder: Recorder | None):
-    _validate_schedule(body)
+    once_start, once_end = _validate_schedule(ctx, body, recorder)
     source, target = db.get(Source, body.source_id), db.get(Target, body.target_id)
     if source is None or target is None:
         raise HTTPException(404, "Source or target not found")
@@ -829,8 +864,14 @@ def _save_recorder(ctx, request, user, db, body: RecorderBody, recorder: Recorde
         db.add(recorder)
     recorder.name, recorder.source_id, recorder.target_id = body.name, source.id, target.id
     recorder.enabled = body.enabled
-    recorder.schedule_days = sorted(set(body.schedule_days))
-    recorder.schedule_start, recorder.schedule_end = body.schedule_start, body.schedule_end
+    if once_start is not None:
+        # schedule_days stays a list, empty, so the recorder still counts as a schedule rather than a base.
+        recorder.schedule_days, recorder.schedule_start, recorder.schedule_end = [], None, None
+    else:
+        recorder.schedule_days = sorted(set(body.schedule_days))
+        recorder.schedule_start, recorder.schedule_end = body.schedule_start, body.schedule_end
+    recorder.once_start, recorder.once_end = once_start, once_end
+    recorder.on_end = body.on_end
     recorder.assigned_by = user.email
     db.commit()
     ctx.audit("recorder.saved", user=user, ip=ip_of(request), target=recorder.name)

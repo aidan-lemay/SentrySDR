@@ -124,7 +124,7 @@ input, select, textarea {
   border: 1px solid var(--rule); border-radius: 0;
   min-height: var(--touch); padding: 0 .4rem; width: 100%; min-width: 0;
 }
-input[type='checkbox'] { width: 22px; height: 22px; min-height: 0; flex: none; margin: 0; accent-color: var(--ink); }
+input[type='checkbox'], input[type='radio'] { width: 22px; height: 22px; min-height: 0; flex: none; margin: 0; accent-color: var(--ink); }
 input:disabled { background: var(--page); color: var(--dim); }
 :focus-visible { outline: 2px solid var(--ink); outline-offset: 1px; }
 .buttons { display: flex; flex-wrap: wrap; gap: .4rem; margin: .5rem 0; align-items: center; }

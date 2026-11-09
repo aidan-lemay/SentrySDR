@@ -2,7 +2,8 @@
 
 Pure functions, so the override and revert behaviour can be tested directly.
 An active scheduled recorder overrides the source's base assignment; when its
-window ends the base assignment applies again automatically.
+window ends the base assignment applies again automatically. A schedule repeats
+weekly, or runs once between two moments (once_start and once_end).
 """
 from __future__ import annotations
 
@@ -50,6 +51,22 @@ def is_scheduled(recorder: RecorderLike) -> bool:
     return recorder.schedule_days is not None
 
 
+def is_once(recorder) -> bool:
+    return getattr(recorder, "once_start", None) is not None
+
+
+def window_active(recorder, local: datetime) -> bool:
+    """Whether this schedule's own time window covers this moment, enabled or not."""
+    if is_once(recorder):
+        return recorder.once_start <= local.timestamp() < recorder.once_end
+    return is_window_active(recorder.schedule_days, recorder.schedule_start, recorder.schedule_end, local)
+
+
+def finished(recorder, local: datetime) -> bool:
+    """A one-off schedule whose time has passed. Weekly ones never finish."""
+    return is_once(recorder) and local.timestamp() >= recorder.once_end
+
+
 def resolve(recorders: Iterable[RecorderLike], local: datetime) -> dict[int, RecorderLike]:
     """Return {source_id: the recorder in control}. The lowest id wins a tie."""
     base: dict[int, RecorderLike] = {}
@@ -59,6 +76,6 @@ def resolve(recorders: Iterable[RecorderLike], local: datetime) -> dict[int, Rec
             continue
         if not is_scheduled(rec):
             base.setdefault(rec.source_id, rec)
-        elif is_window_active(rec.schedule_days, rec.schedule_start, rec.schedule_end, local):
+        elif window_active(rec, local):
             active.setdefault(rec.source_id, rec)
     return {**base, **active}

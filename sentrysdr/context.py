@@ -469,6 +469,7 @@ class Context:
             self.wake.clear()
 
     async def apply_assignments(self) -> None:
+        await asyncio.to_thread(self.track_schedule_ends)
         desired = await asyncio.to_thread(self.assignments)
         await self.supervisor.apply(desired.get(self.local_node_id, {}))
         for node_id, link in list(self.node_links.items()):
@@ -656,6 +657,52 @@ class Context:
     def recordings_size(self) -> int:
         with self.db() as session:
             return session.scalar(select(func.coalesce(func.sum(Recording.size_bytes), 0)))
+
+    def track_schedule_ends(self, local_now: datetime | None = None) -> list[str]:
+        """Note when schedules take over and let go. One set to keep its target becomes the base when it ends.
+
+        active_since is stored, so a schedule that ends while the service is down is still handled.
+        Returns what was kept, for tests and the audit log.
+        """
+        local_now = local_now or datetime.now(self.cfg.tz)
+        kept, events = [], []
+        with self.db() as session:
+            recorders = list(session.scalars(select(Recorder)))
+            winners = {r.id for r in schedule.resolve(recorders, local_now).values()}
+            for rec in recorders:
+                if rec.schedule_days is None:
+                    continue
+                if rec.id in winners:
+                    rec.active_since = rec.active_since or local_now.timestamp()
+                    continue
+                if rec.active_since is None:
+                    continue
+                ran_out = not schedule.window_active(rec, local_now)  # not turned off or overtaken early
+                rec.active_since = None
+                if ran_out and rec.on_end == "keep":
+                    kept.append(self._keep_schedule_target(session, rec, events))
+            session.commit()
+        for action, target, details in events:  # after the commit: audit() writes through its own connection
+            self.audit(action, target=target, details=details)
+        return [k for k in kept if k]
+
+    def _keep_schedule_target(self, session, rec: Recorder, events: list) -> str | None:
+        source, target = session.get(Source, rec.source_id), session.get(Target, rec.target_id)
+        if source is None or target is None:
+            return None
+        base = next((r for r in session.scalars(select(Recorder).where(Recorder.source_id == rec.source_id))
+                     if r.schedule_days is None), None)
+        if base is not None and base.locked:
+            events.append(("schedule.keep_skipped", rec.name, {"reason": "the assignment is locked"}))
+            return None
+        label = f"{source.name}: {target.name}"
+        if base is None:
+            session.add(Recorder(name=label, source_id=source.id, target_id=target.id,
+                                 assigned_by=f"schedule: {rec.name}"[:254], assigned_at=time.time()))
+        else:
+            base.target_id, base.name, base.assigned_by, base.assigned_at = target.id, label, f"schedule: {rec.name}"[:254], time.time()
+        events.append(("schedule.kept", rec.name, {"source": source.name, "target": target.name}))
+        return label
 
     # --- health ------------------------------------------------------------
     def health_warnings(self) -> list[dict]:

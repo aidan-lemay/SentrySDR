@@ -2254,3 +2254,118 @@ def test_backup_needs_the_password_and_holds_the_database(ctx, admin, operator, 
     assert list(ctx.cfg.data_dir.glob("backup-*")) == []  # the temporary copy is gone
     with ctx.db() as session:
         assert session.scalar(select(AuditLog).where(AuditLog.action == "admin.backup_downloaded"))
+
+
+# --- one-off schedules and what happens when a schedule ends --------------------------------
+from zoneinfo import ZoneInfo
+
+
+def test_one_off_window():
+    tz = ZoneInfo("America/New_York")
+    start = datetime(2026, 11, 22, 9, 0, tzinfo=tz).timestamp()
+    once = SimpleNamespace(id=2, source_id=1, enabled=True, schedule_days=[], schedule_start=None, schedule_end=None,
+                           once_start=start, once_end=start + 7200)
+    base = rec(1)
+    assert schedule.resolve([base, once], datetime(2026, 11, 22, 10, 30, tzinfo=tz))[1] is once
+    assert schedule.resolve([base, once], datetime(2026, 11, 22, 11, 0, tzinfo=tz))[1] is base
+    assert schedule.resolve([base, once], datetime(2026, 11, 29, 10, 0, tzinfo=tz))[1] is base  # not weekly
+    assert schedule.finished(once, datetime(2026, 11, 22, 11, 0, tzinfo=tz)) and not schedule.finished(base, datetime(2026, 11, 22, 11, 0, tzinfo=tz))
+
+
+def once_body(source, target, start="2030-11-22T09:00", end="2030-11-22T11:00", **extra):
+    return {"name": "Event", "source_id": source, "target_id": target, "repeat": "once", "once_start": start, "once_end": end, **extra}
+
+
+def test_one_off_schedule_api(ctx, admin):
+    source, target = make_source(admin), make_target(admin)
+    made = admin.post("/api/recorders", json=once_body(source, target))
+    assert made.status_code == 201, made.text
+    view = made.json()
+    expected = datetime(2030, 11, 22, 9, 0, tzinfo=ctx.cfg.tz).timestamp()
+    assert view["repeat"] == "once" and view["once_start"] == expected and view["once_end"] == expected + 7200 and view["on_end"] == "return"
+    for bad, problem in ((dict(start="2020-01-01T09:00", end="2020-01-01T10:00"), "already passed"),
+                         (dict(start="2030-11-22T11:00", end="2030-11-22T09:00"), "after the start"),
+                         (dict(start="2030-11-01T00:00", end="2030-12-15T00:00"), "at most 31 days"),
+                         (dict(start="tomorrow", end="2030-11-22T09:00"), "date and time")):
+        reply = admin.post("/api/recorders", json=once_body(source, target, **bad))
+        assert reply.status_code == 422 and problem in reply.text, (bad, reply.text)
+    weekly = {"name": "W", "source_id": source, "target_id": target, "schedule_days": [], "schedule_start": "22:00", "schedule_end": "23:00"}
+    assert admin.post("/api/recorders", json=weekly).status_code == 422
+    assert admin.post("/api/recorders", json={**weekly, "on_end": "sideways", "schedule_days": [1]}).status_code == 422
+
+
+def make_once(ctx, admin, source, target, on_end, start_offset=-60, length=3600):
+    with ctx.db() as session:
+        recorder = Recorder(name=f"Once {on_end}", source_id=source, target_id=target, schedule_days=[], on_end=on_end,
+                            once_start=time.time() + start_offset, once_end=time.time() + start_offset + length)
+        session.add(recorder)
+        session.commit()
+        return recorder.id
+
+
+def end_now(ctx, recorder_id):
+    with ctx.db() as session:
+        recorder = session.get(Recorder, recorder_id)
+        recorder.once_end = time.time() - 1
+        session.commit()
+
+
+def base_target(ctx, source):
+    with ctx.db() as session:
+        base = next((r for r in session.scalars(select(Recorder).where(Recorder.source_id == source)) if r.schedule_days is None), None)
+        return base.target_id if base else None
+
+
+def test_keep_replaces_the_base_and_return_leaves_it(ctx, admin):
+    first, second = make_source(admin), make_source(admin, "SER2", "Two")
+    usual, event = make_target(admin, "Usual"), make_target(admin, "Event", 446_000_000)
+    for source in (first, second):
+        admin.post(f"/api/sources/{source}/assign", json={"target_id": usual}).raise_for_status()
+    keep, back = make_once(ctx, admin, first, event, "keep"), make_once(ctx, admin, second, event, "return")
+    ctx.track_schedule_ends()  # both take over
+    end_now(ctx, keep); end_now(ctx, back)
+    assert ctx.track_schedule_ends() == ["Source 1: Event"]
+    assert base_target(ctx, first) == event and base_target(ctx, second) == usual
+    assert ctx.assignments()[ctx.local_node_id]["SER1"]["target_id"] == event
+
+
+def test_keep_on_an_unassigned_sdr_assigns_it(ctx, admin):
+    source, event = make_source(admin), make_target(admin, "Event")
+    keep = make_once(ctx, admin, source, event, "keep")
+    ctx.track_schedule_ends(); end_now(ctx, keep); ctx.track_schedule_ends()
+    assert base_target(ctx, source) == event
+    other = make_source(admin, "SER2", "Two")
+    back = make_once(ctx, admin, other, event, "return")
+    ctx.track_schedule_ends(); end_now(ctx, back); ctx.track_schedule_ends()
+    assert base_target(ctx, other) is None
+
+
+def test_turning_a_schedule_off_early_doesnt_keep(ctx, admin):
+    source, event = make_source(admin), make_target(admin, "Event")
+    keep = make_once(ctx, admin, source, event, "keep")
+    ctx.track_schedule_ends()
+    with ctx.db() as session:
+        session.get(Recorder, keep).enabled = False
+        session.commit()
+    assert ctx.track_schedule_ends() == [] and base_target(ctx, source) is None
+
+
+def test_keep_skips_a_locked_assignment(ctx, admin):
+    source, usual, event = make_source(admin), make_target(admin, "Usual"), make_target(admin, "Event", 446_000_000)
+    admin.post(f"/api/sources/{source}/assign", json={"target_id": usual}).raise_for_status()
+    admin.post(f"/api/sources/{source}/lock").raise_for_status()
+    keep = make_once(ctx, admin, source, event, "keep")
+    ctx.track_schedule_ends(); end_now(ctx, keep)
+    assert ctx.track_schedule_ends() == [] and base_target(ctx, source) == usual
+    with ctx.db() as session:
+        assert session.scalar(select(AuditLog).where(AuditLog.action == "schedule.keep_skipped"))
+
+
+def test_a_schedule_that_ended_while_down_still_keeps(ctx, admin):
+    source, event = make_source(admin), make_target(admin, "Event")
+    keep = make_once(ctx, admin, source, event, "keep", start_offset=-7200, length=3600)  # already over
+    with ctx.db() as session:
+        session.get(Recorder, keep).active_since = time.time() - 7000  # it was running when the service stopped
+        session.commit()
+    assert ctx.track_schedule_ends() == ["Source 1: Event"]
+    assert ctx.track_schedule_ends() == []  # only once
