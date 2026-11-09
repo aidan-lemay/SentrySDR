@@ -31,10 +31,14 @@ def list_messages(
     if tail:
         conditions.append(AcarsMessage.tail == normalize_tail(tail))
     if search:
-        like = f"%{search.strip()}%"
+        # Typed % and _ are literal, as in the recordings search.
+        def pattern(text: str) -> str:
+            return "%" + text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        like, tail_like = pattern(search.strip()), pattern(normalize_tail(search))
         conditions.append(or_(
-            AcarsMessage.flight.ilike(like), AcarsMessage.tail.ilike(f"%{normalize_tail(search)}%"),
-            AcarsMessage.text.ilike(like), AcarsMessage.label.ilike(like), AcarsMessage.target_name.ilike(like),
+            AcarsMessage.flight.ilike(like, escape="\\"), AcarsMessage.tail.ilike(tail_like, escape="\\"),
+            AcarsMessage.text.ilike(like, escape="\\"), AcarsMessage.label.ilike(like, escape="\\"),
+            AcarsMessage.target_name.ilike(like, escape="\\"),
         ))
     total = db.scalar(select(func.count()).select_from(AcarsMessage).where(*conditions))
     rows = db.scalars(select(AcarsMessage).where(*conditions)

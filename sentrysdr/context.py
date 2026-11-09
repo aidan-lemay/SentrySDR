@@ -5,6 +5,8 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
+import math
 import logging.handlers
 import os
 import shutil
@@ -17,11 +19,12 @@ from urllib.parse import urlsplit
 import httpx
 from sqlalchemy import delete, or_, select
 
+from . import aio
 from . import acars, capabilities, pipelines, schedule, uploaders
 from .config import Config
 from .engine import MeasureError, Supervisor
 from .live import LiveHub
-from .models import AcarsMessage, AuditLog, BroadcastifySystem, Node, Recorder, Recording, SdrProfile, Setting, Source, Target, UploadJob, make_session_factory
+from .models import AcarsMessage, AuditLog, BroadcastifySystem, Node, Recorder, Recording, SdrProfile, Setting, Source, Target, UploadJob, UserSession, make_session_factory
 from .sdr import enumerate_serials
 from .security import RateLimiter, SecretBox
 
@@ -43,6 +46,36 @@ SETTING_DEFAULTS = {
 }
 SECRET_SETTINGS = {"rdio_api_key", "clearcut_api_key"}
 TRACK_EXPIRY_SECONDS = 60
+MAX_TRACK_ITEMS = 3000
+# Per SDR, one-minute window. Busy ACARS sites reach a few messages a minute; this is far above that.
+ACARS_LIMIT_PER_MINUTE = 600
+_FIELD_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,31}$")
+_UNSAFE_TEXT = re.compile(r"[^\x20-\x7e]|[<>&\"'`\\]")
+_CONTROL_TEXT = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def clean_track_value(value, depth: int = 0, strict: bool = True):
+    """Aircraft and ship data can come from a slave. Aircraft are also shown by tar1090,
+    a third-party page, so their text keeps only plain characters. Ship names may have
+    apostrophes and only appear on SentrySDR's own map, which never parses them as HTML."""
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, (int, float)):
+        return value if math.isfinite(value) and abs(value) < 1e12 else None
+    if isinstance(value, str):
+        return (_UNSAFE_TEXT if strict else _CONTROL_TEXT).sub("", value)[:64]
+    if depth < 2 and isinstance(value, list):
+        return [clean_track_value(v, depth + 1, strict) for v in value[:32]]
+    if depth < 2 and isinstance(value, dict):
+        return {k: clean_track_value(v, depth + 1, strict) for k, v in list(value.items())[:64]
+                if isinstance(k, str) and _FIELD_RE.match(k)}
+    return None
+
+
+def clean_track_items(items, strict: bool = True) -> list[dict]:
+    if not isinstance(items, list):
+        return []
+    return [clean_track_value(item, 0, strict) for item in items[:MAX_TRACK_ITEMS] if isinstance(item, dict)]
 UPLOAD_MAX_ATTEMPTS = 12
 BROADCASTIFY_RETRY_SECONDS = 10
 DUPLICATE_UPLOAD_NOTE = "Skipped: another SDR on this channel already recorded this call."
@@ -173,8 +206,14 @@ class Context:
 
     def update_tracks(self, kind: str, node_id: int, serial: str, data: dict) -> None:
         if kind == "acars":
+            key = f"acars:{node_id}:{serial}"
+            if self.limiter.blocked(key, ACARS_LIMIT_PER_MINUTE, 60):
+                return  # a flood, whatever its cause, mustn't fill the database
+            self.limiter.hit(key, 60)
             self.ingest_acars(node_id, serial, data)
             return
+        field = "aircraft" if kind == "adsb" else "vessels"
+        data = {field: clean_track_items(data.get(field), strict=kind == "adsb")}
         self.tracks.setdefault(kind, {})[f"{node_id}:{serial}"] = {"at": time.time(), "data": data}
 
     def ingest_acars(self, node_id: int, serial: str, data: dict) -> None:
@@ -271,7 +310,7 @@ class Context:
         self.pending_measures[request_id] = (node.id, future, request.get("op", "measure"))
         try:
             link.request_measure(request_id, serial, request)
-            return await asyncio.wait_for(future, MEASURE_TIMEOUT)
+            return await aio.wait_for(future, MEASURE_TIMEOUT)
         except asyncio.TimeoutError:
             raise MeasureError("The node didn't answer. Check that it runs the same version as this server.") from None
         finally:
@@ -392,7 +431,7 @@ class Context:
             except Exception:
                 log.exception("scheduler pass failed")
             try:
-                await asyncio.wait_for(self.wake.wait(), 5.0)
+                await aio.wait_for(self.wake.wait(), 5.0)
             except asyncio.TimeoutError:
                 pass
             self.wake.clear()
@@ -547,6 +586,7 @@ class Context:
                         path.unlink(missing_ok=True)
                     session.delete(recording)
                     removed["recordings"] += 1
+            removed["sessions"] = session.execute(delete(UserSession).where(UserSession.expires_at < now)).rowcount
             if message_days > 0:
                 result = session.execute(delete(AcarsMessage).where(AcarsMessage.received_at < now - message_days * 86400))
                 removed["messages"] = result.rowcount

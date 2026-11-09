@@ -13,12 +13,12 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 
-from .. import capabilities, feeds, pipelines, schedule
+from .. import aio, capabilities, feeds, pipelines, schedule
 from ..config import SERIAL_RE
 from ..context import Context
 from ..engine import MeasureError
 from ..models import ANTENNA_UNITS, Antenna, BroadcastifySystem, Node, Recorder, SdrProfile, Source, Target, User, now
-from .deps import admin_user, ctx_of, current_user, get_db, ip_of, require
+from .deps import admin_user, ctx_of, current_user, effective_permissions, get_db, ip_of, require
 from .routes_messages import annotate_aircraft
 
 router = APIRouter(prefix="/api")
@@ -224,6 +224,8 @@ def list_sources(request: Request, user: User = Depends(current_user), db=Depend
         # Admins only: with the ID, someone else could feed aggregators as this receiver.
         if user.role == "admin":
             view["feeder_uuid"] = source.feeder_uuid
+        if "assign" not in effective_permissions(user):
+            view["assigned_by"] = ""  # other people's email addresses
         views.append(view)
     return views
 
@@ -402,9 +404,21 @@ def broadcastify_choices(_user: User = Depends(require("manage_targets")), db=De
             for s in db.scalars(select(BroadcastifySystem).order_by(BroadcastifySystem.name))]
 
 
+# Upload IDs and feed addresses (some services' ports identify your station) are only for
+# people who manage targets. Everyone else gets what the pages they can see actually use.
+TARGET_PRIVATE_FIELDS = (
+    "clearcut_system", "clearcut_id", "rdio_system", "rdio_talkgroup", "broadcastify_system_ref", "broadcastify_slot", "feeds",
+)
+
+
 @router.get("/targets")
-def list_targets(_user: User = Depends(current_user), db=Depends(get_db)):
-    return [_target_view(t) for t in db.scalars(select(Target).order_by(Target.name))]
+def list_targets(user: User = Depends(current_user), db=Depends(get_db)):
+    views = [_target_view(t) for t in db.scalars(select(Target).order_by(Target.name))]
+    if "manage_targets" not in effective_permissions(user):
+        for view in views:
+            for field in TARGET_PRIVATE_FIELDS:
+                view[field] = None
+    return views
 
 
 @router.post("/targets", status_code=201)
@@ -727,8 +741,12 @@ def _recorder_view(db, recorder: Recorder) -> dict:
 
 
 @router.get("/recorders")
-def list_recorders(_user: User = Depends(current_user), db=Depends(get_db)):
-    return [_recorder_view(db, r) for r in db.scalars(select(Recorder).order_by(Recorder.id))]
+def list_recorders(user: User = Depends(current_user), db=Depends(get_db)):
+    views = [_recorder_view(db, r) for r in db.scalars(select(Recorder).order_by(Recorder.id))]
+    if "assign" not in effective_permissions(user):
+        for view in views:
+            view["assigned_by"] = ""  # other people's email addresses
+    return views
 
 
 def _save_recorder(ctx, request, user, db, body: RecorderBody, recorder: Recorder | None):
@@ -805,7 +823,7 @@ async def live_audio(source_id: int, request: Request, user: User = Depends(requ
         try:
             while True:
                 try:
-                    yield await asyncio.wait_for(queue.get(), 15)
+                    yield await aio.wait_for(queue.get(), 15)
                 except asyncio.TimeoutError:
                     if await request.is_disconnected():
                         return

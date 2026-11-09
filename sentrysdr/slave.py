@@ -18,6 +18,7 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx
 import websockets
 
+from . import aio
 from . import pipelines
 from .config import Config
 from .engine import MeasureError, Supervisor
@@ -206,7 +207,7 @@ class Slave:
             except httpx.HTTPError as exc:
                 log.warning("spool upload deferred: %s", exc)
             with contextlib.suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(self.spool_event.wait(), 30)
+                await aio.wait_for(self.spool_event.wait(), 30)
             self.spool_event.clear()
 
     # --- master link ------------------------------------------------------

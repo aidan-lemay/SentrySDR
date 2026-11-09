@@ -41,7 +41,9 @@ rsync -a --delete --exclude .git --exclude .venv --exclude .cache --exclude .dev
   --exclude node_modules --exclude web/dist "$SRC/" "$APP/"
 python3 -m venv "$APP/.venv"
 "$APP/.venv/bin/pip" install --quiet --upgrade pip
-"$APP/.venv/bin/pip" install --quiet -e "$APP"
+# Exact, tested versions from requirements.lock; then the app itself without re-resolving them.
+"$APP/.venv/bin/pip" install --quiet -r "$APP/requirements.lock"
+"$APP/.venv/bin/pip" install --quiet --no-deps -e "$APP"
 
 if [[ "$ROLE" == "master" ]]; then
   npm --prefix "$APP/web" ci --no-audit --no-fund

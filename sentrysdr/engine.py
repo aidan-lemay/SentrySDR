@@ -20,6 +20,7 @@ from array import array
 from pathlib import Path
 from typing import Awaitable, Callable
 
+from . import aio
 from . import acars, capabilities, feeds, pipelines, sdr
 from .config import Config
 
@@ -61,7 +62,7 @@ async def stop_process(proc: asyncio.subprocess.Process | None, timeout: float =
     with contextlib.suppress(ProcessLookupError):
         proc.send_signal(signal.SIGTERM)
     try:
-        await asyncio.wait_for(proc.wait(), timeout)
+        await aio.wait_for(proc.wait(), timeout)
     except asyncio.TimeoutError:
         with contextlib.suppress(ProcessLookupError):
             proc.kill()
@@ -222,6 +223,7 @@ class Worker:
         self.last_call_at: float | None = None
         self.note = ""  # an informational warning that outlives the error field
         self.feed_status: dict = {}
+        self._saving: set[asyncio.Task] = set()  # finished calls being encoded and stored
         self.note_at: float | None = None
         self._reset_seen = asyncio.Event()
         self._last_reset_restart = -RESET_RESTART_GAP
@@ -274,6 +276,9 @@ class Worker:
             with contextlib.suppress(asyncio.CancelledError):
                 await self.task
             self.task = None
+        # A retune or shutdown must not lose a call that was still being saved.
+        if self._saving:
+            await asyncio.gather(*list(self._saving), return_exceptions=True)
 
     @contextlib.asynccontextmanager
     async def _paused(self, state: str):
@@ -327,7 +332,7 @@ class Worker:
         try:
             while (remaining := deadline - time.monotonic()) > 0 and len(out) < 65536:
                 try:
-                    chunk = await asyncio.wait_for(proc.stdout.read(4096), remaining)
+                    chunk = await aio.wait_for(proc.stdout.read(4096), remaining)
                 except asyncio.TimeoutError:
                     break
                 if not chunk:
@@ -353,7 +358,7 @@ class Worker:
             try:
                 while (remaining := deadline - time.monotonic()) > 0:
                     try:
-                        chunk = await asyncio.wait_for(proc.stdout.read(65536), remaining)
+                        chunk = await aio.wait_for(proc.stdout.read(65536), remaining)
                     except asyncio.TimeoutError:
                         break
                     if not chunk:
@@ -483,11 +488,12 @@ class Worker:
 
             while True:
                 try:
-                    chunk = await asyncio.wait_for(proc.stdout.read(READ_SIZE), cfg.hang_seconds)
+                    chunk = await aio.wait_for(proc.stdout.read(READ_SIZE), cfg.hang_seconds)
                 except asyncio.TimeoutError:
                     open_since = None
                     if writer:
-                        writer = await self._end_call(writer)
+                        self._save(writer)
+                        writer = None
                     if self.error:
                         self._publish(error="")
                     continue
@@ -509,7 +515,8 @@ class Worker:
                 if warn_stuck and not self.error and time.monotonic() - open_since >= SQUELCH_STUCK_SECONDS:
                     self._publish(error=SQUELCH_STUCK_WARNING)
                 if writer.duration >= cfg.max_call_seconds:
-                    writer = await self._end_call(writer)  # stuck carriers and continuous mode
+                    self._save(writer)  # stuck carriers and continuous mode
+                    writer = None
             await asyncio.gather(*(p.wait() for p in procs), return_exceptions=True)
             detail = tail[-1] if tail else ""
             return f"radio process exited ({proc.returncode}) {detail}".strip()
@@ -519,18 +526,27 @@ class Worker:
             for task in tasks:
                 task.cancel()
             if writer:
-                # Shielded so a retune or shutdown still saves the call in progress.
-                await asyncio.shield(self._end_call(writer))
+                # Saved in its own task, which stop() waits for, so a retune or shutdown keeps it.
+                self._save(writer)
 
-    async def _end_call(self, writer: CallWriter) -> None:
+    def _save(self, writer: CallWriter) -> None:
+        """End a call now and save it in the background.
+
+        Saving in its own task means the next call isn't missed while this one is
+        encoded, and a retune or shutdown can't interrupt it halfway: stop() waits.
+        """
         self.in_call, self.call_started = False, None
         self.last_call_at = time.time()
         self._publish()
+        task = asyncio.create_task(self._finish(writer), name=f"save-{writer.id}")
+        self._saving.add(task)
+        task.add_done_callback(self._saving.discard)
+
+    async def _finish(self, writer: CallWriter) -> None:
         try:
             await writer.finish()
         except Exception:
             log.exception("[%s] failed to save call %s", self.serial, writer.id)
-        return None
 
     async def _run_adsb(self, index: int, spec: dict) -> str:
         json_dir = tempfile.mkdtemp(prefix=f"adsb-{self.serial}-", dir=self.sup.tmp_dir)
@@ -549,7 +565,7 @@ class Worker:
         try:
             while proc.returncode is None:
                 try:
-                    await asyncio.wait_for(proc.wait(), 2.0)
+                    await aio.wait_for(proc.wait(), 2.0)
                 except asyncio.TimeoutError:
                     pass
                 if (addresses or settings.get("beast_port")) and checks % FEED_CHECK_EVERY == 0:

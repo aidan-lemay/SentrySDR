@@ -12,6 +12,8 @@ import re
 import socket
 import time
 
+from . import aio
+
 log = logging.getLogger("sentrysdr.acars")
 
 MAX_LINE = 16384
@@ -119,7 +121,7 @@ class AirframesFeed:
             return None
         if target == self._resolved_for and time.monotonic() - self._resolved_at < self.RESOLVE_SECONDS:
             return self._address
-        infos = await asyncio.wait_for(
+        infos = await aio.wait_for(
             asyncio.get_running_loop().getaddrinfo(match["host"], int(match["port"]), type=socket.SOCK_DGRAM), 5)
         self._address = infos[0][4] if infos else None
         self._family = infos[0][0] if infos else None

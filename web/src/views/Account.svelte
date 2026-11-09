@@ -12,6 +12,7 @@
   let current = $state('');
   let next = $state('');
   let totpPassword = $state('');
+  let offCode = $state('');
   let setup = $state(null);
   let qr = $state('');
   let code = $state('');
@@ -77,9 +78,10 @@
 
   async function disableTotp(event) {
     event.preventDefault();
-    const done = await run(() => api('me/totp/disable', { method: 'POST', body: { password: totpPassword } }), 'Two-factor sign-in is off.');
+    const done = await run(() => api('me/totp/disable', { method: 'POST', body: { password: totpPassword, code: offCode } }), 'Two-factor sign-in is off.');
     if (done) {
       totpPassword = '';
+      offCode = '';
       await onChange();
     }
   }
@@ -127,6 +129,7 @@
       <p><span class="st-ok">On.</span> You'll enter a code from your authenticator app each time you sign in.</p>
       <form onsubmit={disableTotp}>
         <label class="field"><span>Password</span><input type="password" bind:value={totpPassword} required autocomplete="current-password" /></label>
+        <label class="field"><span>Code from your app</span><input bind:value={offCode} required inputmode="numeric" autocomplete="one-time-code" maxlength="6" /></label>
         <div class="buttons form-buttons"><button class="bad">Turn off</button></div>
       </form>
     {:else if setup}

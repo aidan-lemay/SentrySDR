@@ -1032,3 +1032,64 @@ def test_established_connections_are_found_and_sorted(tmp_path):
     finally:
         for s in (client, accepted, server):
             s.close()
+
+
+
+# --- what slaves send is checked ---------------------------------------------------
+def test_aircraft_data_is_cleaned_and_capped(ctx):
+    from sentrysdr import context as context_module
+    hostile = {"hex": "a00001", "flight": "<img src=x onerror=alert(1)>", "lat": 43.1, "lon": float("nan"),
+               "alt_baro": 1e300, "bad key!": 1, "nested": {"deep": {"deeper": {"x": 1}}}, "list": list(range(100))}
+    ctx.update_tracks("adsb", 7, "S", {"aircraft": [hostile] + [{"hex": f"{i:06x}"} for i in range(context_module.MAX_TRACK_ITEMS + 50)]})
+    items = ctx.current_tracks("adsb")
+    assert len(items) <= context_module.MAX_TRACK_ITEMS
+    clean = next(i for i in items if i.get("hex") == "a00001")
+    assert "<" not in clean["flight"] and ">" not in clean["flight"]
+    assert clean["lon"] is None and clean["alt_baro"] is None and "bad key!" not in clean
+    assert clean["nested"] == {"deep": None}  # only two levels kept; readsb's own lists are one level down
+    assert len(clean["list"]) == 32
+
+
+def test_ship_names_keep_apostrophes(ctx):
+    ctx.update_tracks("ais", 7, "S", {"vessels": [{"mmsi": 1, "shipname": "O'BRIEN\x00 & SONS"}]})
+    assert ctx.current_tracks("ais")[0]["shipname"] == "O'BRIEN & SONS"
+
+
+def test_acars_floods_are_capped(ctx, monkeypatch):
+    from sentrysdr import context as context_module
+    monkeypatch.setattr(context_module, "ACARS_LIMIT_PER_MINUTE", 5)
+    stored = []
+    monkeypatch.setattr(ctx, "ingest_acars", lambda *args: stored.append(args))
+    for i in range(20):
+        ctx.update_tracks("acars", 7, "S", {"message": {"text": str(i)}})
+    assert len(stored) == 5
+
+
+def test_slave_times_are_checked(ctx):
+    from sentrysdr.web.routes_nodes import handle_agent_message, _epoch
+    handle_agent_message(ctx, 7, ["S"], {"t": "status", "sources": {"S": {"state": "x", "last_call_at": "nan", "call_started": "<b>"}}})
+    assert ctx.status[(7, "S")]["last_call_at"] is None and ctx.status[(7, "S")]["call_started"] is None
+    assert _epoch(1.7e9) == 1.7e9 and _epoch(float("inf")) is None and _epoch(-5) is None
+
+
+async def test_call_being_split_survives_a_shutdown(tmp_path, caplog):
+    """A split call was saved twice when a retune or shutdown landed mid-save, and lost."""
+    bins = tmp_path / "bin"
+    install_tool(bins, "rtl_fm", "#!/usr/bin/env python3\nimport sys,time\nwhile True:\n  sys.stdout.buffer.write(b'\\1\\0'*1600);sys.stdout.flush();time.sleep(0.05)\n")
+    calls = []
+    cfg = make_config(tmp_path, bin_dirs=[bins], max_call_seconds=1)
+    sup = supervisor(cfg, calls)
+    await sup.apply({"SER1": spec()})
+    assert await wait_for(lambda: len(calls) >= 2)
+    before = len(calls)
+    await sup.shutdown()
+    assert len(calls) == before + 1  # the call in progress was saved too
+    assert "encoding failed" not in caplog.text and "failed to save" not in caplog.text
+    assert list((cfg.recordings_dir / ".tmp").glob("*.raw")) == []
+
+
+def test_app_never_uses_asyncio_wait_for():
+    """On Python 3.11 (Raspberry Pi OS) it can lose a cancellation, so a stop or retune hangs. Use aio.wait_for."""
+    root = Path(__file__).resolve().parent.parent / "sentrysdr"
+    offenders = [str(p) for p in root.rglob("*.py") if p.name != "aio.py" and "asyncio.wait_for(" in p.read_text()]
+    assert offenders == []

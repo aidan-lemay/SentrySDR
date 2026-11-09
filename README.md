@@ -15,14 +15,40 @@ It supervises existing tools instead of reimplementing them: `rtl_fm`, `ffmpeg`,
 
 ## Install
 
+### Requirements
+
+- **System:** Debian 12 or newer, or Raspberry Pi OS (Bookworm or newer), with systemd. Other Linux systems work, but you install the packages yourself (see the top of `scripts/install.sh`). Python 3.11 or newer.
+- **Master:** any 64-bit machine that stays on. It holds the recordings, so give it disk space: about 0.25 MB per minute of recorded audio. It also needs Node.js and npm to build the web interface, which the script installs.
+- **Slave:** a Raspberry Pi 3B or newer works for one or two SDRs. Each SDR uses one USB port, and see [USB connections](#usb-connections).
+- **SDRs:** RTL-SDR sticks (RTL2832U), each with a unique serial number. Sticks often ship with the same serial; give each its own with `rtl_eeprom -s <serial>`, one stick plugged in at a time.
+
+### Master
+
 ```sh
-sudo ./scripts/install.sh master          # or: slave
-sudo ./scripts/install.sh master --with-decoders   # also builds readsb, tar1090, AIS-catcher, dsd-fme, acarsdec
+git clone <this repository> SentrySDR && cd SentrySDR
+sudo ./scripts/install.sh master --with-decoders   # leave out --with-decoders for voice calls only
 ```
 
-The script prints the remaining steps: choose SDR serials, edit `/etc/sentrysdr/sentrysdr.toml`, create the first admin, and start the service. There are no default credentials. Example configurations are in [config/](config/).
+The script installs packages, creates the `sentrysdr` user, copies the application to `/opt/sentrysdr`, installs the exact tested Python packages from `requirements.lock`, builds the web interface, and installs the systemd service. It doesn't start anything. `--with-decoders` also builds readsb, tar1090, AIS-catcher, dsd-fme and acarsdec into `/opt/sentrysdr/.vendor`; without them, ADS-B, AIS, digital voice and ACARS targets show a fault.
 
-To add a slave, go to **Admin > Nodes** on the master to create a one-time token, then put the token in the slave's configuration. The token is swapped for a key that you can revoke per node.
+1. **Find your SDRs:** `sudo -u sentrysdr /opt/sentrysdr/.venv/bin/python -m sentrysdr -c /etc/sentrysdr/sentrysdr.toml list-sdrs`. It prints a line to paste into the configuration.
+2. **Configure:** edit `/etc/sentrysdr/sentrysdr.toml`. At least set `sdr.serials`, `server.public_url` (the address people will use), `server.timezone`, and `[proxy]` to match how you publish it (see [Publishing the master](#publishing-the-master)). The [example](config/master.example.toml) explains each setting.
+3. **Create the first administrator:** `sudo -u sentrysdr /opt/sentrysdr/.venv/bin/python -m sentrysdr -c /etc/sentrysdr/sentrysdr.toml create-admin`. There are no default accounts or passwords. Running it again for the same email resets that password.
+4. **Start it:** `sudo systemctl enable --now sentrysdr`, then check `systemctl status sentrysdr`.
+5. **Publish it** with a tunnel or reverse proxy, then sign in.
+6. **In the web interface:** add each SDR under **Admin > SDR sources** (and **Detect from the stick**), add targets, and assign them on the Sources page. Turn off **Let people request accounts** under **Admin > Settings** if you don't want sign-up requests.
+
+The script also blacklists the kernel's DVB-T driver, which would otherwise claim the sticks. Reboot once after installing, or unplug and replug the sticks.
+
+### Slave
+
+1. On the master, go to **Admin > Nodes**, enter a name, and select **Create token**. The token is shown once and lasts 24 hours.
+2. On the slave: `sudo ./scripts/install.sh slave --with-decoders`, then `list-sdrs` as above.
+3. Edit `/etc/sentrysdr/sentrysdr.toml`: `master.url` (any address that reaches the master; see the [example](config/slave.example.toml)), `master.enrollment_token`, and `sdr.serials`.
+4. `sudo systemctl enable --now sentrysdr`. The slave swaps the token for its own key and appears as online under **Admin > Nodes**. You can then remove the token line.
+5. On the master, add the slave's SDRs under **Admin > SDR sources**.
+
+Run the same version on the master and every slave. To retire a slave, select **Revoke** under **Admin > Nodes**; it disconnects and needs a new token to come back.
 
 Before you rely on it, read [USB connections](#usb-connections), and [Storing recordings on another drive](#storing-recordings-on-another-drive) if recordings won't stay on the system disk.
 
@@ -127,14 +153,19 @@ Upload API keys are never shown again once saved. Leave a key's box blank to kee
 ## Security model
 
 - **Access:** signing up only requests an account. Every data route needs a signed-in, approved user, and a test fails if a new route forgets this.
-- **Passwords:** Argon2id, with limits on sign-in attempts per account and per address, and optional TOTP 2FA. Session tokens, device keys and enrolment tokens are stored only as hashes.
+- **Passwords:** Argon2id, at least 12 characters. Sign-in attempts are limited per account (8 in 15 minutes) and per address (30), and so are password checks when changing your email or two-factor settings, so a stolen session can't be used to guess the password. A wrong password costs the same time whether or not the account exists, and pending or banned status is only revealed to someone who knew the password. After 8 failures, even the right password is refused for up to 15 minutes, so someone guessing can lock an account out for that long.
+- **Two-factor sign-in:** TOTP, optional per user. Each code works once. Turning it off needs the password and a current code.
+- **Sessions:** random tokens stored only as hashes, which expire after 14 days without use. Changing a password signs out your other sessions; an admin disabling an account or resetting its password signs it out everywhere. Expired sessions are deleted hourly.
+- **Least privilege:** what each role can do is in [Users and permissions](#users-and-permissions). Users who can't manage targets don't receive upload IDs or feed addresses, and only those who can assign SDRs see who assigned them.
 - **Secrets at rest:** TOTP seeds and upload API keys are encrypted with `secret.key` in the data folder. Back up that file with the database, and keep both private.
-- **Browser protections:** strict CSP, `HttpOnly` and `SameSite=Strict` cookies, and Host and Origin checks. tar1090 is the one exception: it needs inline scripts, so it gets a looser CSP on its own path.
+- **Browser protections:** strict CSP, `HttpOnly`, `Secure` and `SameSite=Strict` cookies (not `Secure` over a plain-http local address), Host and Origin checks, and a custom header on every change, so other sites can't make requests as you. tar1090 is the one exception: it needs inline scripts, so it gets a looser CSP on its own path. Aircraft data it shows is cleaned of anything but plain characters first, because it can come from a slave.
 - **Radio tools:** run as argv lists, never through a shell, with all values validated first, including those arriving from the network. Decoders open no ports, with one opt-in exception: the local data port below.
+- **Slaves:** each enrols with a one-time token that expires in 24 hours, then uses its own key, stored only as a hash on the master and revocable from **Admin > Nodes**. A slave can only report on its own SDRs. What it sends is checked: call details and times, and limits on aircraft and ship lists (3,000 each) and ACARS messages (600 a minute per SDR), so a compromised slave can't fill the master's memory or database. Recordings are limited to 256 MB and must be MP3.
 - **Outbound connections:** only the uploads and feeds you turn on. Aggregator addresses are fixed in the code, so a master can switch a slave's feeds on or off but can't point them anywhere else. The airframes.io feed sends only acarsdec's own message fields and your station ID.
 - **Local data port:** the optional port for fr24feed and piaware is bound to 127.0.0.1 on the node with the SDR. readsb opens no other ports.
 - **SDRs:** only serials in `sdr.serials` are ever opened. Other dongles stay free for other software. Duplicate serials are refused; fix them with `rtl_eeprom -s`.
-- **Service:** runs unprivileged under a systemd sandbox, with only its data and log folders writable. If you move `recordings_dir` or `log_dir`, see [Storing recordings on another drive](#storing-recordings-on-another-drive).
+- **Service:** runs as the unprivileged `sentrysdr` user under a strict systemd sandbox: no capabilities, the system read-only, only its data and log folders writable, and USB as the only device. The application folder is owned by root, so the service can't change its own code. The configuration file is readable only by root and the service, and the database and keys only by the service. If you move `recordings_dir` or `log_dir`, see [Storing recordings on another drive](#storing-recordings-on-another-drive).
+- **Dependencies:** Python packages are installed at the exact versions in `requirements.lock`, and the web interface's from `web/package-lock.json`, so an install never picks up an untested release. The decoders are built from their projects' current source.
 - **Encryption on the air:** encrypted digital traffic isn't decoded. Check the rules on recording and sharing radio traffic where you operate.
 
 ## Decoder status
@@ -287,6 +318,49 @@ ClearCut makes the transcript itself after a call is uploaded, either automatica
 
 ClearCut has no published API docs. The upload format comes from the `clearcut_uploader` plugin in [galenguyer/trunk-recorder](https://github.com/galenguyer/trunk-recorder/tree/clearcut), and the read and transcribe calls from [ClearCut_Mobile](https://github.com/aidan-lemay/ClearCut_Mobile).
 
+## Upgrading
+
+On the master and each slave:
+
+```sh
+cd SentrySDR && git pull
+sudo ./scripts/install.sh master        # or slave; add --with-decoders to rebuild the decoders too
+sudo systemctl restart sentrysdr
+```
+
+Re-running the script keeps the configuration file, database, recordings and keys. It replaces `/opt/sentrysdr`, so don't keep anything of your own there. Database changes apply on the first start. The decoders only need rebuilding with `--with-decoders` if you want newer versions of them. Upgrade the master and slaves together: measuring and detecting SDRs on a slave need matching versions.
+
+## Backups
+
+Everything the master knows is in `data_dir` (`/var/lib/sentrysdr` by default):
+
+- `sentrysdr.db`: users, settings, SDRs, targets, schedules, recordings' details, ACARS messages. Back it up while the service is stopped, or with `sqlite3 sentrysdr.db ".backup /path/to/copy.db"` while it runs.
+- `secret.key`: decrypts the upload API keys and two-factor secrets in the database. Without it, those have to be entered again. Keep it as private as the database.
+- `recordings/`, unless you moved `recordings_dir`.
+
+Keep `/etc/sentrysdr/sentrysdr.toml` too. A slave only holds calls waiting to upload, and its key in `data_dir`; a lost slave can be revoked and enrolled again.
+
+## Ports and firewall
+
+| What | Port | Who needs to reach it |
+|---|---|---|
+| Master web interface | 8642, on 127.0.0.1 by default | Only the tunnel or proxy on the same machine. With `local_access`, devices on your own network |
+| Slave | None | Nothing: slaves only connect out to the master |
+| Local data port for fr24feed or piaware | The port you choose, on 127.0.0.1 only | Only programs on the same machine |
+
+Outbound, the master connects to the upload and feed services you turn on; slaves connect to the master and, if you turn them on, the ADS-B and AIS services. [nftables.example.conf](deploy/nftables.example.conf) is a default-deny firewall for the master.
+
+## Logs and troubleshooting
+
+- **Service log:** `journalctl -u sentrysdr -f`. A file copy is in `log_dir` (`/var/log/sentrysdr`), with `audit.log` holding sign-ins and changes.
+- **Won't start:** `journalctl -u sentrysdr -n 50` usually names the problem. A configuration error says which setting. `Permission denied` or `Read-only file system` means a moved folder; see [Storing recordings on another drive](#storing-recordings-on-another-drive).
+- **An SDR shows "SDR not connected":** check `list-sdrs`, that its serial is in `sdr.serials` on the right node, and that nothing else (GQRX, SDR++, `dump1090-fa`) has it open.
+- **"tool not installed":** that target needs a decoder. Re-run the install with `--with-decoders`.
+- **Records nothing, or only static:** see [Tuning call detection](#tuning-call-detection) and [USB connections](#usb-connections).
+- **Upload failures** show on each recording, with the service's reply.
+- **Slave offline:** on the slave, `journalctl -u sentrysdr` shows why it can't reach the master. Check `master.url` and the clock (`timedatectl`).
+- **Forgotten admin password:** run `create-admin` again with the same email.
+
 ## Development
 
 ```sh
@@ -298,4 +372,6 @@ npm --prefix web ci && npm --prefix web run build
 
 Create an admin with `sentrysdr -c <config> create-admin`. Run with `sentrysdr -c <config> run`.
 
-Tests use fake radio tools, so they need `ffmpeg` but no SDR.
+Tests use fake radio tools, so they need `ffmpeg` but no SDR. Run them on Python 3.11 as well as your own version: Raspberry Pi OS ships 3.11, and some asyncio behaviour differs. In app code, use `aio.wait_for`, never `asyncio.wait_for`, which can lose a cancellation on 3.11 (a test enforces this).
+
+To update a Python dependency: upgrade it in the dev venv, run the tests and `pip-audit`, then regenerate `requirements.lock` with only the runtime packages. Check the web interface's with `npm audit --omit=dev`.

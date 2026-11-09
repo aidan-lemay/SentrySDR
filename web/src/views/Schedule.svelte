@@ -117,13 +117,13 @@
   <div class="box">
     <h2>Always on</h2>
     <table class="table">
-      <thead><tr><th>Source</th><th>Target</th><th>Assigned by</th></tr></thead>
+      <thead><tr><th>Source</th><th>Target</th>{#if canEdit}<th>Assigned by</th>{/if}</tr></thead>
       <tbody>
         {#each alwaysOn as recorder (recorder.id)}
           <tr>
             <td class="title-cell">{recorder.source_name}</td>
             <td data-label="Target"><span>{recorder.target_name} <span class="mono small nowrap">{formatMHz(recorder.frequency_hz)}</span></span></td>
-            <td data-label="Assigned by"><span>{recorder.assigned_by}</span></td>
+            {#if canEdit}<td data-label="Assigned by"><span>{recorder.assigned_by}</span></td>{/if}
           </tr>
         {/each}
       </tbody>

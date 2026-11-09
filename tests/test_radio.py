@@ -1993,3 +1993,11 @@ def test_feeder_id_shown_to_admins_only(ctx, admin, operator):
         expected = session.get(Source, source).feeder_uuid
     assert next(s for s in admin.get("/api/sources").json() if s["id"] == source)["feeder_uuid"] == expected
     assert "feeder_uuid" not in next(s for s in operator.get("/api/sources").json() if s["id"] == source)
+
+
+
+def test_message_search_treats_wildcards_literally(ctx, listener):
+    add_message(ctx, text="100% FUEL")
+    add_message(ctx, text="NOTHING HERE")
+    assert listener.get("/api/messages?search=%25").json()["total"] == 1
+    assert listener.get("/api/messages?search=_").json()["total"] == 0
