@@ -1073,7 +1073,11 @@ def test_slave_times_are_checked(ctx):
 
 
 async def test_call_being_split_survives_a_shutdown(tmp_path, caplog):
-    """A split call was saved twice when a retune or shutdown landed mid-save, and lost."""
+    """A split call was saved twice when a retune or shutdown landed mid-save, and lost.
+
+    Counting calls around the shutdown races with the splits, so check what matters:
+    the saved calls add up to all the audio, with nothing lost to a failed save.
+    """
     bins = tmp_path / "bin"
     install_tool(bins, "rtl_fm", "#!/usr/bin/env python3\nimport sys,time\nwhile True:\n  sys.stdout.buffer.write(b'\\1\\0'*1600);sys.stdout.flush();time.sleep(0.05)\n")
     calls = []
@@ -1081,9 +1085,13 @@ async def test_call_being_split_survives_a_shutdown(tmp_path, caplog):
     sup = supervisor(cfg, calls)
     await sup.apply({"SER1": spec()})
     assert await wait_for(lambda: len(calls) >= 2)
-    before = len(calls)
+    await asyncio.sleep(0.4)  # partway into the next call
+    stopped_at = time.time()
     await sup.shutdown()
-    assert len(calls) == before + 1  # the call in progress was saved too
+    metas = sorted((meta for meta, _, _ in calls), key=lambda m: m["started_at"])
+    span = metas[-1]["ended_at"] - metas[0]["started_at"]
+    assert sum(m["duration"] for m in metas) >= span - 0.3  # no gap where a call went missing
+    assert metas[-1]["ended_at"] >= stopped_at - 0.3  # the call in progress at shutdown was kept, right up to it
     assert "encoding failed" not in caplog.text and "failed to save" not in caplog.text
     assert list((cfg.recordings_dir / ".tmp").glob("*.raw")) == []
 
