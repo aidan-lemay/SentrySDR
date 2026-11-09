@@ -2,7 +2,8 @@
   import { onMount, untrack } from 'svelte';
   import { api, formatMHz, formatTime } from '../lib.js';
 
-  let { route } = $props();
+  let { route, user } = $props();
+  const canMark = user.permissions.includes('protect');
   const PAGE = 50;
 
   let items = $state([]);
@@ -10,20 +11,24 @@
   let offset = $state(0);
   let search = $state('');
   let showEmpty = $state(false);
+  let importantOnly = $state(false);
   let error = $state('');
   let loaded = $state(false);
 
   const tailFilter = $derived(new URLSearchParams(route.split('?')[1] ?? '').get('tail'));
+  const idFilter = $derived(new URLSearchParams(route.split('?')[1] ?? '').get('id'));  // from an alert email
 
   // The filters last searched with. Polling uses these, not what's half typed.
-  let applied = { search: '', showEmpty: false };
+  let applied = { search: '', showEmpty: false, importantOnly: false };
   let generation = 0;
 
   async function load() {
     const params = new URLSearchParams({ limit: PAGE, offset });
     if (applied.search) params.set('search', applied.search);
     if (applied.showEmpty) params.set('show_empty', 'true');
+    if (applied.importantOnly) params.set('important', 'true');
     if (tailFilter) params.set('tail', tailFilter);
+    if (idFilter) params.set('id', idFilter);
     const mine = ++generation;
     try {
       const reply = await api(`messages?${params}`);
@@ -40,6 +45,7 @@
 
   $effect(() => {
     tailFilter;
+    idFilter;
     untrack(() => {
       offset = 0;
       load();
@@ -48,9 +54,17 @@
 
   function applyFilters(event) {
     event.preventDefault();
-    applied = { search, showEmpty };
+    applied = { search, showEmpty, importantOnly };
     offset = 0;
     load();
+  }
+
+  async function setImportant(message, value) {
+    try {
+      message.important = (await api(`messages/${message.id}/important`, { method: 'POST', body: { important: value } })).important;
+    } catch (failure) {
+      error = failure.message;
+    }
   }
 
   function page(delta) {
@@ -79,7 +93,7 @@
 
 <h1>Messages</h1>
 <p class="small">
-  {total} ACARS message{total === 1 ? '' : 's'}{#if tailFilter}, from <span class="mono">{tailFilter}</span>. <a href="#/messages">Show all</a>{/if}
+  {total} ACARS message{total === 1 ? '' : 's'}{#if idFilter}, the one from your alert email. <a href="#/messages">Show all</a>{:else if tailFilter}, from <span class="mono">{tailFilter}</span>. <a href="#/messages">Show all</a>{/if}
 </p>
 
 {#if error}<div class="err" role="alert">{error}</div>{/if}
@@ -90,13 +104,16 @@
       <input type="search" bind:value={search} aria-label="Search messages" placeholder="Flight, registration, label or text" />
       <button class="main">Search</button>
     </div>
-    <label class="tick small"><input type="checkbox" bind:checked={showEmpty} onchange={applyFilters} /> Show messages with no text</label>
+    <div class="flags">
+      <label class="tick small"><input type="checkbox" bind:checked={showEmpty} onchange={applyFilters} /> Show messages with no text</label>
+      <label class="tick small"><input type="checkbox" bind:checked={importantOnly} onchange={applyFilters} /> Important only</label>
+    </div>
   </div>
 </form>
 
 <div class="box">
   {#each items as message (message.id)}
-    <div class="call">
+    <div class="call" class:important={message.important || message.matches.length}>
       <div>
         <strong class="mono">{message.flight || 'No flight'}</strong>
         {#if message.tail}<a class="mono small" href={`#/messages?tail=${encodeURIComponent(message.tail)}`}>{message.tail}</a>{/if}
@@ -104,6 +121,15 @@
       </div>
       <div class="small">{formatTime(message.received_at)}, <span class="mono">{formatMHz(message.frequency_hz)}</span>{message.level != null ? `, ${message.level.toFixed(1)} dB` : ''}</div>
       <div class="small dim">{message.source_name || message.serial}{message.node_name ? ` on ${message.node_name}` : ''}{message.fed ? ', sent to airframes.io' : ''}</div>
+      {#if message.matches.length || message.important}
+        <div class="small">
+          {#if message.matches.length}<span class="st-bad">Matches: {message.matches.join(', ')}</span>{/if}
+          {#if message.important}{message.matches.length ? ' · ' : ''}<span class="st-bad">Important</span>{/if}
+        </div>
+      {/if}
+      {#if canMark}
+        <div class="buttons" style="margin:.2rem 0"><button onclick={() => setImportant(message, !message.important)}>{message.important ? 'Not important' : 'Mark important'}</button></div>
+      {/if}
       {#if message.text}
         <pre class="message-text mono small">{message.text}</pre>
       {:else}

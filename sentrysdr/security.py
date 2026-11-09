@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import ipaddress
 import os
 import secrets
@@ -75,9 +76,14 @@ class SecretBox:
                 handle.write(key)
         base64.urlsafe_b64decode(key)
         self._fernet = Fernet(key)
+        self._mac_key = hashlib.sha256(b"sentrysdr-mac:" + key).digest()
 
     def seal(self, value: str) -> str:
         return self._fernet.encrypt(value.encode()).decode()
+
+    def mac(self, text: str) -> str:
+        """A keyed checksum: proves this server made a link, without storing a token for it."""
+        return hmac.new(self._mac_key, text.encode(), hashlib.sha256).hexdigest()[:40]
 
     def open(self, value: str) -> str | None:
         try:

@@ -9,7 +9,7 @@ It supervises existing tools instead of reimplementing them: `rtl_fm`, `ffmpeg`,
 - **One application, two roles.** `node.role` in the configuration file selects `master` or `slave`.
 - **Master:** holds users, recordings and ACARS messages, serves the web UI, runs schedules, and uploads calls to Broadcastify Calls, RDIO Scanner and ClearCut. By default it listens on loopback only, so publish it through a tunnel or reverse proxy. Direct access by local IP is opt-in.
 - **Slave:** opens no listening ports. It dials out to the master, takes its configuration from the master's UI, and sends everything back. If the link drops, it keeps recording its last assignment and uploads the calls when the link returns.
-- **One target per SDR at a time.** A schedule takes over its source for the window, then the source returns to its assigned target.
+- **One target per SDR at a time.** A schedule takes over its source for its window. See [Schedules](#schedules).
 - **Locks.** An administrator can tick **Lock this assignment** on the Sources page. Other users then can't change that SDR's assignment or schedules, its target, or its squelch profiles, and can't measure it. There's no password. Locks set with a password in an older version stay locked, and their passwords are deleted on upgrade.
 - **Recordings stand alone.** Each keeps its own copy of the source and target names, so it stays searchable after that setup is deleted.
 
@@ -146,10 +146,12 @@ Each permission except the admin-only ones can be allowed or denied per user, un
 | SDR sources | Each SDR's name, description, antenna, gain, frequency correction and capabilities |
 | Antennas | Antennas and their frequency ranges |
 | Nodes | Slaves: create a one-time enrolment token, or revoke a slave |
-| Settings | How long recordings, ACARS messages and audit logs are kept (0 keeps them forever); sign-ups; the map tile server |
+| Settings | How long recordings, ACARS messages and emergencies, and audit logs are kept (0 keeps them forever); a size limit for recordings; sign-ups; the map tile server; a backup download |
 | Uploads and feeds | RDIO and ClearCut servers and keys; the Broadcastify upload address and systems; the airframes.io station ID and address |
+| Email | The mail server for alert emails, and the daily limit. See [Email alerts](#email-alerts) |
+| Warnings | Every current health warning, including muted and hidden ones |
 
-Upload API keys are never shown again once saved. Leave a key's box blank to keep it.
+Upload API keys and the mail server password are never shown again once saved. Leave a key's box blank to keep it.
 
 ## Security model
 
@@ -158,11 +160,12 @@ Upload API keys are never shown again once saved. Leave a key's box blank to kee
 - **Two-factor sign-in:** TOTP, optional per user. Each code works once. Turning it off needs the password and a current code.
 - **Sessions:** random tokens stored only as hashes, which expire after 14 days without use. Changing a password signs out your other sessions; an admin disabling an account or resetting its password signs it out everywhere. Expired sessions are deleted hourly.
 - **Least privilege:** what each role can do is in [Users and permissions](#users-and-permissions). Users who can't manage targets don't receive upload IDs or feed addresses, and only those who can assign SDRs see who assigned them.
-- **Secrets at rest:** TOTP seeds and upload API keys are encrypted with `secret.key` in the data folder. Back up that file with the database, and keep both private.
+- **Secrets at rest:** TOTP seeds, upload API keys and the mail server password are encrypted with `secret.key` in the data folder. Back up that file with the database, and keep both private.
 - **Browser protections:** strict CSP, `HttpOnly`, `Secure` and `SameSite=Strict` cookies (not `Secure` over a plain-http local address), Host and Origin checks, and a custom header on every change, so other sites can't make requests as you. tar1090 is the one exception: it needs inline scripts, so it gets a looser CSP on its own path. Aircraft data it shows is cleaned of anything but plain characters first, because it can come from a slave.
 - **Radio tools:** run as argv lists, never through a shell, with all values validated first, including those arriving from the network. Decoders open no ports, with one opt-in exception: the local data port below.
 - **Slaves:** each enrols with a one-time token that expires in 24 hours, then uses its own key, stored only as a hash on the master and revocable from **Admin > Nodes**. A slave can only report on its own SDRs. What it sends is checked: call details and times, and limits on aircraft and ship lists (3,000 each) and ACARS messages (600 a minute per SDR), so a compromised slave can't fill the master's memory or database. Recordings are limited to 256 MB and must be MP3.
-- **Outbound connections:** only the uploads and feeds you turn on. Aggregator addresses are fixed in the code, so a master can switch a slave's feeds on or off but can't point them anywhere else. The airframes.io feed sends only acarsdec's own message fields and your station ID.
+- **Email:** alerts go only to an address its owner confirmed with a link sent to it, so nobody can sign up with someone else's address and have mail sent there. Confirmation and turn-off links carry a random or keyed token, checked in constant time, and are rate limited per address. Names in a subject can't add mail headers. Each user is limited to 3 confirmations an hour and the daily cap of alerts.
+- **Outbound connections:** only the uploads, feeds and mail server you turn on. Aggregator addresses are fixed in the code, so a master can switch a slave's feeds on or off but can't point them anywhere else. The airframes.io feed sends only acarsdec's own message fields and your station ID.
 - **Local data port:** the optional port for fr24feed and piaware is bound to 127.0.0.1 on the node with the SDR. readsb opens no other ports.
 - **rtl_tcp:** has no password, so its address is set only in each machine's own configuration file, defaulting to loopback, and every interface or a public address needs `allow_public`. Only administrators can put an SDR on it. A slave never takes the address from the master.
 - **SDRs:** only serials in `sdr.serials` are ever opened. Other dongles stay free for other software. Duplicate serials are refused; fix them with `rtl_eeprom -s`.
@@ -216,6 +219,98 @@ If an SDR still seems stuck, administrators have two buttons:
 Both work on slaves, need the slave to be online and running this version, and are recorded in the audit log.
 
 A stick that stays connected but stops working may not show a fault, because it looks the same as a closed squelch. Try **Restart** first.
+
+## Listening
+
+- **Live:** **Listen** on the Sources page plays an SDR as it hears it.
+- **Autoplay:** tick **Autoplay new calls** on the Recordings page, or in an SDR's **Calls** list on the Sources page, and each new call plays once it's finished, one after another. On the Recordings page it follows the current search. Untick it, or leave the page, and it stops.
+- **Scanner:** the Scanner page plays new calls from the channels you tick, like a scanner. **Hold** stays on the channel that's playing, **Skip** moves to the next call, and **Just played** lists the last ten. Your channels are remembered in that browser.
+
+Only calls that finish after you start are played, never a backlog. Browsers only play sound after a click on the page, so autoplay starts from the tick or **Start scanning**; if one still blocks it, select **Play** once.
+
+## Map
+
+The Maps page shows aircraft from every ADS-B receiver, and ships from every AIS one, merged.
+
+- **Trails:** a line behind each aircraft for its last 10 minutes.
+- **Receivers:** give an SDR a location (latitude, longitude, and optionally antenna height) under **Admin > SDR sources**, and it shows as a square. Anyone who can see maps sees where it is.
+- **Coverage:** for each located ADS-B receiver, an outline through the farthest aircraft it has heard in each 10° direction. Positions over 450 km away are ignored as bad decodes. It's saved, so it survives restarts, and starts again if the receiver is moved.
+
+Trails and coverage can each be turned off above the map.
+
+## Aircraft and ship emergencies
+
+SentrySDR watches the ADS-B and AIS data every receiver already reports, from slaves too, for emergencies. An aircraft or ship in one is drawn larger and in red on the map with its label always showing (everything else is blue), and listed in a banner above the map.
+
+| Kind | What's watched for |
+|---|---|
+| Aircraft | Squawk 7700 (general emergency), 7600 (radio failure) and 7500 (unlawful interference), and the separate emergency status newer transponders send: general, medical (lifeguard), minimum fuel, no radio, unlawful interference, downed |
+| Ships | AIS search-and-rescue transmitters (AIS-SART, MMSI 970...), man-overboard beacons (972...), EPIRBs (974...), and the aground and not-under-command navigation statuses |
+
+- **No false alarms from one bad decode:** an aircraft must show a squawk or status for 10 seconds, over at least 3 updates, before it counts. AIS messages carry a checksum and these values are set on purpose, so they count at once.
+- **One event per emergency:** however many receivers hear it, until it hasn't been seen for 5 minutes. If it starts again after that, it's a new event. A restart carries on the same event rather than alerting again.
+- **The record:** **Alerts > Emergencies** lists every one recorded, with the flight or ship name, registration or callsign, ICAO address or MMSI, when it started and ended, the last position and altitude, and how far it was from the SDR that heard it first. They're kept as long as ACARS messages. Anyone with the Maps permission can see it.
+- **Your alerts:** under **Alerts > Keywords and email**, choose which kinds you want listed under **New alerts**, and how far away you care about (within 25, 50, 100 or 200 km of the SDR that heard it, or anywhere). Distance needs that SDR's location set; one without a location always counts. By default everything is chosen except aground and not under command, which ships often leave set by mistake.
+- **Email:** tick **Email me about these straight away**, with email alerts turned on (see [Email alerts](#email-alerts)). An emergency is emailed at once, even inside your gap between emails, with anything else waiting; the subject starts with EMERGENCY. It still counts toward the daily limit.
+
+A 7500 squawk is very rarely a real hijacking: it's usually a mis-set transponder, corrected within a minute or two. AIS navigation statuses need slaves upgraded to this version; AIS beacons and all aircraft emergencies work with slaves as they are.
+
+## Keyword alerts
+
+Under **Alerts > Keywords and email**, each user keeps their own words and phrases to watch for, in call transcripts, ACARS messages, or both. Matching ignores case and takes whole words: "fire" matches "Fire!" but not "firefighter", and a phrase matches across a line break. Only you see your keywords.
+
+- **Alerts:** the menu shows how many new calls and messages matched since you last looked, including a call whose transcript arrived later. The **Alerts** page lists them; **Mark all seen** clears the count.
+- **Important:** matching calls and messages are outlined in red with the words they matched, and **Important only** on the Recordings and Messages pages shows just those. Anyone with the Protect permission can also **Mark important** by hand, which everyone then sees as important, and which protects a call from automatic deletion.
+- **Email:** see [Email alerts](#email-alerts).
+
+## Email alerts
+
+Each user sets up their own, under **Alerts > Keywords and email**, and they go only to that user's own account address. Nobody else sees what you watch for.
+
+What can send you an email:
+
+- **Keywords** ticked **Email**. A call matches once its ClearCut transcript arrives, so its email comes then, not when the call ends.
+- **Channels:** every call on a target you pick, with or without a transcript.
+- **Aircraft:** every ACARS message from a registration or flight, typed as the Messages page shows it (N123UA, UA0123).
+- **Marked important**, if you tick it: a call or message someone marks important by hand.
+- **Aircraft and ship emergencies**, if you tick it: see [Aircraft and ship emergencies](#aircraft-and-ship-emergencies). These go at once.
+
+You only get what your permissions let you see: calls need **Play recordings**, ACARS needs **Maps**. Losing a permission stops those emails. Nothing from before you turned emails on is sent.
+
+**Confirming your address.** Turning emails on sends a confirmation link to your address, good for 24 hours; nothing else is sent until you open it. Changing your email address under **My account** needs a new confirmation, and old links stop working. At most 3 confirmation emails an hour per user.
+
+**How often.** The first alert is emailed at once. After that you get at most one email every 5, 15 or 60 minutes (your choice), with everything since in it, up to 25 items, and a link to the Alerts page for the rest. The server also caps how many alert emails anyone gets a day (50 by default); the last one says so.
+
+**What's in an email.** For each call or message: the channel or flight, the time (in the master's time zone), why it matched, the transcript or message text, and a link straight to it in SentrySDR. Opening the call still needs signing in, and the audio stays on your server.
+
+**Turning them off.** Untick **Email me alerts**, or use the link at the bottom of any email. That link opens a page with a button rather than turning emails off at once, because mail scanners open every link in an email. Mail apps that offer one-click unsubscribe (Gmail, Outlook, Apple Mail) turn them off directly. Your keywords and watches stay either way.
+
+**Watches follow the target.** A channel watch is on the target, not the SDR: renaming it, changing its frequency, or moving it to another SDR (or removing the SDR) keeps the watch. Deleting the target removes the watch with it.
+
+### Setting up email (admins)
+
+Under **Admin > Email**, give SentrySDR an SMTP server to send through. It doesn't run its own mail server.
+
+| Setting | Notes |
+|---|---|
+| Send alert emails | The switch for everyone. Off by default |
+| Most emails per person per day | 1 to 1000. Confirmation emails don't count |
+| Server, Encryption, Port | STARTTLS on 587 or TLS on 465. Certificates are checked. **None** is only allowed for a mail server on the same machine (localhost), so a password never crosses the network unencrypted |
+| Username, Password | The password is stored encrypted with `secret.key` and never shown again. For Gmail or Outlook, make an app password |
+| From | An address the server may send as, like `SentrySDR <alerts@example.com>`. Mail from an address the server doesn't own is often refused or marked as spam |
+
+**Send me a test email** sends to your own address with the saved settings. If the mail server starts refusing alerts, admins and operators see a warning, and SentrySDR waits 5 minutes before trying again; nothing is lost, the waiting alerts go once it works.
+
+## Schedules
+
+On the Schedule page, a schedule puts an SDR on a target for a while. It **repeats every week** on chosen days and times, or runs **once** between two dates and times, such as 9:00 to 11:00 on 22 November. One-off schedules can last up to 31 days, and stay listed as finished afterwards. Times are in the master's time zone (`server.timezone`), whatever the browser's is.
+
+**When it ends,** each schedule either:
+
+- **goes back:** the SDR returns to its normal assignment, or to nothing if it had none. This is the default.
+- **keeps this target:** the schedule's target becomes the SDR's normal assignment, even if it had none before.
+
+Keeping only happens when the time runs out, not when someone turns the schedule off early. It still happens if the service was down at the end time, once it's back. If an administrator has locked the SDR's assignment since, it's left alone and the audit log says so. If two schedules overlap on one SDR, the one created first wins.
 
 ## Antennas
 
@@ -357,11 +452,32 @@ sudo ./scripts/install.sh master        # or slave; add --with-decoders to rebui
 sudo systemctl restart sentrysdr
 ```
 
-Re-running the script keeps the configuration file, database, recordings and keys. It replaces `/opt/sentrysdr`, so don't keep anything of your own there. Database changes apply on the first start. The decoders only need rebuilding with `--with-decoders` if you want newer versions of them. Upgrade the master and slaves together: measuring and detecting SDRs on a slave need matching versions.
+Re-running the script keeps the configuration file, database, recordings and keys. It replaces `/opt/sentrysdr`, so don't keep anything of your own there. Database changes apply on the first start. The decoders only need rebuilding with `--with-decoders` if you want newer versions of them. Upgrade the master and slaves together: measuring, detecting and restarting SDRs on a slave need matching versions. **Admin > Nodes** shows each machine's version and a build ID that changes with any change to the code, and warns when a slave's differs from the master's.
+
+## Health warnings
+
+Admins and operators see a banner at the top of every page when something needs attention. It's checked every 30 seconds:
+
+- a slave offline for more than 5 minutes, or running a different version from the master
+- an SDR in use that shows a fault, such as **SDR disconnected**
+- uploads that failed in the last day
+- a machine whose clock isn't synced, or is more than 5 seconds off the master's (Broadcastify rejects calls with wrong times)
+- a recordings disk with less than 2 GB or 5% free
+- protected recordings that alone exceed the recordings size limit
+
+Each warning links to the page to look at. Health warnings only appear in SentrySDR; they aren't emailed.
+
+**Muting.** **Admin > Warnings** lists every current warning, including hidden ones, and says why each is hidden. An admin can mute any warning for 1 hour to 1 week, or until they unmute it. A mute is that admin's own: other admins and operators still see the warning. A mute follows what the warning is about (that slave being offline, that SDR's fault, failed uploads), so it still applies if the warning clears and comes back, until it runs out. Mutes for warnings that have cleared are listed there too, so they can be removed. The banner's **Mute** link opens that section.
+
+**Don't warn if offline.** For a slave or SDR that is offline on purpose at times, tick **Don't warn if offline** on the slave under **Admin > Nodes**, or **Don't warn if its stick is unplugged** on the SDR under **Admin > SDR sources**. This hides the warning for everyone, admins and operators alike. On an SDR it covers only an unplugged or missing stick: other faults still warn. Hidden warnings still show under **Admin > Warnings**.
+
+A recordings **size limit** under **Admin > Settings** (0 means none) deletes the oldest unprotected recordings once all of them together pass it, as well as the limit in days.
 
 ## Backups
 
-Everything the master knows is in `data_dir` (`/var/lib/sentrysdr` by default):
+The quickest way is **Download backup** under **Admin > Settings**: it asks for your password again, and gives one file holding a consistent copy of the database and `secret.key`, taken while the service runs. Recordings aren't in it. It's recorded in the audit log, and the file holds every account and API key, so keep it private.
+
+To back up by hand, everything the master knows is in `data_dir` (`/var/lib/sentrysdr` by default):
 
 - `sentrysdr.db`: users, settings, SDRs, targets, schedules, recordings' details, ACARS messages. Back it up while the service is stopped, or with `sqlite3 sentrysdr.db ".backup /path/to/copy.db"` while it runs.
 - `secret.key`: decrypts the upload API keys and two-factor secrets in the database. Without it, those have to be entered again. Keep it as private as the database.
@@ -378,7 +494,7 @@ Keep `/etc/sentrysdr/sentrysdr.toml` too. A slave only holds calls waiting to up
 | Local data port for fr24feed or piaware | The port you choose, on 127.0.0.1 only | Only programs on the same machine |
 | rtl_tcp, while an SDR is on an rtl_tcp target | That SDR's port (1234 and up), on `rtl_tcp.bind` | The devices running GQRX or SDR++. Loopback by default |
 
-Outbound, the master connects to the upload and feed services you turn on; slaves connect to the master and, if you turn them on, the ADS-B and AIS services. [nftables.example.conf](deploy/nftables.example.conf) is a default-deny firewall for the master.
+Outbound, the master connects to the upload and feed services you turn on, and to your mail server (usually port 587 or 465) if email alerts are on; slaves connect to the master and, if you turn them on, the ADS-B and AIS services. [nftables.example.conf](deploy/nftables.example.conf) is a default-deny firewall for the master.
 
 ## Logs and troubleshooting
 

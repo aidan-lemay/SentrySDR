@@ -4,6 +4,8 @@
   import Notice from '../Notice.svelte';
   import { NOTICE_MS } from '../notice.svelte.js';
   import GainField from '../GainField.svelte';
+  import NowPlaying from '../NowPlaying.svelte';
+  import { CallPlayer } from '../player.svelte.js';
 
   let { user } = $props();
   let sources = $state([]);
@@ -73,7 +75,10 @@
   onMount(() => {
     refresh();
     const timer = setInterval(poll, 3000);
-    return () => clearInterval(timer);
+    return () => {
+      clearInterval(timer);
+      player.stop();
+    };
   });
 
   async function act(source, path, options, success) {
@@ -157,14 +162,28 @@
 
   // An open call list is reloaded with each refresh, so new calls and transcripts appear.
   const callsOpen = {};
+  // One player for the page: each open call list can feed it.
+  const player = new CallPlayer();
+  let autoplaying = $state({});
+
   async function loadRecent(id) {
     const reply = await api(`recordings?source_id=${id}&limit=5`);
     if (callsOpen[id]) recent[id] = reply.items;  // unless it was closed meanwhile
+    if (autoplaying[id]) player.offer(reply.items);
+  }
+
+  function toggleAutoplay(source) {
+    if (autoplaying[source.id]) delete autoplaying[source.id];
+    else autoplaying[source.id] = true;
+    const any = Object.keys(autoplaying).length > 0;
+    if (any && !player.on) player.start();
+    if (!any && player.on) player.stop();
   }
 
   async function toggleRecent(source) {
     if (callsOpen[source.id]) {
       delete callsOpen[source.id];
+      if (autoplaying[source.id]) toggleAutoplay(source);
       delete recent[source.id];
       return;
     }
@@ -182,6 +201,7 @@
 </script>
 
 <h1>Sources</h1>
+<NowPlaying {player} />
 {#if error}<div class="err" role="alert">{error}</div>{/if}
 
 {#if loaded && !sources.length}
@@ -264,6 +284,7 @@
                 <audio src={`api/live/${source.id}`} controls autoplay></audio>
               {/if}
               {#if recent[source.id]}
+                <label class="tick small"><input type="checkbox" checked={!!autoplaying[source.id]} onchange={() => toggleAutoplay(source)} /> Autoplay new calls from {source.name}</label>
                 {#each recent[source.id] as call (call.id)}
                   <div style="margin:.4rem 0">
                     <div class="small">{formatTime(call.started_at)}, {formatDuration(call.duration)}, {call.target_name}</div>

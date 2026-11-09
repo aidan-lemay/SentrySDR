@@ -1,11 +1,12 @@
 <script>
   import { onMount, tick } from 'svelte';
-  import { ANTENNA_UNITS, DEFAULT_GAIN_DB, OTHER_USES, RECORDED_USES, api, formatRange, formatRanges, formatTime, nearestStep } from '../lib.js';
+  import { ANTENNA_UNITS, DEFAULT_GAIN_DB, formatSize, OTHER_USES, RECORDED_USES, api, formatRange, formatRanges, formatTime, nearestStep } from '../lib.js';
   import Notice from '../Notice.svelte';
   import { clearAfter, NOTICE_MS } from '../notice.svelte.js';
   import GainField from '../GainField.svelte';
 
-  const TABS = [['users', 'Users'], ['sources', 'SDR sources'], ['antennas', 'Antennas'], ['nodes', 'Nodes'], ['bans', 'Bans'], ['audit', 'Audit log'], ['settings', 'Settings'], ['uploads', 'Uploads and feeds']];
+  const TABS = [['users', 'Users'], ['sources', 'SDR sources'], ['antennas', 'Antennas'], ['nodes', 'Nodes'], ['bans', 'Bans'], ['audit', 'Audit log'], ['settings', 'Settings'], ['uploads', 'Uploads and feeds'], ['email', 'Email'], ['warnings', 'Warnings']];
+  const MUTE_CHOICES = [['1', '1 hour'], ['4', '4 hours'], ['8', '8 hours'], ['24', '1 day'], ['72', '3 days'], ['168', '1 week'], ['', 'Until I unmute it']];
   const PERMISSIONS = [
     ['listen_live', 'Listen live'], ['listen_recordings', 'Play recordings'], ['download', 'Download'],
     ['assign', 'Assign and schedule'], ['manage_targets', 'Manage targets'], ['protect', 'Protect recordings'],
@@ -27,7 +28,7 @@
   let nodes = $state([]);
   const blankSource = () => ({
     id: null, key: '', name: '', description: '', antenna_id: '', gain: DEFAULT_GAIN_DB, ppm: 0,
-    tuner: '', steps: '', capMin: '', capMax: '', uses: [], rtlTcpPort: '',
+    tuner: '', steps: '', capMin: '', capMax: '', uses: [], rtlTcpPort: '', lat: '', lon: '', alt: '', quiet: false,
   });
   const TUNERS = ['R820T', 'R820T2', 'R828D', 'FC0012', 'FC0013', 'FC2580', 'E4000'];
   let detecting = $state(false);
@@ -44,6 +45,9 @@
 
   let bans = $state([]);
   let ban = $state({ kind: 'ip', value: '', reason: '' });
+
+  let warnings = $state({ current: [], cleared: [] });
+  let muteFor = $state({});
 
   let audit = $state([]);
   let auditSearch = $state('');
@@ -85,6 +89,8 @@
     audit: async () => { audit = await api(`admin/audit?limit=200${auditSearch ? `&search=${encodeURIComponent(auditSearch)}` : ''}`); },
     settings: async () => { settings = await api('admin/settings'); systems = await api('admin/broadcastify'); },
     uploads: async () => { settings = await api('admin/settings'); systems = await api('admin/broadcastify'); },
+    warnings: async () => { warnings = await api('admin/warnings'); },
+    email: async () => { settings = await api('admin/settings'); smtpPassword = ''; },
   };
 
   function open(next) {
@@ -93,10 +99,22 @@
     selected = null;
     oneTimeSecret = null;
     enrolment = null;
+    if (location.hash !== `#/admin?tab=${next}`) history.replaceState(null, '', `#/admin?tab=${next}`);
     run(loaders[next]);
   }
 
-  onMount(() => open('users'));
+  // The address names the section, so #/admin?tab=warnings (from the warnings banner) opens it.
+  function openFromAddress() {
+    if (!location.hash.startsWith('#/admin')) return;
+    const wanted = new URLSearchParams(location.hash.split('?')[1] ?? '').get('tab');
+    open(TABS.some(([id]) => id === wanted) ? wanted : 'users');
+  }
+
+  onMount(() => {
+    openFromAddress();
+    addEventListener('hashchange', openFromAddress);
+    return () => removeEventListener('hashchange', openFromAddress);
+  });
 
   // --- users
   async function updateUser(user, body, success) {
@@ -155,6 +173,8 @@
       cap_min_hz: filled(sourceForm.capMin) ? toHz(sourceForm.capMin) : null,
       cap_max_hz: filled(sourceForm.capMax) ? toHz(sourceForm.capMax) : null, uses: sourceForm.uses,
       rtl_tcp_port: filled(sourceForm.rtlTcpPort) ? Number(sourceForm.rtlTcpPort) : null,
+      lat: filled(sourceForm.lat) ? Number(sourceForm.lat) : null, lon: filled(sourceForm.lon) ? Number(sourceForm.lon) : null,
+      alt_m: filled(sourceForm.alt) ? Number(sourceForm.alt) : null, quiet_offline: sourceForm.quiet,
     };
     if (body.gain_steps.some(Number.isNaN)) {
       error = 'Gain steps must be numbers, separated by spaces or commas.';
@@ -177,6 +197,7 @@
       tuner: source.tuner, steps: source.gain_steps.join(' '),
       capMin: source.cap_min_hz == null ? '' : plain(source.cap_min_hz), capMax: source.cap_max_hz == null ? '' : plain(source.cap_max_hz),
       uses: [...source.uses], rtlTcpPort: source.rtl_tcp_port ?? '',
+      lat: source.lat ?? '', lon: source.lon ?? '', alt: source.alt_m ?? '', quiet: !!source.quiet_offline,
     };
     document.getElementById('source-form')?.scrollIntoView();
   }
@@ -309,6 +330,29 @@
     await loaders.nodes();
   }, `${node.name} revoked.`);
 
+  // --- nodes: no warning while offline
+  const setNodeQuiet = (node, quiet) => run(async () => {
+    await api(`nodes/${node.id}/quiet`, { method: 'POST', body: { quiet } });
+    await loaders.nodes();
+    dispatchEvent(new Event('warnings-changed'));
+  }, quiet ? `No warnings when ${node.name} is offline.` : `${node.name} warns when offline again.`);
+
+  // --- warnings: muted for this admin only
+  const muteWarning = (warning) => run(async () => {
+    const hours = muteFor[warning.key] ?? '8';
+    await api('admin/warnings/mute', { method: 'POST', body: { key: warning.key, hours: hours === '' ? null : Number(hours) } });
+    await loaders.warnings();
+    dispatchEvent(new Event('warnings-changed'));
+  }, 'Warning muted for you.');
+
+  const unmuteWarning = (key) => run(async () => {
+    await api('admin/warnings/unmute', { method: 'POST', body: { key } });
+    await loaders.warnings();
+    dispatchEvent(new Event('warnings-changed'));
+  }, 'Warning unmuted.');
+
+  const muteText = (until) => (until ? `Muted for you until ${formatTime(until)}` : 'Muted for you until you unmute it');
+
   // --- bans
   async function addBan(event) {
     event.preventDefault();
@@ -335,6 +379,7 @@
       clearcut_page_url: settings.clearcut_page_url, map_tile_url: settings.map_tile_url,
       broadcastify_server: settings.broadcastify_server,
       message_retention_days: Number(settings.message_retention_days),
+      recording_retention_gb: Number(settings.recording_retention_gb || 0),
       airframes_station_id: settings.airframes_station_id.trim(), airframes_feed: settings.airframes_feed.trim(),
     };
     for (const name of ['rdio_api_key', 'clearcut_api_key']) {
@@ -344,6 +389,65 @@
     if (reply) {
       settings = reply;
       keys = { rdio_api_key: '', clearcut_api_key: '' };
+    }
+  }
+
+  // --- email
+  let smtpPassword = $state('');
+  let testing = $state(false);
+  const SMTP_PORTS = { starttls: 587, tls: 465, none: 25 };
+
+  async function saveEmail(event) {
+    event.preventDefault();
+    const body = {
+      email_alerts_enabled: settings.email_alerts_enabled === 'true' || settings.email_alerts_enabled === true,
+      email_daily_cap: Number(settings.email_daily_cap), smtp_host: settings.smtp_host.trim(), smtp_port: Number(settings.smtp_port),
+      smtp_security: settings.smtp_security, smtp_username: settings.smtp_username.trim(), smtp_from: settings.smtp_from.trim(),
+    };
+    if (smtpPassword) body.smtp_password = smtpPassword;
+    const reply = await run(() => api('admin/settings', { method: 'PATCH', body }), 'Email settings saved.');
+    if (reply) {
+      settings = reply;
+      smtpPassword = '';
+    }
+  }
+
+  async function testEmail() {
+    testing = true;
+    const reply = await run(() => api('admin/email/test', { method: 'POST' }));
+    if (reply) message = reply.detail;
+    testing = false;
+  }
+
+  // --- backup
+  let backupPassword = $state('');
+  let backingUp = $state(false);
+
+  async function downloadBackup(event) {
+    event.preventDefault();
+    backingUp = true;
+    error = '';
+    try {
+      const response = await fetch('api/admin/backup', {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json', 'X-SentrySDR': '1' },
+        body: JSON.stringify({ password: backupPassword }),
+      });
+      if (!response.ok) {
+        error = (await response.json().catch(() => ({}))).detail ?? `Backup failed (${response.status})`;
+        scrollTo(0, 0);
+        return;
+      }
+      const name = /filename="?([^";]+)"?/.exec(response.headers.get('content-disposition') ?? '')?.[1] ?? 'sentrysdr-backup.tar.gz';
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(await response.blob());
+      link.download = name;
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(link.href), 10000);
+      backupPassword = '';
+      message = 'Backup downloaded.';
+    } finally {
+      backingUp = false;
     }
   }
 
@@ -596,10 +700,24 @@
         {/if}
       </label>
       <label class="field"><span>Frequency correction (ppm)</span><input type="number" min="-500" max="500" bind:value={sourceForm.ppm} /></label>
+      <div class="field"><span>Location</span>
+        <div class="pair">
+          <input class="mono" type="number" inputmode="decimal" step="any" min="-90" max="90" aria-label="Latitude" placeholder="Latitude" bind:value={sourceForm.lat} />
+          <input class="mono" type="number" inputmode="decimal" step="any" min="-180" max="180" aria-label="Longitude" placeholder="Longitude" bind:value={sourceForm.lon} />
+        </div>
+      </div>
+      <label class="field"><span>Antenna height (m)</span>
+        <input class="mono" type="number" inputmode="decimal" step="any" min="-500" max="10000" bind:value={sourceForm.alt} />
+        <span class="hint">Optional. Where the antenna is, in decimal degrees (43.1566, -77.6088), for the map's receiver marker and ADS-B coverage. Anyone who can see maps sees it. Moving it starts the coverage again.</span>
+      </label>
       <label class="field"><span>rtl_tcp port</span>
         <input class="mono" type="number" inputmode="numeric" min="1024" max="65535" placeholder="Picked for you" bind:value={sourceForm.rtlTcpPort} />
         <span class="hint">Used when this SDR is on an rtl_tcp target. Each SDR on one machine needs its own. The address is set in that machine's configuration file.</span>
       </label>
+      <div class="field"><span>Warnings</span>
+        <label class="tick"><input type="checkbox" bind:checked={sourceForm.quiet} /> Don't warn if its stick is unplugged</label>
+        <span class="hint">For everyone. Other faults still warn. The warning still shows under Admin, Warnings.</span>
+      </div>
     </fieldset>
     <fieldset>
       <legend>What this stick can do</legend>
@@ -720,7 +838,7 @@
   {/if}
   <div class="box">
     <table class="table">
-      <thead><tr><th>Name</th><th>Type</th><th>Status</th><th>SDRs</th><th>Last address</th><th>Actions</th></tr></thead>
+      <thead><tr><th>Name</th><th>Type</th><th>Status</th><th>Version</th><th>SDRs</th><th>Last address</th><th>Actions</th></tr></thead>
       {#each nodes as node (node.id)}
         <tbody>
           <tr>
@@ -729,6 +847,15 @@
             <td data-label="Status">
               <span>
                 <span class={statusClass(node.status)}>{node.status}</span>{#if node.status === 'active'}, <span class={node.online ? 'st-ok' : 'st-warn'}>{node.online ? 'online' : 'offline'}</span>{/if}
+                {#if !node.is_local && node.status !== 'revoked'}
+                  <label class="tick small"><input type="checkbox" checked={node.quiet_offline} onchange={(event) => setNodeQuiet(node, event.target.checked)} /> Don't warn if offline</label>
+                {/if}
+              </span>
+            </td>
+            <td data-label="Version">
+              <span class="small">
+                {node.version ?? 'Unknown'}{#if node.build}{' '}<span class="mono dim">{node.build}</span>{/if}
+                {#if !node.matches_master && node.status === 'active' && !node.is_local}<br /><span class="st-warn">Differs from this server. Upgrade it.</span>{/if}
               </span>
             </td>
             <td data-label="SDRs"><span class="mono small">{node.serials.join(', ') || 'None'}</span></td>
@@ -826,6 +953,10 @@
         <input type="number" inputmode="numeric" min="0" bind:value={settings.audit_retention_days} />
         <span class="hint">0 keeps them forever.</span>
       </label>
+      <label class="field"><span>Recordings size limit (GB)</span>
+        <input type="number" inputmode="decimal" min="0" step="any" bind:value={settings.recording_retention_gb} />
+        <span class="hint">0 means no limit. Over it, the oldest unprotected recordings are deleted first. Using {formatSize(settings.recordings_bytes)}{settings.disk ? `, with ${formatSize(settings.disk.free)} free on that disk` : ''}.</span>
+      </label>
       <label class="field"><span>ACARS messages (days)</span>
         <input type="number" inputmode="numeric" min="0" bind:value={settings.message_retention_days} />
         <span class="hint">0 keeps them forever.</span>
@@ -872,6 +1003,16 @@
     {/if}
     <div class="buttons"><button class="main">{tab === 'uploads' ? 'Save uploads and feeds' : 'Save settings'}</button></div>
   </form>
+  {#if tab === 'settings'}
+    <form onsubmit={downloadBackup}>
+      <fieldset>
+        <legend>Backup</legend>
+        <p class="small">The database and <span class="mono">secret.key</span>, as one file: every account, setting, SDR, target, schedule and recording's details, and the key that decrypts the saved API keys. Recordings themselves aren't included. Keep the file private.</p>
+        <label class="field"><span>Your password</span><input type="password" bind:value={backupPassword} required autocomplete="current-password" /></label>
+        <div class="buttons form-buttons"><button disabled={backingUp}>{backingUp ? 'Preparing...' : 'Download backup'}</button></div>
+      </fieldset>
+    </form>
+  {/if}
   {#if tab === 'uploads'}
   <form onsubmit={saveSystem}>
     <fieldset>
@@ -897,4 +1038,83 @@
     </fieldset>
   </form>
   {/if}
+{/if}
+
+{#if tab === 'warnings'}
+  <p class="small dim">Everything that needs attention now, including what's hidden. Muting is for you only: other admins and operators still see it. To stop a warning for everyone, set <strong>Don't warn if offline</strong> on the slave under Nodes, or on the SDR under SDR sources.</p>
+  <div class="box">
+    {#each warnings.current as warning (warning.key)}
+      <div class="call">
+        <div><span class={warning.level === 'bad' ? 'st-bad' : 'st-warn'}>{warning.level === 'bad' ? 'Problem' : 'Warning'}</span>: <a href={warning.page}>{warning.text}</a></div>
+        {#if warning.quiet}
+          <div class="small dim">Not shown to anyone. {warning.quiet}</div>
+        {:else if warning.muted}
+          <div class="small dim">{muteText(warning.muted_until)}.</div>
+          <div class="buttons" style="margin:.3rem 0 0"><button onclick={() => unmuteWarning(warning.key)}>Unmute</button></div>
+        {:else}
+          <div class="pair" style="margin-top:.3rem">
+            <select aria-label="Mute for how long" value={muteFor[warning.key] ?? '8'} onchange={(event) => (muteFor[warning.key] = event.target.value)}>
+              {#each MUTE_CHOICES as [hours, label] (hours)}<option value={hours}>{label}</option>{/each}
+            </select>
+            <button onclick={() => muteWarning(warning)}>Mute</button>
+          </div>
+        {/if}
+      </div>
+    {:else}
+      <p class="pad dim">Nothing needs attention.</p>
+    {/each}
+  </div>
+  {#if warnings.cleared.length}
+    <h2>Muted, but cleared for now</h2>
+    <p class="small dim">These have stopped for now. The mute still applies if they come back.</p>
+    <div class="box">
+      {#each warnings.cleared as mute (mute.key)}
+        <div class="call">
+          <div>{mute.text}</div>
+          <div class="small dim">{muteText(mute.muted_until)}.</div>
+          <div class="buttons" style="margin:.3rem 0 0"><button onclick={() => unmuteWarning(mute.key)}>Unmute</button></div>
+        </div>
+      {/each}
+    </div>
+  {/if}
+{/if}
+
+{#if tab === 'email' && settings}
+  <form onsubmit={saveEmail}>
+    <fieldset>
+      <legend>Alert emails</legend>
+      <p class="small">Each user chooses their own alerts on the Alerts page, and gets them only at an address they've confirmed. Mail goes through the server below; SentrySDR doesn't run its own.</p>
+      <label class="tick"><input type="checkbox" checked={settings.email_alerts_enabled === 'true' || settings.email_alerts_enabled === true} onchange={(event) => (settings.email_alerts_enabled = event.target.checked)} /> Send alert emails</label>
+      <label class="field"><span>Most emails per person per day</span>
+        <input type="number" inputmode="numeric" min="1" max="1000" bind:value={settings.email_daily_cap} />
+        <span class="hint">Stops a noisy keyword filling an inbox, or getting this server's mail marked as spam. Confirmation emails don't count.</span>
+      </label>
+    </fieldset>
+    <fieldset>
+      <legend>Mail server (SMTP)</legend>
+      <label class="field"><span>Server</span><input class="mono" bind:value={settings.smtp_host} maxlength="253" placeholder="smtp.example.com" autocomplete="off" /></label>
+      <label class="field"><span>Encryption</span>
+        <select bind:value={settings.smtp_security} onchange={() => (settings.smtp_port = SMTP_PORTS[settings.smtp_security])}>
+          <option value="starttls">STARTTLS (port 587)</option>
+          <option value="tls">TLS (port 465)</option>
+          <option value="none">None (this machine)</option>
+        </select>
+      </label>
+      <label class="field"><span>Port</span><input class="mono" type="number" inputmode="numeric" min="1" max="65535" bind:value={settings.smtp_port} /></label>
+      <label class="field"><span>Username</span><input bind:value={settings.smtp_username} maxlength="254" autocomplete="off" /></label>
+      <label class="field"><span>Password {settings.smtp_password_set ? '(saved)' : '(not set)'}</span>
+        <input type="password" bind:value={smtpPassword} autocomplete="new-password" />
+        <span class="hint">Stored encrypted, and never shown again. Leave empty to keep the saved one. For Gmail or Outlook, use an app password.</span>
+      </label>
+      <label class="field"><span>From</span>
+        <input bind:value={settings.smtp_from} maxlength="254" placeholder="SentrySDR <alerts@example.com>" />
+        <span class="hint">An address the mail server is allowed to send as, or the email may be refused or land in spam.</span>
+      </label>
+      <div class="buttons form-buttons">
+        <button class="main">Save email settings</button>
+        <button type="button" disabled={testing || !settings.smtp_host} onclick={testEmail}>{testing ? 'Sending...' : 'Send me a test email'}</button>
+      </div>
+      <p class="small dim form-buttons">The test uses the saved settings, so save first. It goes to your own address.</p>
+    </fieldset>
+  </form>
 {/if}

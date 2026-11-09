@@ -8,6 +8,7 @@ import asyncio
 import ipaddress
 import json
 import logging
+import re
 import math
 import tempfile
 import time
@@ -18,7 +19,7 @@ from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Reque
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 
-from .. import aio, feeds, security
+from .. import BUILD_ID, __version__, aio, feeds, security
 from ..config import SERIAL_RE
 from ..context import Context
 from ..engine import MeasureError
@@ -35,12 +36,20 @@ MAX_CALL_BYTES = 256 * 1024 * 1024
 MAX_FRAME_SERIAL = 64
 
 
+def _short_text(value, limit: int, pattern: str) -> str | None:
+    text = str(value or "")[:limit]
+    return text if text and re.fullmatch(pattern, text) else None
+
+
 def _view(ctx: Context, node: Node) -> dict:
+    version, build = (__version__, BUILD_ID) if node.is_local else (node.version, node.build)
     return {
+        "version": version, "build": build,
+        "matches_master": node.is_local or (build is not None and build == BUILD_ID),
         "id": node.id, "name": node.name, "is_local": node.is_local, "status": node.status,
         "online": ctx.node_online(node) and node.status == "active",
         "serials": node.serials or [], "last_seen_at": node.last_seen_at, "last_ip": node.last_ip,
-        "enroll_expires_at": node.enroll_expires_at,
+        "enroll_expires_at": node.enroll_expires_at, "quiet_offline": bool(node.quiet_offline),
     }
 
 
@@ -82,6 +91,22 @@ def revoke_node(node_id: int, request: Request, admin: User = Depends(admin_user
         ctx.loop.call_soon_threadsafe(link.disconnect)
     ctx.audit("node.revoked", user=admin, ip=ip_of(request), target=node.name)
     return {"detail": "Revoked"}
+
+
+class QuietBody(BaseModel):
+    quiet: bool
+
+
+@router.post("/{node_id}/quiet")
+def set_quiet(node_id: int, body: QuietBody, request: Request, admin: User = Depends(admin_user), db=Depends(get_db)):
+    """For a slave that's offline on purpose at times: no warning about it being offline, for anyone."""
+    node = db.get(Node, node_id)
+    if node is None or node.is_local:
+        raise HTTPException(404, "Node not found")
+    node.quiet_offline = body.quiet or None
+    db.commit()
+    ctx_of(request).audit("node.quiet_offline", user=admin, ip=ip_of(request), target=node.name, details={"quiet": body.quiet})
+    return {"quiet_offline": bool(node.quiet_offline)}
 
 
 SERVICE_RESTART_LIMIT = 10
@@ -271,6 +296,17 @@ def _epoch(value) -> float | None:
     return value if math.isfinite(value) and 0 < value < 32503680000 else None
 
 
+def clean_health(raw: dict) -> dict:
+    """A slave's clock and disk report. Its clock is compared with this one as it arrives."""
+    clean = {"at": time.time(), "clock_synced": raw.get("clock_synced") if isinstance(raw.get("clock_synced"), bool) else None}
+    sent = _epoch(raw.get("time"))
+    clean["skew"] = round(clean["at"] - sent, 1) if sent else None
+    disk = raw.get("disk")
+    if isinstance(disk, dict) and all(isinstance(disk.get(k), int) and disk[k] >= 0 for k in ("free", "total")) and disk["total"]:
+        clean["disk"] = {"free": disk["free"], "total": disk["total"]}
+    return clean
+
+
 def clean_rtl_tcp_status(raw) -> dict:
     """The address a slave's rtl_tcp listens on, and whether a client is connected."""
     if not isinstance(raw, dict):
@@ -313,6 +349,8 @@ def handle_agent_message(ctx: Context, node_id: int, allowed: list[str], message
                 })
     elif kind == "measure_result":
         ctx.finish_measure(node_id, message)
+    elif kind == "health":
+        ctx.node_health[node_id] = clean_health(message)
     elif kind == "tracks":
         serial, track_kind = message.get("serial"), message.get("kind")
         if serial in allowed and track_kind in ("adsb", "ais", "acars") and isinstance(message.get("data"), dict):
@@ -341,6 +379,9 @@ async def agent_socket(websocket: WebSocket):
         with ctx.db() as db:
             node = db.get(Node, node_id)
             node.serials, node.last_seen_at, node.last_ip = allowed, time.time(), ip
+            # Older slaves don't report these; the page then says the version is unknown.
+            node.version = _short_text(hello.get("version"), 32, r"[0-9A-Za-z.+-]+")
+            node.build = _short_text(hello.get("build"), 16, r"[0-9a-f]+")
             db.commit()
         previous = ctx.node_links.get(node_id)
         if previous is not None:

@@ -144,7 +144,7 @@ def test_routes_require_sign_in(app, path):
 def test_every_route_is_guarded_or_explicitly_public(app):
     """A new route that forgets its auth dependency fails here."""
     public = {"/api/auth/signup", "/api/auth/login", "/api/auth/logout", "/api/health",
-              "/api/nodes/agent/enroll", "/api/nodes/agent/calls", "/api/nodes/agent/ws",
+              "/api/nodes/agent/enroll", "/api/nodes/agent/calls", "/api/nodes/agent/ws", "/api/email/confirm", "/api/email/off",
               "/api/{_rest:path}", "/{path:path}"}
     client = client_for(app)
     routes = all_routes(app)

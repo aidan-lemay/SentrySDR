@@ -1,5 +1,7 @@
 <script>
   import { onMount, untrack } from 'svelte';
+  import NowPlaying from '../NowPlaying.svelte';
+  import { CallPlayer } from '../player.svelte.js';
   import { api, formatMHz, formatTime, formatDuration, formatSize } from '../lib.js';
 
   let { user, route } = $props();
@@ -13,15 +15,18 @@
   let start = $state('');
   let end = $state('');
   let protectedOnly = $state(false);
+  let importantOnly = $state(false);
   let error = $state('');
   let loaded = $state(false);
   let transcribing = $state({});
+  const player = new CallPlayer();
   let requested = $state({});
 
   const sourceFilter = $derived(new URLSearchParams(route.split('?')[1] ?? '').get('source_id'));
+  const callFilter = $derived(new URLSearchParams(route.split('?')[1] ?? '').get('call'));  // from an alert email
 
   // The filters last searched with. Polling uses these, not what's half typed in the form.
-  let applied = { search: '', start: '', end: '', protectedOnly: false };
+  let applied = { search: '', start: '', end: '', protectedOnly: false, importantOnly: false };
   let generation = 0;
   let loadFailed = false;
 
@@ -29,15 +34,18 @@
     const params = new URLSearchParams({ limit: PAGE, offset });
     if (applied.search) params.set('search', applied.search);
     if (sourceFilter) params.set('source_id', sourceFilter);
+    if (callFilter) params.set('call', callFilter);
     if (applied.start) params.set('start', new Date(applied.start).getTime() / 1000);
     if (applied.end) params.set('end', new Date(applied.end).getTime() / 1000);
     if (applied.protectedOnly) params.set('protected', 'true');
+    if (applied.importantOnly) params.set('important', 'true');
     const mine = ++generation;
     try {
       const reply = await api(`recordings?${params}`);
       if (mine !== generation) return;  // a newer search or page has been asked for
       items = reply.items;
       total = reply.total;
+      player.offer(reply.items);
       if (loadFailed) error = '';  // a failed action's error stays until the next action
       loadFailed = false;
     } catch (failure) {
@@ -52,6 +60,7 @@
   // Reload when the route's source changes, but not on each filter keystroke.
   $effect(() => {
     sourceFilter;
+    callFilter;
     untrack(() => {
       offset = 0;
       load();
@@ -60,7 +69,7 @@
 
   function applyFilters(event) {
     event.preventDefault();
-    applied = { search, start, end, protectedOnly };
+    applied = { search, start, end, protectedOnly, importantOnly };
     offset = 0;
     load();
   }
@@ -80,8 +89,16 @@
 
   onMount(() => {
     const timer = setInterval(poll, 5000);
-    return () => clearInterval(timer);
+    return () => {
+      clearInterval(timer);
+      player.stop();  // leaving the page stops autoplay
+    };
   });
+
+  function toggleAutoplay() {
+    player.toggle();
+    if (player.on && offset !== 0) page(-offset);  // new calls arrive on the first page
+  }
 
   function page(delta) {
     offset = Math.max(0, offset + delta);
@@ -94,6 +111,18 @@
     try {
       await api(`recordings/${call.id}/protect`, { method: 'POST', body: { protected: value } });
       call.protected = value;
+    } catch (failure) {
+      error = failure.message;
+    }
+  }
+
+  async function setImportant(call, value) {
+    error = '';
+    try {
+      const reply = await api(`recordings/${call.id}/important`, { method: 'POST', body: { important: value } });
+      call.important = reply.important;
+      call.protected = reply.protected;
+      call.important_by = value ? user.email : null;
     } catch (failure) {
       error = failure.message;
     }
@@ -132,7 +161,7 @@
 
 <h1>Recordings</h1>
 <p class="small">
-  {total} call{total === 1 ? '' : 's'}{#if sourceFilter}, from one source. <a href="#/recordings">Show all</a>{/if}
+  {total} call{total === 1 ? '' : 's'}{#if callFilter}, the one from your alert email. <a href="#/recordings">Show all</a>{:else if sourceFilter}, from one source. <a href="#/recordings">Show all</a>{/if}
   {#if user.clearcut_page_url}{' | '}<a href={user.clearcut_page_url} target="_blank" rel="noopener noreferrer">Open ClearCut</a>{/if}
 </p>
 
@@ -144,21 +173,31 @@
       <input type="search" bind:value={search} aria-label="Search recordings" placeholder="Target, source or transcript" />
       <button class="main">Search</button>
     </div>
+    <label class="tick small"><input type="checkbox" checked={player.on} onchange={toggleAutoplay} /> Autoplay new calls as they finish, matching this search</label>
     <details>
       <summary class="small">Date and other filters</summary>
       <label class="field"><span>From</span><input type="datetime-local" bind:value={start} /></label>
       <label class="field"><span>To</span><input type="datetime-local" bind:value={end} /></label>
       <div class="field"><span>Protected</span><label class="tick"><input type="checkbox" bind:checked={protectedOnly} /> Protected calls only</label></div>
+      <div class="field"><span>Important</span><label class="tick"><input type="checkbox" bind:checked={importantOnly} /> Important only: your keywords, or marked by hand</label></div>
     </details>
   </div>
 </form>
 
+<NowPlaying {player} />
+
 <div class="box">
   {#each items as call (call.id)}
-    <div class="call">
+    <div class="call" class:important={call.important || call.matches.length}>
       <div><strong>{call.target_name || 'Unknown target'}</strong> <span class="mono small nowrap">{formatMHz(call.frequency_hz)}</span></div>
       <div class="small">{formatTime(call.started_at)}, {formatDuration(call.duration)}, {formatSize(call.size_bytes)}</div>
       <div class="small dim">{call.source_name} on {call.node_name}</div>
+      {#if call.matches.length || call.important}
+        <div class="small">
+          {#if call.matches.length}<span class="st-bad">Matches: {call.matches.join(', ')}</span>{/if}
+          {#if call.important}{call.matches.length ? ' · ' : ''}<span class="st-bad">Important{call.important_by ? `, marked by ${call.important_by}` : ''}</span>{/if}
+        </div>
+      {/if}
       {#if call.protected || call.uploads.length}
         <div class="small flags">
           {#if call.protected}<span class="st-ok">Protected</span>{/if}
@@ -182,6 +221,7 @@
         {/if}
         {#if can('protect')}
           <button onclick={() => setProtected(call, !call.protected)}>{call.protected ? 'Unprotect' : 'Protect'}</button>
+          <button onclick={() => setImportant(call, !call.important)}>{call.important ? 'Not important' : 'Mark important'}</button>
         {/if}
         {#if user.role === 'admin' && !call.protected}
           <button class="bad" onclick={() => remove(call)}>Delete</button>

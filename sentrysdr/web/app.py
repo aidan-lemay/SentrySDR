@@ -16,7 +16,7 @@ from ..models import Node
 from ..security import (
     client_ip, hash_token, host_of, host_permitted, is_direct_plain_http, origin_permitted, peer_permitted,
 )
-from . import routes_account, routes_admin, routes_messages, routes_nodes, routes_radio, routes_recordings
+from . import routes_account, routes_admin, routes_alerts, routes_messages, routes_nodes, routes_radio, routes_recordings, routes_warnings, routes_email, routes_emergencies
 from .deps import ip_banned
 
 WEB_DIST = Path(__file__).resolve().parent.parent.parent / "web" / "dist"
@@ -24,6 +24,7 @@ SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 MAX_API_BODY = 1_000_000
 MAX_CALL_BODY = 256 * 1024 * 1024
 CALL_UPLOAD_PATH = "/api/nodes/agent/calls"
+EMAIL_OFF_PATH = "/api/email/off"
 
 
 def app_csp(tile_origin: str) -> str:
@@ -76,7 +77,8 @@ class SecurityMiddleware:
 
         method = scope["method"]
         path = scope["path"]
-        if method not in SAFE_METHODS and not path.startswith("/api/nodes/agent/"):
+        # Turning alert emails off is proved by the link's token, and mail apps' one-click unsubscribe posts it from outside.
+        if method not in SAFE_METHODS and not path.startswith("/api/nodes/agent/") and path != EMAIL_OFF_PATH:
             origin = headers.get("origin")
             if origin is not None:
                 if not origin_permitted(self.cfg, origin, headers):
@@ -155,7 +157,7 @@ def create_app(ctx: Context, run_background: bool = True) -> FastAPI:
     app.state.ctx = ctx
     app.add_middleware(SecurityMiddleware, ctx=ctx)
 
-    for module in (routes_account, routes_admin, routes_radio, routes_recordings, routes_messages, routes_nodes):
+    for module in (routes_account, routes_admin, routes_radio, routes_recordings, routes_messages, routes_alerts, routes_warnings, routes_email, routes_emergencies, routes_nodes):
         app.include_router(module.router)
 
     @app.get("/api/health")

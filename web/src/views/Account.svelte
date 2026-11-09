@@ -123,6 +123,10 @@
 </form>
 
 {#if !forced}
+  {#if user.permissions.includes('listen_recordings') || user.permissions.includes('maps')}
+    <p class="small">Keywords and email alerts are on the <a href="#/alerts?tab=settings">Alerts</a> page.</p>
+  {/if}
+
   <fieldset>
     <legend>Two-factor sign-in</legend>
     {#if user.totp_enabled}

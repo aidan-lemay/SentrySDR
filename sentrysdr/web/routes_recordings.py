@@ -5,15 +5,18 @@ stores copies of those names, so past pairings stay searchable after deletion.
 """
 from __future__ import annotations
 
+import time
+
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy import func, or_, select
 
-from .. import uploaders
+from .. import keywords, uploaders
 from ..models import Recording, UploadJob, User
 from .deps import ctx_of, current_user, get_db, ip_of, require
+from .routes_alerts import important_condition, user_words
 
 router = APIRouter(prefix="/api/recordings")
 
@@ -22,8 +25,10 @@ TRANSCRIBE_LIMIT = 30
 TRANSCRIBE_WINDOW = 3600
 
 
-def _view(recording: Recording, uploads: list[UploadJob] | None = None) -> dict:
+def _view(recording: Recording, uploads: list[UploadJob] | None = None, words: list[str] | None = None) -> dict:
+    matches = keywords.matches(words or [], recording.transcript)
     return {
+        "important": bool(recording.important), "important_by": recording.important_by, "matches": matches,
         "id": recording.id, "node_name": recording.node_name, "serial": recording.serial,
         "source_id": recording.source_id, "source_name": recording.source_name,
         "target_id": recording.target_id, "target_name": recording.target_name,
@@ -42,16 +47,25 @@ def list_recordings(
     search: str | None = Query(default=None, max_length=120),
     source_id: int | None = None, target_id: int | None = None,
     start: float | None = None, end: float | None = None, protected: bool | None = None,
+    targets: str | None = Query(default=None, max_length=600, pattern=r"^\d+(,\d+){0,49}$"),
+    ended_after: float | None = None,  # for players: calls finished since then, oldest first
+    important: bool = False,  # marked important, or matching this user's keywords
+    call: str | None = Query(default=None, max_length=36, pattern=r"^[0-9a-f-]{36}$"),  # one call, as linked from an alert email
     limit: int = Query(default=50, ge=1, le=200), offset: int = Query(default=0, ge=0),
-    _user: User = Depends(require("listen_recordings")), db=Depends(get_db),
+    user: User = Depends(require("listen_recordings")), db=Depends(get_db),
 ):
+    words = user_words(db, user, "calls")
     conditions = []
+    if important:
+        conditions.append(important_condition(Recording.transcript, Recording.important, words))
     if search:
         pattern = "%" + search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
         conditions.append(or_(
             Recording.target_name.like(pattern, escape="\\"), Recording.source_name.like(pattern, escape="\\"),
             Recording.recorder_name.like(pattern, escape="\\"), Recording.transcript.like(pattern, escape="\\"),
         ))
+    if call:
+        conditions.append(Recording.id == call)
     if source_id is not None:
         conditions.append(Recording.source_id == source_id)
     if target_id is not None:
@@ -62,15 +76,18 @@ def list_recordings(
         conditions.append(Recording.started_at <= end)
     if protected is not None:
         conditions.append(Recording.protected.is_(protected))
+    if targets:
+        conditions.append(Recording.target_id.in_([int(t) for t in targets.split(",")]))
+    if ended_after is not None:
+        conditions.append(Recording.ended_at > ended_after)
+    order = (Recording.ended_at.asc(),) if ended_after is not None else (Recording.started_at.desc(),)
     total = db.scalar(select(func.count()).select_from(Recording).where(*conditions))
-    rows = list(db.scalars(
-        select(Recording).where(*conditions).order_by(Recording.started_at.desc()).limit(limit).offset(offset)
-    ))
+    rows = list(db.scalars(select(Recording).where(*conditions).order_by(*order).limit(limit).offset(offset)))
     jobs: dict[str, list[UploadJob]] = {}
     if rows:
         for job in db.scalars(select(UploadJob).where(UploadJob.recording_id.in_([r.id for r in rows]))):
             jobs.setdefault(job.recording_id, []).append(job)
-    return {"total": total, "items": [_view(r, jobs.get(r.id)) for r in rows]}
+    return {"total": total, "items": [_view(r, jobs.get(r.id), words) for r in rows]}
 
 
 def _get(db, recording_id: str) -> Recording:
@@ -145,6 +162,7 @@ async def transcribe(recording_id: str, request: Request, user: User = Depends(r
     except (uploaders.UploadError, httpx.HTTPError) as exc:
         raise HTTPException(502, "ClearCut couldn't transcribe this call right now") from exc
     recording.transcript = uploaders.transcript_text(call)
+    recording.transcript_at = time.time()
     db.commit()
     ctx.audit("recording.transcribe_requested", user=user, ip=ip_of(request), target=recording.id)
     return _view(recording)

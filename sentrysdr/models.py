@@ -5,7 +5,7 @@ import json
 import time
 from pathlib import Path
 
-from sqlalchemy import JSON, ForeignKey, Index, String, create_engine, event, inspect, text
+from sqlalchemy import JSON, ForeignKey, Index, String, create_engine, event, inspect, text, UniqueConstraint
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
@@ -35,6 +35,21 @@ class User(Base):
     last_login_at: Mapped[float | None] = mapped_column(nullable=True)
     last_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
     signup_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    alerts_seen_at: Mapped[float | None] = mapped_column(nullable=True)
+    # Email alerts: sent only to an address this user has confirmed (email_verified == email).
+    email_alerts: Mapped[bool | None] = mapped_column(nullable=True)
+    email_verified: Mapped[str | None] = mapped_column(String(254), nullable=True)
+    email_confirm_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    email_confirm_address: Mapped[str | None] = mapped_column(String(254), nullable=True)
+    email_confirm_expires: Mapped[float | None] = mapped_column(nullable=True)
+    email_window: Mapped[int | None] = mapped_column(nullable=True)  # minutes between emails
+    email_important: Mapped[bool | None] = mapped_column(nullable=True)  # also things marked important
+    email_since: Mapped[float | None] = mapped_column(nullable=True)  # nothing older is emailed
+    email_last_sent_at: Mapped[float | None] = mapped_column(nullable=True)
+    # Aircraft and ship emergencies: which codes (None = the defaults), how far away (None = anywhere), and email.
+    emergency_codes: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    emergency_km: Mapped[int | None] = mapped_column(nullable=True)
+    email_emergencies: Mapped[bool | None] = mapped_column(nullable=True)
 
 
 class UserSession(Base):
@@ -83,6 +98,9 @@ class Node(Base):
     last_seen_at: Mapped[float | None] = mapped_column(nullable=True)
     last_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[float] = mapped_column(default=now)
+    version: Mapped[str | None] = mapped_column(String(32), nullable=True)  # as the node reported it
+    build: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    quiet_offline: Mapped[bool | None] = mapped_column(nullable=True)  # known to be offline at times: no warning
 
 
 class Source(Base):
@@ -108,6 +126,11 @@ class Source(Base):
     uses: Mapped[list | None] = mapped_column(JSON, nullable=True)
     feeder_uuid: Mapped[str | None] = mapped_column(String(36), nullable=True)  # identifies this receiver to aggregators
     rtl_tcp_port: Mapped[int | None] = mapped_column(nullable=True)  # unique per node; the address is in each node's config
+    # Where the antenna is, for the map's receiver marker and coverage. Optional.
+    lat: Mapped[float | None] = mapped_column(nullable=True)
+    lon: Mapped[float | None] = mapped_column(nullable=True)
+    alt_m: Mapped[float | None] = mapped_column(nullable=True)
+    quiet_offline: Mapped[bool | None] = mapped_column(nullable=True)  # no warning while its stick is unplugged
     __table_args__ = (Index("uq_source_node_serial", "node_id", "serial", unique=True),)
 
 
@@ -188,6 +211,11 @@ class Recorder(Base):
     schedule_start: Mapped[str | None] = mapped_column(String(5), nullable=True)  # HH:MM
     schedule_end: Mapped[str | None] = mapped_column(String(5), nullable=True)
     locked: Mapped[bool | None] = mapped_column(nullable=True)  # only admins may change it
+    # One-off schedules: a window in epoch seconds, with schedule_days empty. Weekly ones leave these empty.
+    once_start: Mapped[float | None] = mapped_column(nullable=True)
+    once_end: Mapped[float | None] = mapped_column(nullable=True)
+    on_end: Mapped[str | None] = mapped_column(String(8), nullable=True)  # "keep": the target stays assigned afterwards
+    active_since: Mapped[float | None] = mapped_column(nullable=True)  # set while this schedule controls its source
     assigned_by: Mapped[str] = mapped_column(String(254), default="")
     assigned_at: Mapped[float] = mapped_column(default=now)
 
@@ -216,6 +244,11 @@ class Recording(Base):
     clearcut_system: Mapped[str | None] = mapped_column(String(64), nullable=True)
     clearcut_talkgroup: Mapped[int | None] = mapped_column(nullable=True)
     clearcut_call_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    transcript_at: Mapped[float | None] = mapped_column(nullable=True)  # when the transcript arrived, for alerts
+    # Marked important by hand. Anyone's keywords can also make it important to them.
+    important: Mapped[bool | None] = mapped_column(nullable=True)
+    important_at: Mapped[float | None] = mapped_column(nullable=True)
+    important_by: Mapped[str | None] = mapped_column(String(254), nullable=True)
 
 
 class AcarsMessage(Base):
@@ -239,6 +272,84 @@ class AcarsMessage(Base):
     text: Mapped[str] = mapped_column(String(4000), default="")
     has_text: Mapped[bool] = mapped_column(default=False, index=True)
     fed: Mapped[bool | None] = mapped_column(nullable=True)  # sent to airframes.io
+    important: Mapped[bool | None] = mapped_column(nullable=True)
+    important_at: Mapped[float | None] = mapped_column(nullable=True)
+    important_by: Mapped[str | None] = mapped_column(String(254), nullable=True)
+
+
+class UserKeyword(Base):
+    """A word or phrase one user wants flagged in call transcripts or ACARS messages."""
+    __tablename__ = "user_keywords"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    word: Mapped[str] = mapped_column(String(80))
+    applies: Mapped[str] = mapped_column(String(8), default="both")  # calls|messages|both
+    email: Mapped[bool | None] = mapped_column(nullable=True)  # also emailed, not only flagged
+    created_at: Mapped[float] = mapped_column(default=now)
+
+
+class UserWatch(Base):
+    """Email one user about every call on a channel, or every ACARS message from an aircraft."""
+    __tablename__ = "user_watches"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    kind: Mapped[str] = mapped_column(String(8))  # channel|aircraft
+    target_id: Mapped[int | None] = mapped_column(ForeignKey("targets.id", ondelete="CASCADE"), nullable=True)
+    value: Mapped[str] = mapped_column(String(16), default="")  # a registration or flight, for aircraft
+    created_at: Mapped[float] = mapped_column(default=now)
+
+
+class AlertSent(Base):
+    """A call or message already emailed to a user, so it goes once."""
+    __tablename__ = "alerts_sent"
+    __table_args__ = (UniqueConstraint("user_id", "kind", "item_id"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    kind: Mapped[str] = mapped_column(String(9))  # call|message|emergency
+    item_id: Mapped[str] = mapped_column(String(64))
+    sent_at: Mapped[float] = mapped_column(default=now, index=True)
+
+
+class EmailLog(Base):
+    """Each email sent to a user, for the daily limit."""
+    __tablename__ = "email_log"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    kind: Mapped[str] = mapped_column(String(12))  # alert|confirm|test
+    sent_at: Mapped[float] = mapped_column(default=now, index=True)
+
+
+class TrackEmergency(Base):
+    """One aircraft or ship emergency, from first seen until it stopped. Kept as long as ACARS messages."""
+    __tablename__ = "track_emergencies"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    kind: Mapped[str] = mapped_column(String(8))  # adsb|ais
+    ident: Mapped[str] = mapped_column(String(16), index=True)  # ICAO hex or MMSI
+    codes: Mapped[list] = mapped_column(JSON, default=list)
+    name: Mapped[str] = mapped_column(String(40), default="")  # flight or ship name
+    callsign: Mapped[str] = mapped_column(String(20), default="")  # registration or radio callsign
+    node_id: Mapped[int | None] = mapped_column(nullable=True)
+    serial: Mapped[str] = mapped_column(String(64), default="")
+    source_name: Mapped[str] = mapped_column(String(120), default="")
+    first_seen: Mapped[float] = mapped_column(default=now, index=True)
+    last_seen: Mapped[float] = mapped_column(default=now)
+    ended_at: Mapped[float | None] = mapped_column(nullable=True)
+    lat: Mapped[float | None] = mapped_column(nullable=True)
+    lon: Mapped[float | None] = mapped_column(nullable=True)
+    altitude: Mapped[float | None] = mapped_column(nullable=True)  # feet, aircraft only
+    distance_km: Mapped[float | None] = mapped_column(nullable=True)  # from the SDR that first heard it
+
+
+class WarningMute(Base):
+    """One admin's choice not to see one warning, until a time or (until None) for good."""
+    __tablename__ = "warning_mutes"
+    __table_args__ = (UniqueConstraint("user_id", "key"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    key: Mapped[str] = mapped_column(String(120))
+    text: Mapped[str] = mapped_column(String(500), default="")  # the warning as it was, for when it's gone
+    until: Mapped[float | None] = mapped_column(nullable=True)
+    created_at: Mapped[float] = mapped_column(default=now)
 
 
 class UploadJob(Base):
@@ -369,6 +480,8 @@ def make_session_factory(db_path: Path):
         cursor.execute("PRAGMA foreign_keys=ON")
         cursor.execute("PRAGMA synchronous=NORMAL")
         cursor.close()
+        from .keywords import regexp
+        conn.create_function("regexp", 2, regexp, deterministic=True)  # whole-word keyword matching
 
     Base.metadata.create_all(engine)
     _add_missing_columns(engine)

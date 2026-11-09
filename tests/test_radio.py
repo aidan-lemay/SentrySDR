@@ -8,7 +8,7 @@ import subprocess
 import time
 import uuid
 from array import array
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,7 +17,7 @@ import pytest
 from sqlalchemy import select
 
 from sentrysdr import capabilities, feeds, pipelines, schedule, sdr, uploaders
-from sentrysdr.context import BROADCASTIFY_RETRY_SECONDS, UPLOAD_MAX_ATTEMPTS
+from sentrysdr.context import BROADCASTIFY_RETRY_SECONDS, UPLOAD_MAX_ATTEMPTS, Context
 from sentrysdr.engine import MeasureError, VolumeControl, merge_ais_message
 from sentrysdr.models import AcarsMessage, Antenna, AuditLog, BroadcastifySystem, Node, Recorder, Recording, SdrProfile, Source, Target, UploadJob, make_session_factory
 
@@ -2125,3 +2125,449 @@ def test_restart_routes_are_admin_only_and_reach_the_node(ctx, admin, operator):
     with ctx.db() as session:
         actions = [a.action for a in session.scalars(select(AuditLog))]
     assert "source.restarted" in actions and "node.service_restarted" in actions
+
+
+# --- machine health -------------------------------------------------------------------
+import sentrysdr as sentrysdr_package
+from sentrysdr import health as health_module
+from sentrysdr.web.routes_nodes import clean_health
+
+
+def add_slave(ctx, name="Field", online=True, build=None, version="0.1.0", last_seen=None):
+    with ctx.db() as session:
+        node = Node(name=name, status="active", serials=["FIELD1"], build=build, version=version,
+                    last_seen_at=last_seen if last_seen is not None else time.time())
+        session.add(node)
+        session.commit()
+        node_id = node.id
+    if online:
+        ctx.node_links[node_id] = SimpleNamespace(send=lambda m: None)
+    return node_id
+
+
+def warnings_text(client):
+    return " | ".join(w["text"] for w in client.get("/api/warnings").json())
+
+
+def test_node_versions_shown_and_compared(ctx, admin):
+    add_slave(ctx, "Same", build=sentrysdr_package.BUILD_ID, version=sentrysdr_package.__version__)
+    add_slave(ctx, "Old", build="0123456789ab", version="0.1.0")
+    nodes = {n["name"]: n for n in admin.get("/api/nodes").json()}
+    local = next(n for n in nodes.values() if n["is_local"])
+    assert local["version"] == sentrysdr_package.__version__ and local["matches_master"] is True
+    assert nodes["Same"]["matches_master"] is True and nodes["Old"]["matches_master"] is False
+    assert "Old runs a different version (0.1.0)" in warnings_text(admin) and "Same runs" not in warnings_text(admin)
+
+
+def test_health_warnings(ctx, admin, operator, listener, monkeypatch):
+    add_slave(ctx, "Gone", online=False, last_seen=time.time() - 3600)
+    add_slave(ctx, "Briefly", online=False, last_seen=time.time() - 30)
+    skewed = add_slave(ctx, "Skewed", build=sentrysdr_package.BUILD_ID)
+    ctx.node_health[skewed] = clean_health({"time": time.time() - 40, "clock_synced": True, "disk": {"free": 10**12, "total": 2 * 10**12}})
+    unsynced = add_slave(ctx, "Unsynced", build=sentrysdr_package.BUILD_ID)
+    ctx.node_health[unsynced] = clean_health({"time": time.time(), "clock_synced": False, "disk": {"free": 10**8, "total": 10**11}})
+    monkeypatch.setattr(health_module, "clock_synced", lambda: True)
+    monkeypatch.setattr(health_module, "disk", lambda path: {"free": 10**12, "total": 2 * 10**12})
+    text = warnings_text(admin)
+    assert "Gone is offline since" in text and "Briefly" not in text
+    assert "Skewed's clock is 40 seconds off" in text
+    assert "Unsynced's clock isn't synced" in text and "Unsynced has 0.1 GB free" in text
+    assert text == warnings_text(operator)
+    assert listener.get("/api/warnings").json() == []
+
+
+def test_sdr_faults_and_failed_uploads_warn(ctx, admin, monkeypatch):
+    monkeypatch.setattr(health_module, "clock_synced", lambda: True)
+    monkeypatch.setattr(health_module, "disk", lambda path: {"free": 10**12, "total": 2 * 10**12})
+    source = make_source(admin, name="Roof stick")
+    admin.post(f"/api/sources/{source}/assign", json={"target_id": make_target(admin)}).raise_for_status()
+    ctx.set_status(ctx.local_node_id, "SER1", {"state": "error", "error": "SDR disconnected"})
+    assert "Roof stick: SDR disconnected" in warnings_text(admin)
+    with ctx.db() as session:
+        session.add(Recording(id=str(uuid.uuid4()), started_at=time.time() - 60, ended_at=time.time(), duration=5, rel_path="x.mp3"))
+        session.flush()
+        rec_id = session.scalars(select(Recording)).first().id
+        session.add_all([UploadJob(recording_id=rec_id, destination="rdio", status="failed"),
+                         UploadJob(recording_id=rec_id, destination="clearcut", status="failed")])
+        session.commit()
+    assert "2 uploads failed in the last day" in warnings_text(admin)
+
+
+def test_admin_mutes_a_warning_for_themselves_only(ctx, admin, operator, monkeypatch):
+    monkeypatch.setattr(health_module, "clock_synced", lambda: True)
+    monkeypatch.setattr(health_module, "disk", lambda path: {"free": 10**12, "total": 2 * 10**12})
+    gone = add_slave(ctx, "Gone", online=False, last_seen=time.time() - 3600)
+    key = f"node.offline:{gone}"
+    assert any(w["key"] == key for w in admin.get("/api/warnings").json())
+    assert admin.post("/api/admin/warnings/mute", json={"key": key, "hours": 2}).status_code == 200
+    assert "Gone is offline" not in warnings_text(admin)
+    assert "Gone is offline" in warnings_text(operator)  # mutes are each admin's own
+    listed = {w["key"]: w for w in admin.get("/api/admin/warnings").json()["current"]}
+    assert listed[key]["muted"] and listed[key]["muted_until"] > time.time() + 7000
+    # Indefinitely, then back.
+    admin.post("/api/admin/warnings/mute", json={"key": key, "hours": None}).raise_for_status()
+    listed = {w["key"]: w for w in admin.get("/api/admin/warnings").json()["current"]}
+    assert listed[key]["muted"] and listed[key]["muted_until"] is None
+    admin.post("/api/admin/warnings/unmute", json={"key": key}).raise_for_status()
+    assert "Gone is offline" in warnings_text(admin)
+
+
+def test_a_mute_runs_out_and_survives_the_warning_clearing(ctx, admin, monkeypatch):
+    monkeypatch.setattr(health_module, "clock_synced", lambda: True)
+    monkeypatch.setattr(health_module, "disk", lambda path: {"free": 10**12, "total": 2 * 10**12})
+    gone = add_slave(ctx, "Gone", online=False, last_seen=time.time() - 3600)
+    key = f"node.offline:{gone}"
+    admin.post("/api/admin/warnings/mute", json={"key": key, "hours": 1}).raise_for_status()
+    ctx.node_links[gone] = SimpleNamespace(send=lambda m: None)  # back online: the warning clears
+    reply = admin.get("/api/admin/warnings").json()
+    assert reply["cleared"] == [{"key": key, "text": reply["cleared"][0]["text"], "muted_until": reply["cleared"][0]["muted_until"]}]
+    assert "Gone is offline" in reply["cleared"][0]["text"]
+    del ctx.node_links[gone]
+    real = time.time
+    monkeypatch.setattr(time, "time", lambda: real() + 2 * 3600)
+    assert "Gone is offline" in warnings_text(admin)
+    assert admin.get("/api/admin/warnings").json()["cleared"] == []
+
+
+def test_muting_needs_an_admin_and_a_current_warning(ctx, admin, operator, monkeypatch):
+    monkeypatch.setattr(health_module, "clock_synced", lambda: True)
+    monkeypatch.setattr(health_module, "disk", lambda path: {"free": 10**12, "total": 2 * 10**12})
+    gone = add_slave(ctx, "Gone", online=False, last_seen=time.time() - 3600)
+    assert operator.post("/api/admin/warnings/mute", json={"key": f"node.offline:{gone}"}).status_code == 403
+    assert operator.get("/api/admin/warnings").status_code == 403
+    assert admin.post("/api/admin/warnings/mute", json={"key": "node.offline:9999"}).status_code == 404
+    assert admin.post("/api/admin/warnings/mute", json={"key": f"node.offline:{gone}", "hours": 0}).status_code == 422
+
+
+def test_quiet_offline_node_and_source(ctx, admin, operator, monkeypatch):
+    monkeypatch.setattr(health_module, "clock_synced", lambda: True)
+    monkeypatch.setattr(health_module, "disk", lambda path: {"free": 10**12, "total": 2 * 10**12})
+    gone = add_slave(ctx, "Gone", online=False, last_seen=time.time() - 3600)
+    assert admin.post(f"/api/nodes/{gone}/quiet", json={"quiet": True}).json() == {"quiet_offline": True}
+    assert operator.post(f"/api/nodes/{gone}/quiet", json={"quiet": False}).status_code == 403
+    assert admin.post(f"/api/nodes/{ctx.local_node_id}/quiet", json={"quiet": True}).status_code == 404
+    assert "Gone" not in warnings_text(admin) and "Gone" not in warnings_text(operator)  # for everyone
+    listed = {w["key"]: w for w in admin.get("/api/admin/warnings").json()["current"]}
+    assert listed[f"node.offline:{gone}"]["quiet"]  # still on the admin list, saying why it's quiet
+    assert next(n for n in admin.get("/api/nodes").json() if n["id"] == gone)["quiet_offline"] is True
+
+    source = make_source(admin, name="Roof stick", quiet_offline=True)
+    admin.post(f"/api/sources/{source}/assign", json={"target_id": make_target(admin)}).raise_for_status()
+    assert source_row(admin, source)["quiet_offline"] is True
+    ctx.set_status(ctx.local_node_id, "SER1", {"state": "error", "error": "SDR disconnected"})
+    assert "Roof stick" not in warnings_text(admin)
+    ctx.set_status(ctx.local_node_id, "SER1", {"state": "error", "error": "tool not installed: rtl_fm"})
+    assert "Roof stick: tool not installed" in warnings_text(operator)  # other faults still warn
+
+
+def test_clean_health_report():
+    report = clean_health({"time": "nonsense", "clock_synced": "yes", "disk": {"free": -1, "total": 5}})
+    assert report["skew"] is None and report["clock_synced"] is None and "disk" not in report
+
+
+def test_kernel_clock_reading_works_here():
+    assert health_module.clock_synced() in (True, False, None)
+
+
+def add_recording(ctx, age_days, size, protected=False):
+    call = str(uuid.uuid4())
+    path = ctx.cfg.recordings_dir / f"{call}.mp3"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"ID3" + b"x" * 10)
+    with ctx.db() as session:
+        session.add(Recording(id=call, started_at=time.time() - age_days * 86400, ended_at=time.time(), duration=5,
+                              rel_path=path.name, size_bytes=size, protected=protected))
+        session.commit()
+    return call, path
+
+
+def test_size_limit_removes_oldest_unprotected_first(ctx, admin):
+    ctx.set_setting("recording_retention_days", "0")
+    oldest_protected = add_recording(ctx, 10, 400_000_000, protected=True)
+    old, old_path = add_recording(ctx, 9, 400_000_000)
+    middle, _ = add_recording(ctx, 5, 400_000_000)
+    new, _ = add_recording(ctx, 1, 400_000_000)
+    admin.patch("/api/admin/settings", json={"recording_retention_gb": 1}).raise_for_status()
+    assert ctx.apply_retention()["over_size"] == 2
+    with ctx.db() as session:
+        left = {r.id for r in session.scalars(select(Recording))}
+    assert left == {oldest_protected[0], new} and not old_path.exists()
+    assert admin.get("/api/admin/settings").json()["recordings_bytes"] == 800_000_000
+
+
+def test_protected_recordings_over_the_limit_warn(ctx, admin, monkeypatch):
+    monkeypatch.setattr(health_module, "clock_synced", lambda: True)
+    monkeypatch.setattr(health_module, "disk", lambda path: {"free": 10**12, "total": 2 * 10**12})
+    add_recording(ctx, 1, 2_000_000_000, protected=True)
+    ctx.set_setting("recording_retention_gb", "1")
+    ctx.apply_retention()
+    assert "Protected recordings alone (2.0 GB) exceed the 1 GB limit" in warnings_text(admin)
+
+
+def test_backup_needs_the_password_and_holds_the_database(ctx, admin, operator, tmp_path):
+    import io, tarfile
+    assert operator.post("/api/admin/backup", json={"password": PASSWORD}).status_code == 403
+    assert admin.post("/api/admin/backup", json={"password": "wrong-password-123"}).status_code == 403
+    reply = admin.post("/api/admin/backup", json={"password": PASSWORD})
+    assert reply.status_code == 200 and reply.headers["content-type"] == "application/gzip"
+    with tarfile.open(fileobj=io.BytesIO(reply.content)) as tar:
+        names = tar.getnames()
+        tar.extractall(tmp_path / "restore", filter="data")
+    assert sorted(names) == ["secret.key", "sentrysdr.db"]
+    copy = sqlite3.connect(tmp_path / "restore" / "sentrysdr.db")
+    assert copy.execute("SELECT count(*) FROM users WHERE email = ?", (ADMIN_EMAIL,)).fetchone()[0] == 1
+    copy.close()
+    assert (tmp_path / "restore" / "secret.key").read_bytes() == (ctx.cfg.data_dir / "secret.key").read_bytes()
+    assert list(ctx.cfg.data_dir.glob("backup-*")) == []  # the temporary copy is gone
+    with ctx.db() as session:
+        assert session.scalar(select(AuditLog).where(AuditLog.action == "admin.backup_downloaded"))
+
+
+# --- one-off schedules and what happens when a schedule ends --------------------------------
+from zoneinfo import ZoneInfo
+
+
+def test_one_off_window():
+    tz = ZoneInfo("America/New_York")
+    start = datetime(2026, 11, 22, 9, 0, tzinfo=tz).timestamp()
+    once = SimpleNamespace(id=2, source_id=1, enabled=True, schedule_days=[], schedule_start=None, schedule_end=None,
+                           once_start=start, once_end=start + 7200)
+    base = rec(1)
+    assert schedule.resolve([base, once], datetime(2026, 11, 22, 10, 30, tzinfo=tz))[1] is once
+    assert schedule.resolve([base, once], datetime(2026, 11, 22, 11, 0, tzinfo=tz))[1] is base
+    assert schedule.resolve([base, once], datetime(2026, 11, 29, 10, 0, tzinfo=tz))[1] is base  # not weekly
+    assert schedule.finished(once, datetime(2026, 11, 22, 11, 0, tzinfo=tz)) and not schedule.finished(base, datetime(2026, 11, 22, 11, 0, tzinfo=tz))
+
+
+def once_body(source, target, start="2030-11-22T09:00", end="2030-11-22T11:00", **extra):
+    return {"name": "Event", "source_id": source, "target_id": target, "repeat": "once", "once_start": start, "once_end": end, **extra}
+
+
+def test_one_off_schedule_api(ctx, admin):
+    source, target = make_source(admin), make_target(admin)
+    made = admin.post("/api/recorders", json=once_body(source, target))
+    assert made.status_code == 201, made.text
+    view = made.json()
+    expected = datetime(2030, 11, 22, 9, 0, tzinfo=ctx.cfg.tz).timestamp()
+    assert view["repeat"] == "once" and view["once_start"] == expected and view["once_end"] == expected + 7200 and view["on_end"] == "return"
+    for bad, problem in ((dict(start="2020-01-01T09:00", end="2020-01-01T10:00"), "already passed"),
+                         (dict(start="2030-11-22T11:00", end="2030-11-22T09:00"), "after the start"),
+                         (dict(start="2030-11-01T00:00", end="2030-12-15T00:00"), "at most 31 days"),
+                         (dict(start="tomorrow", end="2030-11-22T09:00"), "date and time")):
+        reply = admin.post("/api/recorders", json=once_body(source, target, **bad))
+        assert reply.status_code == 422 and problem in reply.text, (bad, reply.text)
+    weekly = {"name": "W", "source_id": source, "target_id": target, "schedule_days": [], "schedule_start": "22:00", "schedule_end": "23:00"}
+    assert admin.post("/api/recorders", json=weekly).status_code == 422
+    assert admin.post("/api/recorders", json={**weekly, "on_end": "sideways", "schedule_days": [1]}).status_code == 422
+
+
+def make_once(ctx, admin, source, target, on_end, start_offset=-60, length=3600):
+    with ctx.db() as session:
+        recorder = Recorder(name=f"Once {on_end}", source_id=source, target_id=target, schedule_days=[], on_end=on_end,
+                            once_start=time.time() + start_offset, once_end=time.time() + start_offset + length)
+        session.add(recorder)
+        session.commit()
+        return recorder.id
+
+
+def end_now(ctx, recorder_id):
+    with ctx.db() as session:
+        recorder = session.get(Recorder, recorder_id)
+        recorder.once_end = time.time() - 1
+        session.commit()
+
+
+def base_target(ctx, source):
+    with ctx.db() as session:
+        base = next((r for r in session.scalars(select(Recorder).where(Recorder.source_id == source)) if r.schedule_days is None), None)
+        return base.target_id if base else None
+
+
+def test_keep_replaces_the_base_and_return_leaves_it(ctx, admin):
+    first, second = make_source(admin), make_source(admin, "SER2", "Two")
+    usual, event = make_target(admin, "Usual"), make_target(admin, "Event", 446_000_000)
+    for source in (first, second):
+        admin.post(f"/api/sources/{source}/assign", json={"target_id": usual}).raise_for_status()
+    keep, back = make_once(ctx, admin, first, event, "keep"), make_once(ctx, admin, second, event, "return")
+    ctx.track_schedule_ends()  # both take over
+    end_now(ctx, keep); end_now(ctx, back)
+    assert ctx.track_schedule_ends() == ["Source 1: Event"]
+    assert base_target(ctx, first) == event and base_target(ctx, second) == usual
+    assert ctx.assignments()[ctx.local_node_id]["SER1"]["target_id"] == event
+
+
+def test_keep_on_an_unassigned_sdr_assigns_it(ctx, admin):
+    source, event = make_source(admin), make_target(admin, "Event")
+    keep = make_once(ctx, admin, source, event, "keep")
+    ctx.track_schedule_ends(); end_now(ctx, keep); ctx.track_schedule_ends()
+    assert base_target(ctx, source) == event
+    other = make_source(admin, "SER2", "Two")
+    back = make_once(ctx, admin, other, event, "return")
+    ctx.track_schedule_ends(); end_now(ctx, back); ctx.track_schedule_ends()
+    assert base_target(ctx, other) is None
+
+
+def test_turning_a_schedule_off_early_doesnt_keep(ctx, admin):
+    source, event = make_source(admin), make_target(admin, "Event")
+    keep = make_once(ctx, admin, source, event, "keep")
+    ctx.track_schedule_ends()
+    with ctx.db() as session:
+        session.get(Recorder, keep).enabled = False
+        session.commit()
+    assert ctx.track_schedule_ends() == [] and base_target(ctx, source) is None
+
+
+def test_keep_skips_a_locked_assignment(ctx, admin):
+    source, usual, event = make_source(admin), make_target(admin, "Usual"), make_target(admin, "Event", 446_000_000)
+    admin.post(f"/api/sources/{source}/assign", json={"target_id": usual}).raise_for_status()
+    admin.post(f"/api/sources/{source}/lock").raise_for_status()
+    keep = make_once(ctx, admin, source, event, "keep")
+    ctx.track_schedule_ends(); end_now(ctx, keep)
+    assert ctx.track_schedule_ends() == [] and base_target(ctx, source) == usual
+    with ctx.db() as session:
+        assert session.scalar(select(AuditLog).where(AuditLog.action == "schedule.keep_skipped"))
+
+
+def test_a_schedule_that_ended_while_down_still_keeps(ctx, admin):
+    source, event = make_source(admin), make_target(admin, "Event")
+    keep = make_once(ctx, admin, source, event, "keep", start_offset=-7200, length=3600)  # already over
+    with ctx.db() as session:
+        session.get(Recorder, keep).active_since = time.time() - 7000  # it was running when the service stopped
+        session.commit()
+    assert ctx.track_schedule_ends() == ["Source 1: Event"]
+    assert ctx.track_schedule_ends() == []  # only once
+
+
+# --- playing calls as they arrive ------------------------------------------------------------
+def test_recordings_for_a_player(ctx, listener):
+    now_ = time.time()
+    with ctx.db() as session:
+        for i, (target, ended) in enumerate(((1, now_ - 100), (2, now_ - 50), (1, now_ - 10), (3, now_ - 5))):
+            session.add(Recording(id=str(uuid.uuid4()), target_id=target, target_name=f"T{target}", started_at=ended - 30 if i != 2 else now_ - 400,
+                                  ended_at=ended, duration=5, rel_path="x.mp3"))
+        session.commit()
+    items = listener.get(f"/api/recordings?targets=1,2&ended_after={now_ - 60}").json()["items"]
+    # Oldest first, and a long call that started long ago but just ended is included.
+    assert [(i["target_name"], round(now_ - i["ended_at"])) for i in items] == [("T2", 50), ("T1", 10)]
+    assert listener.get("/api/recordings?targets=1;DROP").status_code == 422
+
+
+# --- keyword alerts and important calls ------------------------------------------------------
+def add_call(ctx, transcript=None, ended_ago=60, transcript_ago=None, **extra):
+    call = str(uuid.uuid4())
+    with ctx.db() as session:
+        session.add(Recording(id=call, target_name="Fire", started_at=time.time() - ended_ago - 10, ended_at=time.time() - ended_ago,
+                              duration=10, rel_path="x.mp3", transcript=transcript,
+                              transcript_at=time.time() - transcript_ago if transcript_ago is not None else None, **extra))
+        session.commit()
+    return call
+
+
+def test_keywords_are_each_users_own(ctx, admin, listener):
+    made = listener.post("/api/me/keywords", json={"word": "  Structure   FIRE ", "applies": "calls"})
+    assert made.status_code == 201 and made.json()["word"] == "structure fire"
+    assert listener.post("/api/me/keywords", json={"word": "structure fire"}).status_code == 409
+    assert listener.post("/api/me/keywords", json={"word": "x"}).status_code == 422
+    assert listener.post("/api/me/keywords", json={"word": "ok", "applies": "everything"}).status_code == 422
+    assert admin.get("/api/me/keywords").json() == []
+    assert admin.delete(f"/api/me/keywords/{made.json()['id']}").status_code == 404  # not theirs
+    assert listener.delete(f"/api/me/keywords/{made.json()['id']}").status_code == 200
+
+
+def test_important_filter_and_matches(ctx, admin, listener):
+    listener.post("/api/me/keywords", json={"word": "fire", "applies": "calls"}).raise_for_status()
+    hit = add_call(ctx, "Engine 41 responding to a FIRE alarm")
+    add_call(ctx, "The firefighter is on scene")  # not a whole-word match
+    add_call(ctx, "Nothing here")
+    marked = add_call(ctx, "Routine traffic")
+    admin.post(f"/api/recordings/{marked}/important", json={"important": True}).raise_for_status()
+    items = listener.get("/api/recordings?important=true").json()["items"]
+    assert {i["id"] for i in items} == {hit, marked}
+    by_id = {i["id"]: i for i in items}
+    assert by_id[hit]["matches"] == ["fire"] and by_id[marked]["important"] is True and by_id[marked]["important_by"] == ADMIN_EMAIL
+    # Keywords are per user: the admin has none, so only the marked call is important to them.
+    assert [i["id"] for i in admin.get("/api/recordings?important=true").json()["items"]] == [marked]
+
+
+def test_marking_important_protects_and_needs_permission(ctx, admin, operator, listener):
+    call = add_call(ctx, "x")
+    assert listener.post(f"/api/recordings/{call}/important", json={"important": True}).status_code == 403
+    reply = operator.post(f"/api/recordings/{call}/important", json={"important": True})
+    assert reply.json() == {"important": True, "protected": True}
+    reply = operator.post(f"/api/recordings/{call}/important", json={"important": False})
+    assert reply.json() == {"important": False, "protected": True}  # unmarking leaves the protection
+
+
+def test_alerts_count_new_matches_and_clear_when_seen(ctx, listener):
+    listener.post("/api/me/keywords", json={"word": "mayday"}).raise_for_status()
+    add_call(ctx, "MAYDAY mayday, engine failure")
+    add_message(ctx, text="MAYDAY RELAYED", tail="N5")
+    add_message(ctx, text="all normal", tail="N6")
+    got = listener.get("/api/alerts").json()
+    assert got["count"] == 2 and {i["kind"] for i in got["items"]} == {"call", "message"}
+    assert all(i["matches"] == ["mayday"] for i in got["items"])
+    listener.post("/api/alerts/seen").raise_for_status()
+    assert listener.get("/api/alerts").json()["count"] == 0
+    # An old call whose transcript arrives now is a new alert.
+    add_call(ctx, "mayday at last", ended_ago=3600, transcript_ago=0)
+    assert listener.get("/api/alerts").json()["count"] == 1
+
+
+def test_alerts_follow_permissions(ctx, admin, listener):
+    listener.post("/api/me/keywords", json={"word": "mayday"}).raise_for_status()
+    add_call(ctx, "mayday")
+    add_message(ctx, text="mayday")
+    user = next(u for u in admin.get("/api/admin/users").json() if u["role"] == "listener")
+    admin.patch(f"/api/admin/users/{user['id']}", json={"perm_overrides": {"maps": False}}).raise_for_status()
+    assert [i["kind"] for i in listener.get("/api/alerts").json()["items"]] == ["call"]
+
+
+def test_marking_a_message_important(ctx, operator, listener):
+    add_message(ctx, text="hello")
+    with ctx.db() as session:
+        message_id = session.scalars(select(AcarsMessage)).first().id
+    assert operator.post(f"/api/messages/{message_id}/important", json={"important": True}).json() == {"important": True}
+    assert [m["id"] for m in listener.get("/api/messages?important=true").json()["items"]] == [message_id]
+
+
+# --- map: trails, receivers and coverage -------------------------------------------------------
+def test_receiver_location_and_coverage(ctx, admin, listener):
+    source = make_source(admin)
+    assert admin.put(f"/api/sources/{source}", json={"serial": "SER1", "name": "Roof", "lat": 43.1}).status_code == 422
+    admin.put(f"/api/sources/{source}", json={"serial": "SER1", "name": "Roof", "lat": 43.0, "lon": -77.0, "alt_m": 150}).raise_for_status()
+    assert next(s for s in admin.get("/api/sources").json() if s["id"] == source)["lat"] == 43.0
+    assert "lat" not in listener.get("/api/sources").json()[0]  # admins only, outside the map
+    ctx.update_tracks("adsb", ctx.local_node_id, "SER1", {"aircraft": [
+        {"hex": "a1", "lat": 44.0, "lon": -77.0}, {"hex": "a2", "lat": 43.0, "lon": -76.0}, {"hex": "a3", "lat": 52.0, "lon": -77.0}]})
+    ctx.update_tracks("adsb", ctx.local_node_id, "SER1", {"aircraft": [{"hex": "a1", "lat": 44.1, "lon": -77.0}]})
+    got = listener.get("/api/maps/adsb").json()
+    receiver = got["receivers"][0]
+    assert receiver["name"] == "Roof" and len(receiver["coverage"]) == 0  # two directions heard: not a shape yet
+    ctx.update_tracks("adsb", ctx.local_node_id, "SER1", {"aircraft": [{"hex": "a4", "lat": 42.0, "lon": -77.0}]})
+    receiver = listener.get("/api/maps/adsb").json()["receivers"][0]
+    assert len(receiver["coverage"]) == 3  # only the directions heard
+    assert 120 < receiver["farthest_km"] < 125  # 44.1 N is about 122 km; the 1000 km decode was ignored
+    trail = next(i for i in got["items"] if i["hex"] == "a1")["trail"]
+    assert trail == [[44.0, -77.0], [44.1, -77.0]]
+    ctx.save_coverage()
+    admin.put(f"/api/sources/{source}", json={"serial": "SER1", "name": "Roof", "lat": 45.0, "lon": -77.0}).raise_for_status()
+    assert listener.get("/api/maps/adsb").json()["receivers"][0]["coverage"] == []  # moved: starts again
+
+
+def test_coverage_survives_a_restart(ctx, admin, tmp_path):
+    source = make_source(admin)
+    admin.put(f"/api/sources/{source}", json={"serial": "SER1", "name": "Roof", "lat": 43.0, "lon": -77.0}).raise_for_status()
+    ctx.update_tracks("adsb", ctx.local_node_id, "SER1", {"aircraft": [{"hex": "a1", "lat": 44.0, "lon": -77.0}]})
+    ctx.save_coverage()
+    fresh = Context(ctx.cfg)
+    assert max(fresh.coverage()[str(source)]["sectors"]) > 100
+
+
+def test_trails_forget_quiet_aircraft():
+    from sentrysdr import coverage
+    trails = coverage.Trails()
+    trails.add([{"hex": "a1", "lat": 1, "lon": 1}], now=1000)
+    trails.add([{"hex": "a1", "lat": 1, "lon": 1}], now=1001)  # same spot: not repeated
+    trails.add([{"hex": "b2", "lat": 2, "lon": 2}], now=1000 + coverage.TRAIL_SECONDS + 5)
+    assert trails.get("a1", now=1000 + coverage.TRAIL_SECONDS + 5) == [] and "a1" not in trails.points
+    assert trails.get("b2", now=1000 + coverage.TRAIL_SECONDS + 5) == [[2, 2]]

@@ -19,8 +19,7 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx
 import websockets
 
-from . import aio
-from . import pipelines
+from . import BUILD_ID, __version__, aio, health, pipelines
 from .config import Config
 from .engine import MeasureError, Supervisor
 from .sdr import enumerate_serials
@@ -30,6 +29,7 @@ log = logging.getLogger("sentrysdr.slave")
 RECONNECT_MIN = 2.0
 RECONNECT_MAX = 60.0
 STATUS_SECONDS = 5
+HEALTH_SECONDS = 60
 MAX_WS_MESSAGE = 8 * 1024 * 1024
 
 
@@ -218,7 +218,8 @@ class Slave:
             additional_headers={"Authorization": f"Bearer {key}"},
             max_size=MAX_WS_MESSAGE, ping_interval=20, ping_timeout=20,
         ) as socket:
-            await socket.send(json.dumps({"t": "hello", "name": self.cfg.node_name, "serials": self.cfg.serials}))
+            await socket.send(json.dumps({"t": "hello", "name": self.cfg.node_name, "serials": self.cfg.serials,
+                                          "version": __version__, "build": BUILD_ID}))
             log.info("connected to master")
             self.outgoing = asyncio.Queue(512)
 
@@ -231,13 +232,22 @@ class Slave:
                     await socket.send(json.dumps({"t": "status", "sources": self.status}))
                     await asyncio.sleep(STATUS_SECONDS)
 
+            async def health_loop():
+                # Clock and disk, for the master's health warnings. Broadcastify needs the clock right.
+                while True:
+                    await socket.send(json.dumps({
+                        "t": "health", "time": time.time(), "clock_synced": health.clock_synced(),
+                        "disk": health.disk(self.cfg.data_dir),
+                    }))
+                    await asyncio.sleep(HEALTH_SECONDS)
+
             async def receiver():
                 async for raw in socket:
                     if isinstance(raw, bytes):
                         continue
                     await self.handle_message(json.loads(raw))
 
-            tasks = [asyncio.create_task(c()) for c in (sender, status_loop, receiver)]
+            tasks = [asyncio.create_task(c()) for c in (sender, status_loop, health_loop, receiver)]
             try:
                 done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
                 for task in done:

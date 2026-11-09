@@ -18,14 +18,14 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import httpx
-from sqlalchemy import delete, or_, select
+from sqlalchemy import delete, func, or_, select
 
 from . import aio
-from . import acars, capabilities, pipelines, schedule, uploaders
+from . import BUILD_ID, __version__, acars, capabilities, coverage, emergencies, health, notify, pipelines, schedule, uploaders
 from .config import Config
-from .engine import MeasureError, Supervisor
+from .engine import UNPLUGGED, MeasureError, Supervisor
 from .live import LiveHub
-from .models import AcarsMessage, AuditLog, BroadcastifySystem, Node, Recorder, Recording, SdrProfile, Setting, Source, Target, UploadJob, UserSession, make_session_factory
+from .models import AcarsMessage, AuditLog, TrackEmergency, BroadcastifySystem, Node, Recorder, Recording, SdrProfile, Setting, Source, Target, UploadJob, UserSession, make_session_factory
 from .sdr import enumerate_serials
 from .security import RateLimiter, SecretBox
 
@@ -43,10 +43,20 @@ SETTING_DEFAULTS = {
     "broadcastify_server": "https://api.broadcastify.com/call-upload",
     "map_tile_url": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
     "message_retention_days": "30",
+    "recording_retention_gb": "0",
     "airframes_station_id": "",
     "airframes_feed": acars.AIRFRAMES_DEFAULT,
+    "email_alerts_enabled": "false",
+    "email_daily_cap": "50",
+    "smtp_host": "",
+    "smtp_port": "587",
+    "smtp_security": "starttls",
+    "smtp_username": "",
+    "smtp_from": "",
 }
-SECRET_SETTINGS = {"rdio_api_key", "clearcut_api_key"}
+SECRET_SETTINGS = {"rdio_api_key", "clearcut_api_key", "smtp_password"}
+EMAIL_SECONDS = 30
+EMAIL_RETRY_SECONDS = 300
 TRACK_EXPIRY_SECONDS = 60
 MAX_TRACK_ITEMS = 3000
 # Per SDR, one-minute window. Busy ACARS sites reach a few messages a minute; this is far above that.
@@ -86,6 +96,10 @@ TRANSCRIPT_WINDOW_SECONDS = 86400
 TRANSCRIPT_POLL_SECONDS = 60
 TRANSCRIPT_MAX_LOOKUPS = 20
 NODE_OFFLINE_SECONDS = 45
+NODE_OFFLINE_WARN_SECONDS = 300
+CLOCK_SKEW_WARN_SECONDS = 5
+DISK_WARN_BYTES = 2_000_000_000
+DISK_WARN_FRACTION = 0.05
 
 
 def setup_logging(cfg: Config) -> None:
@@ -117,6 +131,11 @@ class Context:
         self.limiter = RateLimiter()
         self.enumerate = enumerate_fn
         self.status: dict[tuple[int, str], dict] = {}
+        self.node_health: dict[int, dict] = {}  # each slave's latest clock and disk report
+        self.trails = coverage.Trails()
+        self._coverage: dict | None = None  # {source id: {"home": [lat, lon], "sectors": [...]}}, saved now and then
+        self._coverage_saved = 0.0
+        self._receivers: tuple[float, dict] = (0.0, {})  # (when read, {(node, serial): (source id, lat, lon)})
         self.tracks: dict[str, dict[str, dict]] = {"adsb": {}, "ais": {}}
         self.live = LiveHub(cfg, self._live_demand)
         self.node_links: dict[int, object] = {}
@@ -130,6 +149,9 @@ class Context:
         self.loop: asyncio.AbstractEventLoop | None = None
         self.wake: asyncio.Event | None = None
         self.tasks: list[asyncio.Task] = []
+        self.emergencies = emergencies.Emergencies(self.db)
+        self.email_error = ""  # the last alert email failure, until one succeeds
+        self.email_retry_at = 0.0
         self.http_transport = None  # replaced in tests so nothing reaches a real server
         self.audit_log = logging.getLogger("sentrysdr.audit")
 
@@ -216,6 +238,10 @@ class Context:
             return
         field = "aircraft" if kind == "adsb" else "vessels"
         data = {field: clean_track_items(data.get(field), strict=kind == "adsb")}
+        if kind == "adsb":
+            self.trails.add(data["aircraft"])
+            self._widen_coverage(node_id, serial, data["aircraft"])
+        self.emergencies.check(kind, node_id, serial, data[field])
         self.tracks.setdefault(kind, {})[f"{node_id}:{serial}"] = {"at": time.time(), "data": data}
 
     def ingest_acars(self, node_id: int, serial: str, data: dict) -> None:
@@ -249,6 +275,48 @@ class Context:
             task = self.loop.create_task(self.airframes.send(self.get_setting("airframes_feed"), payload))
             self.tasks.append(task)
             task.add_done_callback(lambda done: done in self.tasks and self.tasks.remove(done))
+
+    # --- receiver locations and coverage ------------------------------------
+    def receiver_locations(self) -> dict:
+        """(node id, serial) -> (source id, lat, lon) for SDRs with a location. Read at most once a minute."""
+        read_at, cached = self._receivers
+        if time.monotonic() - read_at < 60:
+            return cached
+        with self.db() as session:
+            cached = {(s.node_id, s.serial): (s.id, s.lat, s.lon) for s in session.scalars(select(Source))
+                      if s.lat is not None and s.lon is not None}
+        self._receivers = (time.monotonic(), cached)
+        return cached
+
+    def coverage(self) -> dict:
+        if self._coverage is None:
+            try:
+                saved = json.loads(self.get_setting("coverage") or "{}")
+            except ValueError:
+                saved = {}
+            self._coverage = saved if isinstance(saved, dict) else {}
+        return self._coverage
+
+    def _widen_coverage(self, node_id: int, serial: str, aircraft: list[dict]) -> None:
+        found = self.receiver_locations().get((node_id, serial))
+        if not found:
+            return
+        source_id, lat, lon = found
+        record = self.coverage().get(str(source_id))
+        if not record or record.get("home") != [lat, lon]:
+            # A new or moved receiver starts again: its old reach was from somewhere else.
+            record = self.coverage()[str(source_id)] = {"home": [lat, lon], "sectors": [0.0] * coverage.SECTORS}
+        if coverage.update_sectors(record["sectors"], (lat, lon), aircraft) and time.time() - self._coverage_saved > 600:
+            self.save_coverage()
+
+    def save_coverage(self) -> None:
+        self._coverage_saved = time.time()
+        self.set_setting("coverage", json.dumps(self.coverage()))
+
+    def forget_receiver(self, source_id: int) -> None:
+        self.coverage().pop(str(source_id), None)
+        self._receivers = (0.0, {})
+        self.save_coverage()
 
     def current_tracks(self, kind: str) -> list[dict]:
         """Merge every receiver's view. The freshest report wins for duplicates."""
@@ -439,16 +507,46 @@ class Context:
             status=lambda serial, data: self.set_status(node_id, serial, data),
             enumerate_fn=self.enumerate,
         )
-        for coroutine in (self._scheduler_loop, self._upload_loop, self._transcript_loop, self._retention_loop):
+        for coroutine in (self._scheduler_loop, self._upload_loop, self._transcript_loop, self._retention_loop, self._email_loop):
             self.tasks.append(asyncio.create_task(coroutine(), name=coroutine.__name__))
 
     async def stop(self) -> None:
+        if self._coverage:
+            self.save_coverage()
         for task in self.tasks:
             task.cancel()
         await asyncio.gather(*self.tasks, return_exceptions=True)
         await self.live.shutdown()
         if self.supervisor:
             await self.supervisor.shutdown()
+
+    async def _email_loop(self) -> None:
+        """Alert emails. A mail server that fails is left alone for a few minutes, and an admin is warned."""
+        while True:
+            await asyncio.sleep(EMAIL_SECONDS)
+            try:
+                await asyncio.to_thread(self.send_alert_emails)
+            except Exception:
+                log.exception("alert email pass failed")
+
+    def send_alert_emails(self, send=None) -> int:
+        if time.time() < self.email_retry_at:
+            return 0
+        failures: list[str] = []
+
+        def deliver(settings, message):
+            try:
+                (send or notify.deliver)(settings, message)
+            except notify.EmailError as exc:
+                failures.append(str(exc))
+                raise
+
+        sent = notify.send_due(self, deliver)
+        if failures:
+            self.email_error, self.email_retry_at = failures[-1], time.time() + EMAIL_RETRY_SECONDS
+        elif sent:
+            self.email_error = ""
+        return sent
 
     async def _scheduler_loop(self) -> None:
         while True:
@@ -463,6 +561,7 @@ class Context:
             self.wake.clear()
 
     async def apply_assignments(self) -> None:
+        await asyncio.to_thread(self.track_schedule_ends)
         desired = await asyncio.to_thread(self.assignments)
         await self.supervisor.apply(desired.get(self.local_node_id, {}))
         for node_id, link in list(self.node_links.items()):
@@ -583,6 +682,7 @@ class Context:
                     text = uploaders.transcript_text(call)
                     if text:
                         recording.transcript = text
+                        recording.transcript_at = time.time()
                         found += 1
                 session.commit()
         return found
@@ -597,7 +697,7 @@ class Context:
 
     def apply_retention(self, now: float | None = None) -> dict:
         now = now or time.time()
-        removed = {"recordings": 0, "audit": 0, "messages": 0}
+        removed = {"recordings": 0, "audit": 0, "messages": 0, "over_size": 0}
         message_days = int(self.get_setting("message_retention_days") or 0)
         recording_days = int(self.get_setting("recording_retention_days") or 0)
         audit_days = int(self.get_setting("audit_retention_days") or 0)
@@ -613,15 +713,150 @@ class Context:
                     session.delete(recording)
                     removed["recordings"] += 1
             removed["sessions"] = session.execute(delete(UserSession).where(UserSession.expires_at < now)).rowcount
+            limit_gb = float(self.get_setting("recording_retention_gb") or 0)
+            if limit_gb > 0:
+                removed["over_size"] = self._trim_to_size(session, int(limit_gb * 1e9))
             if message_days > 0:
                 result = session.execute(delete(AcarsMessage).where(AcarsMessage.received_at < now - message_days * 86400))
                 removed["messages"] = result.rowcount
+                result = session.execute(delete(TrackEmergency).where(TrackEmergency.first_seen < now - message_days * 86400))
+                removed["emergencies"] = result.rowcount
             if audit_days > 0:
                 result = session.execute(delete(AuditLog).where(AuditLog.ts < now - audit_days * 86400))
                 removed["audit"] = result.rowcount
                 self._expire_audit_files(now - audit_days * 86400)
             session.commit()
         return removed
+
+    def _trim_to_size(self, session, limit: int) -> int:
+        """Delete the oldest unprotected recordings until all of them fit in limit bytes."""
+        total = session.scalar(select(func.coalesce(func.sum(Recording.size_bytes), 0)))
+        removed = 0
+        while total > limit:
+            batch = list(session.scalars(select(Recording).where(Recording.protected.is_(False))
+                                         .order_by(Recording.started_at).limit(200)))
+            if not batch:
+                break  # only protected recordings are left
+            for recording in batch:
+                if total <= limit:
+                    break
+                path = self.recording_path(recording)
+                if path:
+                    path.unlink(missing_ok=True)
+                total -= recording.size_bytes or 0
+                session.delete(recording)
+                removed += 1
+            session.flush()
+        return removed
+
+    def recordings_size(self) -> int:
+        with self.db() as session:
+            return session.scalar(select(func.coalesce(func.sum(Recording.size_bytes), 0)))
+
+    def track_schedule_ends(self, local_now: datetime | None = None) -> list[str]:
+        """Note when schedules take over and let go. One set to keep its target becomes the base when it ends.
+
+        active_since is stored, so a schedule that ends while the service is down is still handled.
+        Returns what was kept, for tests and the audit log.
+        """
+        local_now = local_now or datetime.now(self.cfg.tz)
+        kept, events = [], []
+        with self.db() as session:
+            recorders = list(session.scalars(select(Recorder)))
+            winners = {r.id for r in schedule.resolve(recorders, local_now).values()}
+            for rec in recorders:
+                if rec.schedule_days is None:
+                    continue
+                if rec.id in winners:
+                    rec.active_since = rec.active_since or local_now.timestamp()
+                    continue
+                if rec.active_since is None:
+                    continue
+                ran_out = not schedule.window_active(rec, local_now)  # not turned off or overtaken early
+                rec.active_since = None
+                if ran_out and rec.on_end == "keep":
+                    kept.append(self._keep_schedule_target(session, rec, events))
+            session.commit()
+        for action, target, details in events:  # after the commit: audit() writes through its own connection
+            self.audit(action, target=target, details=details)
+        return [k for k in kept if k]
+
+    def _keep_schedule_target(self, session, rec: Recorder, events: list) -> str | None:
+        source, target = session.get(Source, rec.source_id), session.get(Target, rec.target_id)
+        if source is None or target is None:
+            return None
+        base = next((r for r in session.scalars(select(Recorder).where(Recorder.source_id == rec.source_id))
+                     if r.schedule_days is None), None)
+        if base is not None and base.locked:
+            events.append(("schedule.keep_skipped", rec.name, {"reason": "the assignment is locked"}))
+            return None
+        label = f"{source.name}: {target.name}"
+        if base is None:
+            session.add(Recorder(name=label, source_id=source.id, target_id=target.id,
+                                 assigned_by=f"schedule: {rec.name}"[:254], assigned_at=time.time()))
+        else:
+            base.target_id, base.name, base.assigned_by, base.assigned_at = target.id, label, f"schedule: {rec.name}"[:254], time.time()
+        events.append(("schedule.kept", rec.name, {"source": source.name, "target": target.name}))
+        return label
+
+    # --- health ------------------------------------------------------------
+    def health_warnings(self) -> list[dict]:
+        """Problems an admin or operator should know about, muted or not.
+
+        Each has a stable key (what it's about, so a mute follows it), a level, text and a page to look at.
+        quiet says why nobody is warned, when a node or source is set not to warn while it's offline.
+        """
+        warnings: list[dict] = []
+        now_ = time.time()
+
+        def add(key: str, level: str, text: str, page: str, quiet: str | None = None) -> None:
+            warnings.append({"key": key, "level": level, "text": text, "page": page, "quiet": quiet})
+
+        with self.db() as session:
+            for node in session.scalars(select(Node).where(Node.status == "active")):
+                online = self.node_online(node)
+                if not node.is_local and not online and (now_ - (node.last_seen_at or 0)) > NODE_OFFLINE_WARN_SECONDS:
+                    since = f" since {datetime.fromtimestamp(node.last_seen_at, self.cfg.tz):%Y-%m-%d %H:%M}" if node.last_seen_at else ""
+                    add(f"node.offline:{node.id}", "bad", f"{node.name} is offline{since}.", "#/admin",
+                        "Set not to warn when it's offline, under Nodes." if node.quiet_offline else None)
+                if not node.is_local and online and node.build != BUILD_ID:
+                    add(f"node.version:{node.id}", "warn", f"{node.name} runs a different version ({node.version or 'unknown'}) from this server "
+                                f"({__version__}). Upgrade it so measuring, detecting and restarts work.", "#/admin")
+                report = {"clock_synced": health.clock_synced(), "disk": health.disk(self.cfg.recordings_dir), "skew": 0} \
+                    if node.is_local else (self.node_health.get(node.id) if online else None)
+                if not report:
+                    continue
+                if report.get("clock_synced") is False:
+                    add(f"node.clock:{node.id}", "warn", f"{node.name}'s clock isn't synced. Broadcastify rejects calls with wrong times; check timedatectl.", "#/admin")
+                elif report.get("skew") is not None and abs(report["skew"]) > CLOCK_SKEW_WARN_SECONDS:
+                    add(f"node.clock:{node.id}", "warn", f"{node.name}'s clock is {abs(report['skew']):.0f} seconds off this server's.", "#/admin")
+                disk = report.get("disk")
+                if disk and (disk["free"] < DISK_WARN_BYTES or disk["free"] < disk["total"] * DISK_WARN_FRACTION):
+                    add(f"node.disk:{node.id}", "bad", f"{node.name} has {disk['free'] / 1e9:.1f} GB free of {disk['total'] / 1e9:.0f} GB."
+                               f"{' Set a size limit for recordings under Admin > Settings.' if node.is_local else ''}", "#/admin")
+            winners = schedule.resolve(list(session.scalars(select(Recorder))), datetime.now(self.cfg.tz))
+            for source in session.scalars(select(Source).order_by(Source.name)):
+                node = session.get(Node, source.node_id)
+                status = self.status.get((source.node_id, source.serial), {})
+                if source.id in winners and node and self.node_online(node) and status.get("state") == "error":
+                    error = status.get("error") or "fault"
+                    quiet = "Set not to warn while its stick is unplugged, under SDR sources." \
+                        if source.quiet_offline and error in UNPLUGGED else None
+                    add(f"source.fault:{source.id}", "bad", f"{source.name}: {error}", "#/sources", quiet)
+            failed = session.scalar(select(func.count()).select_from(UploadJob).join(Recording).where(
+                UploadJob.status == "failed", Recording.started_at > now_ - 86400))
+            if failed:
+                add("uploads.failed", "warn", f"{failed} upload{'s' if failed != 1 else ''} failed in the last day. The reason shows on each recording.",
+                    "#/recordings")
+            if self.email_error and self.get_setting("email_alerts_enabled") == "true":
+                add("email.failing", "warn", f"Alert emails aren't being sent. {self.email_error}", "#/admin?tab=email")
+            limit_gb = float(self.get_setting("recording_retention_gb") or 0)
+            if limit_gb > 0:
+                protected = session.scalar(select(func.coalesce(func.sum(Recording.size_bytes), 0)).where(Recording.protected.is_(True)))
+                if protected > limit_gb * 1e9:
+                    add("recordings.limit", "warn", f"Protected recordings alone ({protected / 1e9:.1f} GB) exceed the {limit_gb:g} GB limit, "
+                                "so nothing more can be removed to stay under it.", "#/recordings")
+        return warnings
 
     def _expire_audit_files(self, cutoff: float) -> None:
         for path in self.cfg.log_dir.glob("audit.log.*"):

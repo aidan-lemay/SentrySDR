@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sentrysdr"
-version = "0.1.0"
+version = "0.2.0"
 description = "Self-hosted SDR call recorder with a PWA, master/slave nodes and scheduled recording"
 requires-python = ">=3.11"
 dependencies = [
