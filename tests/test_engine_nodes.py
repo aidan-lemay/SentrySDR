@@ -1093,3 +1093,49 @@ def test_app_never_uses_asyncio_wait_for():
     root = Path(__file__).resolve().parent.parent / "sentrysdr"
     offenders = [str(p) for p in root.rglob("*.py") if p.name != "aio.py" and "asyncio.wait_for(" in p.read_text()]
     assert offenders == []
+
+
+# --- rtl_tcp ------------------------------------------------------------------------------
+FAKE_RTL_TCP = """#!/usr/bin/env python3
+import sys, time
+open(sys.argv[0] + ".args", "w").write(" ".join(sys.argv[1:]))
+sys.stderr.write("Found 1 device(s):\\nListening...\\n"); sys.stderr.flush(); time.sleep(0.6)
+sys.stderr.write("client accepted! 192.168.1.50 51234\\n"); sys.stderr.flush(); time.sleep(0.6)
+sys.stderr.write("all threads dead..\\nListening...\\n"); sys.stderr.flush()
+time.sleep(60)
+"""
+
+
+async def test_rtl_tcp_worker_reports_clients(tmp_path):
+    bins = tmp_path / "bin"
+    install_tool(bins, "rtl_tcp", FAKE_RTL_TCP)
+    cfg = make_config(tmp_path, bin_dirs=[bins], rtl_tcp_bind="192.168.1.20")
+    seen = []
+    sup = supervisor(cfg, [], statuses={})
+    worker = sup.workers["SER1"]
+    try:
+        await sup.apply({"SER1": spec(kind="rtltcp", modulation="rtltcp", frequency_hz=162_550_000, squelch=0, rtl_tcp_port=1240)})
+        assert await wait_for(lambda: worker.state == "listening")
+        assert worker.rtl_tcp == {"address": "192.168.1.20:1240", "client": False}
+        assert await wait_for(lambda: worker.rtl_tcp.get("client") is True, 5)
+        assert worker.snapshot()["rtl_tcp"]["client"] is True
+        assert await wait_for(lambda: worker.rtl_tcp.get("client") is False, 5)
+        args = (bins / "rtl_tcp.args").read_text()
+        assert args == "-a 192.168.1.20 -p 1240 -d 0 -f 162550000"
+    finally:
+        await sup.shutdown()
+
+
+async def test_going_idle_clears_old_feed_and_rtl_tcp_status(tmp_path):
+    bins = tmp_path / "bin"
+    install_tool(bins, "rtl_tcp", FAKE_RTL_TCP)
+    sup = supervisor(make_config(tmp_path, bin_dirs=[bins]), [])
+    worker = sup.workers["SER1"]
+    try:
+        await sup.apply({"SER1": spec(kind="rtltcp", modulation="rtltcp", frequency_hz=162_550_000, squelch=0, rtl_tcp_port=1240)})
+        assert await wait_for(lambda: worker.rtl_tcp)
+        worker.feed_status = {"aggregators": {"adsbx": False}}
+        await sup.apply({"SER1": None})
+        assert worker.state == "idle" and worker.snapshot()["rtl_tcp"] == {} and worker.snapshot()["feeds"] == {}
+    finally:
+        await sup.shutdown()

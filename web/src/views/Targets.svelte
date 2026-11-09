@@ -1,5 +1,7 @@
 <script>
   import { onMount } from 'svelte';
+  let { user } = $props();
+  const isAdmin = user.role === 'admin';
   import { ADSB_AGGREGATORS, AIS_SERVICES, api, feedLabel, formatMHz, MODULATIONS } from '../lib.js';
   import Notice from '../Notice.svelte';
   import { clearAfter } from '../notice.svelte.js';
@@ -41,7 +43,7 @@
     eu: ['Europe', [131.525, 131.725, 131.825]],
   };
   const MAX_SPAN_MHZ = 2;
-  const MODE_NAMES = { adsb: 'ADS-B', ais: 'AIS', acars: 'ACARS' };
+  const MODE_NAMES = { adsb: 'ADS-B', ais: 'AIS', acars: 'ACARS', rtltcp: 'rtl_tcp' };
   // These frequencies are the standard ones each decoder listens on.
   const FIXED = { adsb: { modulation: 'adsb', mhz: 1090 }, ais: { modulation: 'ais', mhz: 162 } };
 
@@ -106,7 +108,7 @@
     const body = {
       name: form.name, kind: form.kind,
       frequency_hz: form.kind === 'acars' ? channelsHz[0] : Math.round(Number(fixed ? fixed.mhz : form.mhz) * 1e6),
-      modulation: form.kind === 'acars' ? 'acars' : fixed ? fixed.modulation : form.modulation,
+      modulation: form.kind === 'acars' ? 'acars' : form.kind === 'rtltcp' ? 'rtltcp' : fixed ? fixed.modulation : form.modulation,
       acars_channels: channelsHz, airframes_enabled: form.kind === 'acars' && form.airframes_enabled,
       feeds: feedsBody(form.kind, form.feeds),
       squelch: Number(form.squelch), volume_db: Number(form.volume_db || 0),
@@ -167,10 +169,14 @@
           {#if target.kind === 'audio'}<td data-label="Squelch"><span class="mono">{target.squelch || 'Off'}</span></td>{:else}<td class="wide-only"></td>{/if}
           <td data-label="Sends to"><span>{[target.clearcut_enabled && 'ClearCut', target.rdio_enabled && 'RDIO', target.broadcastify_enabled && 'Broadcastify', target.airframes_enabled && 'airframes.io', ...feedSummary(target)].filter(Boolean).join(', ') || 'None'}</span></td>
           <td>
-            <div class="buttons" style="margin:0">
-              <button onclick={() => edit(target)}>Edit</button>
-              <button class="bad" onclick={() => remove(target)}>Delete</button>
-            </div>
+            {#if target.kind !== 'rtltcp' || isAdmin}
+              <div class="buttons" style="margin:0">
+                <button onclick={() => edit(target)}>Edit</button>
+                <button class="bad" onclick={() => remove(target)}>Delete</button>
+              </div>
+            {:else}
+              <span class="small dim">Administrators only</span>
+            {/if}
           </td>
         </tr>
       {:else}
@@ -190,6 +196,7 @@
         <option value="adsb">ADS-B aircraft (1090 MHz)</option>
         <option value="ais">AIS ships (162 MHz)</option>
         <option value="acars">ACARS aircraft messages</option>
+        {#if isAdmin || form.kind === 'rtltcp'}<option value="rtltcp">rtl_tcp: raw samples for GQRX or SDR++</option>{/if}
       </select>
     </label>
     {#if form.kind === 'acars'}
@@ -220,6 +227,13 @@
       {:else}
         <p class="small dim form-buttons">One stick decodes every channel here at once, so they must fit within {MAX_SPAN_MHZ} MHz{sortedChannels.length > 1 ? ` (these span ${span.toFixed(3)} MHz)` : ''}.</p>
       {/if}
+    {/if}
+    {#if form.kind === 'rtltcp'}
+      <label class="field"><span>Starting frequency (MHz)</span>
+        <input class="mono" type="number" inputmode="decimal" step="0.0001" min="0.5" max="2200" bind:value={form.mhz} required />
+        <span class="hint">The program that connects can retune it. Nothing is recorded while an SDR serves rtl_tcp.</span>
+      </label>
+      <p class="small dim form-buttons">rtl_tcp has no password: whoever can reach it controls the stick. It listens only on the address in that machine's configuration file, on the SDR's own port. Only administrators can use it.</p>
     {/if}
     {#if form.kind === 'audio'}
       <label class="field"><span>Frequency (MHz)</span><input class="mono" type="number" inputmode="decimal" step="0.0001" min="0.5" max="2200" bind:value={form.mhz} required /></label>

@@ -109,6 +109,7 @@ export function nearestStep(steps, gain) {
 }
 
 function neededUses(target) {
+  if (target.kind === 'rtltcp') return [];  // raw samples: any stick can serve them
   if (['adsb', 'ais', 'acars'].includes(target.kind)) return [target.kind];
   if (target.modulation === 'wfm') return ['voice', 'broadcast_fm'];
   if (ANALOG_MODES.includes(target.modulation)) return ['voice'];
@@ -121,7 +122,8 @@ export function stickProblems(source, target) {
   const found = [];
   const hz = target.frequency_hz;
   if ((source.cap_min_hz != null && hz < source.cap_min_hz) || (source.cap_max_hz != null && hz > source.cap_max_hz)) found.push('outside stick range');
-  if (source.uses?.length && !neededUses(target).some((use) => source.uses.includes(use))) found.push('stick not set up for this');
+  const needed = neededUses(target);
+  if (source.uses?.length && needed.length && !needed.some((use) => source.uses.includes(use))) found.push('stick not set up for this');
   if (!antennaCovers(source.antenna_ranges, hz)) found.push('outside antenna range');
   return found;
 }

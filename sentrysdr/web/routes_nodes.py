@@ -5,6 +5,7 @@ Agent routes authenticate with a per-node bearer key, never a browser cookie.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
 import math
@@ -243,6 +244,20 @@ def _epoch(value) -> float | None:
     return value if math.isfinite(value) and 0 < value < 32503680000 else None
 
 
+def clean_rtl_tcp_status(raw) -> dict:
+    """The address a slave's rtl_tcp listens on, and whether a client is connected."""
+    if not isinstance(raw, dict):
+        return {}
+    address = str(raw.get("address") or "")
+    host, _, port = address.rpartition(":")
+    try:
+        ipaddress.ip_address(host)
+        valid = port.isdigit() and 0 < int(port) < 65536
+    except ValueError:
+        valid = False
+    return {"address": address, "client": bool(raw.get("client"))} if valid else {}
+
+
 def clean_feed_status(raw) -> dict:
     """A slave's report of its feeds, keeping only what the page shows."""
     if not isinstance(raw, dict):
@@ -267,6 +282,7 @@ def handle_agent_message(ctx: Context, node_id: int, allowed: list[str], message
                     "in_call": bool(status.get("in_call")), "call_started": _epoch(status.get("call_started")),
                     "last_call_at": _epoch(status.get("last_call_at")),
                     "note": str(status.get("note") or "")[:300], "feeds": clean_feed_status(status.get("feeds")),
+                    "rtl_tcp": clean_rtl_tcp_status(status.get("rtl_tcp")),
                 })
     elif kind == "measure_result":
         ctx.finish_measure(node_id, message)

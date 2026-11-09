@@ -18,7 +18,8 @@ ANALOG = {"nfm", "am", "wfm"}
 DIGITAL = {"p25p1": "-f1", "p25p2": "-f2", "dmr": "-fs", "nxdn48": "-fi", "nxdn96": "-fn", "dstar": "-fd", "ysf": "-fy"}
 # DSD-FME writes one channel per time slot for these modes, and mono for the rest.
 TWO_SLOT = {"p25p2", "dmr"}
-MODULATIONS = ANALOG | set(DIGITAL) | {"adsb", "ais", "acars"}
+MODULATIONS = ANALOG | set(DIGITAL) | {"adsb", "ais", "acars", "rtltcp"}
+RTL_TCP_MIN_PORT = 1024
 # ACARS: one stick decodes several channels, so they must fit in what it can sample.
 ACARS_MIN_HZ = 118_000_000
 ACARS_MAX_HZ = 137_000_000
@@ -60,13 +61,19 @@ def sanitize_spec(spec: dict) -> dict:
             "channels": [int(hz) for hz in spec.get("channels") or []],
             "feeds": spec.get("feeds") or {},
             "feeder_uuid": feeds.valid_uuid(spec.get("feeder_uuid")),
+            "rtl_tcp_port": int(spec["rtl_tcp_port"]) if spec.get("rtl_tcp_port") is not None else None,
         }
     except (KeyError, TypeError, ValueError) as exc:
         raise SpecError(f"bad assignment: {exc}") from exc
     if not VOLUME_MIN_DB <= clean["volume_db"] <= VOLUME_MAX_DB:
         raise SpecError("volume out of range")
-    if clean["kind"] not in ("audio", "adsb", "ais", "acars"):
+    if clean["kind"] not in ("audio", "adsb", "ais", "acars", "rtltcp"):
         raise SpecError("bad kind")
+    if clean["kind"] == "rtltcp":
+        if clean["rtl_tcp_port"] is None or not RTL_TCP_MIN_PORT <= clean["rtl_tcp_port"] <= 65535:
+            raise SpecError("rtl_tcp needs a port from 1024 to 65535")
+    else:
+        clean["rtl_tcp_port"] = None
     if clean["kind"] == "acars":
         problem = acars_channel_problem(clean["channels"])
         if problem:
@@ -217,6 +224,17 @@ def acars_args(cfg: Config, index: int, spec: dict) -> list[str]:
     if spec.get("ppm"):
         args += ["-p", str(spec["ppm"])]
     return args + [f"{hz / 1e6:.3f}" for hz in sorted(spec["channels"])]
+
+
+def rtltcp_args(cfg: Config, index: int, spec: dict) -> list[str]:
+    """rtl_tcp on this machine's configured address. That comes from the local config, never from the master."""
+    args = [cfg.binary("rtl_tcp") or "rtl_tcp", "-a", cfg.rtl_tcp_bind, "-p", str(spec["rtl_tcp_port"]),
+            "-d", str(index), "-f", str(spec["frequency_hz"])]
+    if spec.get("gain_db"):  # rtl_tcp treats 0 as automatic, which is also what no -g means
+        args += ["-g", f"{spec['gain_db']:g}"]
+    if spec.get("ppm"):
+        args += ["-P", str(spec["ppm"])]
+    return args
 
 
 def readsb_args(cfg: Config, index: int, spec: dict, json_dir: str) -> list[str]:

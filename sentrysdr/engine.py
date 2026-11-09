@@ -69,7 +69,8 @@ async def stop_process(proc: asyncio.subprocess.Process | None, timeout: float =
         await proc.wait()
 
 
-async def _log_stderr(serial: str, stream, tail: list[str], on_reset: Callable[[], None] | None = None) -> None:
+async def _log_stderr(serial: str, stream, tail: list[str], on_reset: Callable[[], None] | None = None,
+                      on_line: Callable[[str], None] | None = None) -> None:
     # Reads chunks, not lines: readline fails on a very long line, and if this stops
     # draining the pipe fills and the tool hangs.
     pending = b""
@@ -86,6 +87,8 @@ async def _log_stderr(serial: str, stream, tail: list[str], on_reset: Callable[[
                 exiting = exiting or any(marker in text for marker in EXIT_MARKERS)
                 if on_reset and not exiting and any(marker in text for marker in USB_FAULT_MARKERS):
                     on_reset()
+                if on_line:
+                    on_line(text)
 
 
 class PcmFramer:
@@ -223,6 +226,7 @@ class Worker:
         self.last_call_at: float | None = None
         self.note = ""  # an informational warning that outlives the error field
         self.feed_status: dict = {}
+        self.rtl_tcp: dict = {}  # address and whether a client is connected, while serving rtl_tcp
         self._saving: set[asyncio.Task] = set()  # finished calls being encoded and stored
         self.note_at: float | None = None
         self._reset_seen = asyncio.Event()
@@ -237,6 +241,7 @@ class Worker:
             "last_call_at": self.last_call_at,
             "note": self.note,
             "feeds": self.feed_status,
+            "rtl_tcp": self.rtl_tcp,
             "note_at": self.note_at,
             "recorder_id": self.spec["recorder_id"] if self.spec else None,
             "target_id": self.spec["target_id"] if self.spec else None,
@@ -266,6 +271,7 @@ class Worker:
         await self.stop()
         self.spec = spec
         if spec is None:
+            self.feed_status, self.rtl_tcp = {}, {}  # nothing is running, so nothing is feeding or listening
             self._publish("idle", "")
         else:
             self.task = asyncio.create_task(self._run(spec), name=f"sdr-{self.serial}")
@@ -413,9 +419,11 @@ class Worker:
 
     async def _run(self, spec: dict) -> None:
         delay = RESTART_MIN
-        pipeline = {"adsb": self._run_adsb, "ais": self._run_ais, "acars": self._run_acars}.get(spec["kind"], self._run_audio)
+        pipeline = {"adsb": self._run_adsb, "ais": self._run_ais, "acars": self._run_acars,
+                    "rtltcp": self._run_rtltcp}.get(spec["kind"], self._run_audio)
         self._set_note("")  # a new assignment starts with a clean slate
         self.feed_status = {}
+        self.rtl_tcp = {}
         while True:
             started = time.monotonic()
             error = ""
@@ -580,6 +588,37 @@ class Worker:
             await stop_process(proc)
             reader.cancel()
             shutil.rmtree(json_dir, ignore_errors=True)
+
+    async def _run_rtltcp(self, index: int, spec: dict) -> str:
+        """Hand the stick to rtl_tcp, so a program such as GQRX can use it over the network."""
+        tail: list[str] = []
+        proc = await asyncio.create_subprocess_exec(
+            *pipelines.rtltcp_args(self.cfg, index, spec),
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE, env=self.cfg.tool_env(),
+        )
+        self.rtl_tcp = {"address": f"{self.cfg.rtl_tcp_bind}:{spec['rtl_tcp_port']}", "client": False}
+        reader = asyncio.create_task(_log_stderr(self.serial, proc.stderr, tail, self._on_reset, self._rtltcp_line))
+        self._publish("listening", "")
+        try:
+            await proc.wait()
+            detail = tail[-1] if tail else ""
+            return f"rtl_tcp exited ({proc.returncode}) {detail}".strip()
+        finally:
+            await stop_process(proc)
+            reader.cancel()
+
+    def _rtltcp_line(self, text: str) -> None:
+        # rtl_tcp prints these as a client connects and leaves (rtl_tcp.c). It serves one client at a time.
+        if "client accepted" in text:
+            connected = True
+        elif "all threads dead" in text or text.lower().startswith("listening"):
+            connected = False
+        else:
+            return
+        if self.rtl_tcp.get("client") != connected:
+            self.rtl_tcp = {**self.rtl_tcp, "client": connected}
+            self.last_call_at = time.time() if connected else self.last_call_at
+            self._publish()
 
     async def _run_acars(self, index: int, spec: dict) -> str:
         tail: list[str] = []

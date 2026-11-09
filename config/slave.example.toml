@@ -34,3 +34,12 @@ max_call_seconds = 1800
 
 [binaries]
 search_dirs = ["/opt/sentrysdr/.vendor/bin"]
+
+[rtl_tcp]
+# Where rtl_tcp listens when an SDR on this machine is put on an rtl_tcp target.
+# rtl_tcp has no password: anyone who can reach this address controls the stick.
+# Loopback (the default) needs an SSH tunnel. For GQRX on your network, use this
+# machine's LAN or Tailscale address. Each SDR has its own port, set in the web UI.
+bind = "127.0.0.1"
+# Every interface (0.0.0.0) or a public address is refused unless you set this.
+# allow_public = true

@@ -289,6 +289,7 @@ class Context:
                         "channels": target.acars_channels or [] if target.kind == "acars" else [],
                         "feeds": target.feeds or {} if target.kind in ("adsb", "ais") else {},
                         "feeder_uuid": source.feeder_uuid,
+                        "rtl_tcp_port": source.rtl_tcp_port if target.kind == "rtltcp" else None,
                     })
                 except pipelines.SpecError as exc:
                     log.error("recorder %s has an invalid configuration: %s", recorder.id, exc)

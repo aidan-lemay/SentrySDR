@@ -134,6 +134,7 @@ Anyone can request an account at the sign-in page, unless **Let people request a
 | Add and edit targets | | Yes | Yes |
 | Protect recordings, request ClearCut transcripts | | Yes | Yes |
 | Lock assignments, delete recordings, manage SDRs, antennas, nodes, users and settings | | | Yes |
+| Create, assign and schedule rtl_tcp targets | | | Yes |
 
 Each permission except the admin-only ones can be allowed or denied per user, under **Admin > Users > Manage**. A protected recording is never deleted automatically, and has to be unprotected before an admin can delete it. **Admin > Audit log** records sign-ins, changes and refusals, with the user and address.
 
@@ -163,6 +164,7 @@ Upload API keys are never shown again once saved. Leave a key's box blank to kee
 - **Slaves:** each enrols with a one-time token that expires in 24 hours, then uses its own key, stored only as a hash on the master and revocable from **Admin > Nodes**. A slave can only report on its own SDRs. What it sends is checked: call details and times, and limits on aircraft and ship lists (3,000 each) and ACARS messages (600 a minute per SDR), so a compromised slave can't fill the master's memory or database. Recordings are limited to 256 MB and must be MP3.
 - **Outbound connections:** only the uploads and feeds you turn on. Aggregator addresses are fixed in the code, so a master can switch a slave's feeds on or off but can't point them anywhere else. The airframes.io feed sends only acarsdec's own message fields and your station ID.
 - **Local data port:** the optional port for fr24feed and piaware is bound to 127.0.0.1 on the node with the SDR. readsb opens no other ports.
+- **rtl_tcp:** has no password, so its address is set only in each machine's own configuration file, defaulting to loopback, and every interface or a public address needs `allow_public`. Only administrators can put an SDR on it. A slave never takes the address from the master.
 - **SDRs:** only serials in `sdr.serials` are ever opened. Other dongles stay free for other software. Duplicate serials are refused; fix them with `rtl_eeprom -s`.
 - **Service:** runs as the unprivileged `sentrysdr` user under a strict systemd sandbox: no capabilities, the system read-only, only its data and log folders writable, and USB as the only device. The application folder is owned by root, so the service can't change its own code. The configuration file is readable only by root and the service, and the database and keys only by the service. If you move `recordings_dir` or `log_dir`, see [Storing recordings on another drive](#storing-recordings-on-another-drive).
 - **Dependencies:** Python packages are installed at the exact versions in `requirements.lock`, and the web interface's from `web/package-lock.json`, so an install never picks up an untested release. The decoders are built from their projects' current source.
@@ -176,6 +178,7 @@ Upload API keys are never shown again once saved. Leave a key's box blank to kee
 | `readsb`, tar1090 | Run on a real RTL-SDR with real aircraft |
 | `AIS-catcher` | Run on a real RTL-SDR, and its output checked with a known message; no live ship received yet |
 | `acarsdec` | Not yet run on a real stick: tested against a stand-in that follows acarsdec's documented options and JSON output |
+| `rtl_tcp` | Not yet run on a real stick: tested against a stand-in that follows rtl_tcp's options and messages |
 | `dsd-fme` | DMR tested on air: a real simplex transmission recorded and played back clearly, with correct speed and call splitting, and live audio in step. P25, NXDN, D-STAR and YSF use the same pipeline but haven't been tested on air |
 
 Squelch, calls and noise measurement have been tested on air with NFM on three tuners: R820T (NESDR Mini), R828D and FC0012. Noise readings and squelch numbers differ between them, so measure each stick.
@@ -254,6 +257,23 @@ Sharing runs wherever the target runs, on the master or a slave, and stops when 
 - **aiscatcher.org:** tick **Share with the aiscatcher.org community feed**. It's sent without a station key, so it isn't linked to an aiscatcher.org account.
 - **MarineTraffic, AISHub and VesselFinder:** register a station with the service first. Each gives you a UDP host and port. Tick **Send to** for that service and enter both. Up to six destinations per target.
 - UDP can't confirm delivery, so the Sources page only lists where data is being sent. Check the service's station page to confirm it's arriving.
+
+## rtl_tcp: using an SDR from GQRX or SDR++
+
+An **rtl_tcp** target hands an SDR to `rtl_tcp`, so a program such as GQRX or SDR++ can use it over the network. Nothing is recorded while it does. Each SDR has its own port, so several can serve rtl_tcp at once, on the master and on any slave.
+
+> **rtl_tcp has no password or encryption.** Anyone who can reach its port can take over the stick and pull its raw samples. Only expose it on networks you trust.
+
+1. **Choose the address,** on each machine that will serve rtl_tcp: in its `/etc/sentrysdr/sentrysdr.toml`, under `[rtl_tcp]`, set `bind` to that machine's LAN or Tailscale address, then restart the service. The default, `127.0.0.1`, only accepts connections from the machine itself, for example through an SSH tunnel. Listening on every interface (`0.0.0.0`) or a public address is refused unless you also set `allow_public = true`. This is in the configuration file, not the web interface, so not even an administrator account can open a stick to the internet.
+2. **Check the port** under **Admin > SDR sources**. Each SDR gets one automatically, 1234 and up, unique per machine. If the machine has a firewall, allow that port from your network (see [nftables.example.conf](deploy/nftables.example.conf)).
+3. **Make a target** on the Targets page with the type **rtl_tcp**, and a starting frequency.
+4. **Assign it** to the SDR on the Sources page, or schedule it. The SDR's status then shows the address to use, such as `192.168.1.20:1234`, and whether a program is connected.
+5. **In GQRX**, choose the device *Other*, with the string `rtl_tcp=192.168.1.20:1234`. In SDR++, choose the RTL-TCP source and enter the address and port.
+
+- Only administrators can create, assign or schedule rtl_tcp targets. Operators see them, and can still move an SDR onto another target, which closes the port.
+- rtl_tcp serves one program at a time. The program sets the frequency, gain and sample rate itself.
+- The stream is about 2 to 5 MB/s, depending on the sample rate. That's fine on a local network, but slow or costly over a mobile or metered link.
+- A slave's rtl_tcp is reached directly at the slave, not through the master, so the device running GQRX needs a route to the slave, such as being on the same network or Tailscale.
 
 ## Tuning call detection
 
@@ -345,8 +365,9 @@ Keep `/etc/sentrysdr/sentrysdr.toml` too. A slave only holds calls waiting to up
 | What | Port | Who needs to reach it |
 |---|---|---|
 | Master web interface | 8642, on 127.0.0.1 by default | Only the tunnel or proxy on the same machine. With `local_access`, devices on your own network |
-| Slave | None | Nothing: slaves only connect out to the master |
+| Slave | None, unless it serves rtl_tcp | Nothing: slaves only connect out to the master |
 | Local data port for fr24feed or piaware | The port you choose, on 127.0.0.1 only | Only programs on the same machine |
+| rtl_tcp, while an SDR is on an rtl_tcp target | That SDR's port (1234 and up), on `rtl_tcp.bind` | The devices running GQRX or SDR++. Loopback by default |
 
 Outbound, the master connects to the upload and feed services you turn on; slaves connect to the master and, if you turn them on, the ADS-B and AIS services. [nftables.example.conf](deploy/nftables.example.conf) is a default-deny firewall for the master.
 

@@ -28,6 +28,9 @@
   const can = (permission) => user.permissions.includes(permission);
   const isAdmin = user.role === 'admin';
   const canAssign = isAdmin || user.permissions.includes('assign');
+  const MODE_LABELS = { adsb: 'ADS-B', rtltcp: 'rtl_tcp' };
+  // Only administrators can put an SDR on rtl_tcp. The current one stays listed so the picker shows it.
+  const assignable = (source) => targets.filter((t) => t.kind !== 'rtltcp' || isAdmin || t.id === source.base_target_id);
   // Only voice targets make calls. An idle SDR still offers the calls it made before.
   const records = (source) => !source.active_target || source.active_target.kind === 'audio';
 
@@ -197,7 +200,7 @@
               <div>
                 {#if source.active_target}
                   <span class="mono nowrap">{formatMHz(source.active_target.frequency_hz)}</span><br />
-                  {source.active_target.name} ({source.active_target.modulation.toUpperCase()})
+                  {source.active_target.name} ({MODE_LABELS[source.active_target.modulation] ?? source.active_target.modulation.toUpperCase()})
                   {#if source.active_target.kind === 'audio'}
                     <br /><span class="small">Squelch {source.active_target.squelch || 'off'}, gain {gainLabel(source.active_target.gain_db)}{source.active_target.from_profile ? ', saved profile' : ''}</span>
                   {/if}
@@ -218,6 +221,9 @@
                   <br /><span class="small">Feeding: {#each Object.entries(source.feeds.aggregators) as [key, up], i (key)}{i ? ', ' : ''}<span class={up ? 'st-ok' : 'st-warn'}>{feedLabel(key)} {up ? 'connected' : 'not connected'}</span>{/each}</span>
                 {/if}
                 {#if canAssign && source.feeds?.local_clients != null}<br /><span class="small">Local port: {source.feeds.local_clients} program{source.feeds.local_clients === 1 ? '' : 's'} reading</span>{/if}
+                {#if canAssign && source.rtl_tcp?.address}
+                  <br /><span class="small">rtl_tcp on <span class="mono">{source.rtl_tcp.address}</span>, <span class={source.rtl_tcp.client ? 'st-ok' : ''}>{source.rtl_tcp.client ? 'a program is connected' : 'waiting for a program to connect'}</span></span>
+                {/if}
                 {#if canAssign && source.feeds?.sending?.length}<br /><span class="small">Sending to {source.feeds.sending.map(feedLabel).join(', ')}</span>{/if}
               </div>
             </td>
@@ -263,7 +269,7 @@
                   <label class="field wide"><span>Target</span>
                     <select bind:value={draft.target} onchange={() => (draft.editing = true)}>
                       <option value="">None</option>
-                      {#each targets as target (target.id)}
+                      {#each assignable(source) as target (target.id)}
                         <option value={target.id}>{target.name} ({formatMHz(target.frequency_hz)}){problemNote(source, target)}</option>
                       {/each}
                     </select>

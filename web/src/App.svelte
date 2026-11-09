@@ -93,7 +93,7 @@
     {:else if view === 'recordings'}
       <Recordings {user} {route} />
     {:else if view === 'targets'}
-      <Targets />
+      <Targets {user} />
     {:else if view === 'maps'}
       <Maps {user} />
     {:else if view === 'messages'}

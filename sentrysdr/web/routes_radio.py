@@ -17,7 +17,7 @@ from .. import aio, capabilities, feeds, pipelines, schedule
 from ..config import SERIAL_RE
 from ..context import Context
 from ..engine import MeasureError
-from ..models import ANTENNA_UNITS, Antenna, BroadcastifySystem, Node, Recorder, SdrProfile, Source, Target, User, now
+from ..models import ANTENNA_UNITS, Antenna, BroadcastifySystem, Node, Recorder, SdrProfile, Source, Target, User, free_rtl_tcp_port, now
 from .deps import admin_user, ctx_of, current_user, effective_permissions, get_db, ip_of, require
 from .routes_messages import annotate_aircraft
 
@@ -135,6 +135,7 @@ class SourceBody(BaseModel):
     cap_min_hz: int | None = Field(default=None, ge=0, le=10_000_000_000)
     cap_max_hz: int | None = Field(default=None, ge=0, le=10_000_000_000)
     uses: list[str] = Field(default_factory=list, max_length=len(capabilities.USES) + len(capabilities.RETIRED_USES))
+    rtl_tcp_port: int | None = Field(default=None, ge=pipelines.RTL_TCP_MIN_PORT, le=65535)  # None keeps or picks one
 
     @field_validator("gain_steps")
     @classmethod
@@ -180,7 +181,7 @@ def _source_view(ctx: Context, db, source: Source, winners: dict, recorders: lis
         "cap_min_hz": source.cap_min_hz, "cap_max_hz": source.cap_max_hz, "uses": source.uses or [],
         "state": status.get("state", "offline" if not online else "idle"),
         "error": status.get("error", ""), "in_call": status.get("in_call", False),
-        "note": status.get("note", ""), "feeds": status.get("feeds") or {},
+        "note": status.get("note", ""), "feeds": status.get("feeds") or {}, "rtl_tcp": status.get("rtl_tcp") or {},
         "call_started": status.get("call_started"), "last_call_at": status.get("last_call_at"),
         "locked": bool(base and base.locked),
         "base_recorder_id": base.id if base else None,
@@ -224,6 +225,7 @@ def list_sources(request: Request, user: User = Depends(current_user), db=Depend
         # Admins only: with the ID, someone else could feed aggregators as this receiver.
         if user.role == "admin":
             view["feeder_uuid"] = source.feeder_uuid
+            view["rtl_tcp_port"] = source.rtl_tcp_port
         if "assign" not in effective_permissions(user):
             view["assigned_by"] = ""  # other people's email addresses
         views.append(view)
@@ -260,6 +262,18 @@ def _validate_source(ctx: Context, db, body: SourceBody) -> Node:
     return node
 
 
+def _rtl_tcp_port(db, node: Node, wanted: int | None, source: Source | None) -> int:
+    """Each SDR on a machine needs its own rtl_tcp port, or two couldn't serve at once."""
+    taken = {port: name for port, name in db.execute(
+        select(Source.rtl_tcp_port, Source.name).where(Source.node_id == node.id, Source.id != (source.id if source else 0))
+    ).all() if port}
+    if wanted is None:
+        return source.rtl_tcp_port if source and source.rtl_tcp_port else free_rtl_tcp_port(set(taken))
+    if wanted in taken:
+        raise HTTPException(409, f"rtl_tcp port {wanted} is already used by {taken[wanted]} on {node.name}")
+    return wanted
+
+
 def _refuse_off_step(steps: list[float] | None, gain: float | None, unchanged: float | None = None) -> None:
     """Once a stick's steps are known, only those can be chosen. A gain saved before then may stay."""
     if gain is None or (unchanged is not None and abs(gain - unchanged) < 1e-9):
@@ -285,6 +299,7 @@ def create_source(body: SourceBody, request: Request, admin: User = Depends(admi
         raise HTTPException(409, "That SDR is already defined")
     values = body.model_dump()
     values["node_id"] = node.id
+    values["rtl_tcp_port"] = _rtl_tcp_port(db, node, body.rtl_tcp_port, None)
     source = Source(**values, feeder_uuid=str(uuid.uuid4()))
     db.add(source)
     db.commit()
@@ -303,6 +318,7 @@ def update_source(source_id: int, body: SourceBody, request: Request, admin: Use
     _refuse_off_step(body.gain_steps, body.gain_db, source.gain_db)
     values = body.model_dump()
     values["node_id"] = node.id
+    values["rtl_tcp_port"] = _rtl_tcp_port(db, node, body.rtl_tcp_port, source)
     for key, value in values.items():
         setattr(source, key, value)
     db.commit()
@@ -348,7 +364,8 @@ class TargetBody(BaseModel):
 
 
 def _validate_target(body: TargetBody, db, target_id: int | None = None) -> None:
-    allowed = {"audio": pipelines.ANALOG | set(pipelines.DIGITAL), "adsb": {"adsb"}, "ais": {"ais"}, "acars": {"acars"}}
+    allowed = {"audio": pipelines.ANALOG | set(pipelines.DIGITAL), "adsb": {"adsb"}, "ais": {"ais"}, "acars": {"acars"},
+               "rtltcp": {"rtltcp"}}
     if body.modulation not in allowed.get(body.kind, set()):
         raise HTTPException(422, f"Modulation {body.modulation} doesn't fit a {body.kind} target")
     if body.kind == "acars":
@@ -424,6 +441,7 @@ def list_targets(user: User = Depends(current_user), db=Depends(get_db)):
 @router.post("/targets", status_code=201)
 def create_target(body: TargetBody, request: Request, user: User = Depends(require("manage_targets")), db=Depends(get_db)):
     ctx = ctx_of(request)
+    _refuse_rtl_tcp(user, body)
     _validate_target(body, db)
     warning = _same_channel_warning(db, body)
     target = Target(**body.model_dump())
@@ -431,6 +449,15 @@ def create_target(body: TargetBody, request: Request, user: User = Depends(requi
     db.commit()
     ctx.audit("target.created", user=user, ip=ip_of(request), target=target.name)
     return {**_target_view(target), "warning": warning}
+
+
+RTL_TCP_ADMIN_ONLY = "Only an administrator can use rtl_tcp: whoever connects to it controls the stick."
+
+
+def _refuse_rtl_tcp(user: User, *targets: Target | TargetBody | None) -> None:
+    """rtl_tcp hands raw control of a stick to whoever connects, so only admins can create, assign or schedule it."""
+    if user.role != "admin" and any(t is not None and t.kind == "rtltcp" for t in targets):
+        raise HTTPException(403, RTL_TCP_ADMIN_ONLY)
 
 
 def _active_uses_locked(db, target_id: int) -> bool:
@@ -446,6 +473,7 @@ def update_target(target_id: int, body: TargetBody, request: Request, user: User
     # Otherwise a locked recorder could be retuned by editing its target.
     if user.role != "admin" and _active_uses_locked(db, target_id):
         raise HTTPException(403, "A locked recorder uses this target. Ask an administrator.")
+    _refuse_rtl_tcp(user, body, target)
     _validate_target(body, db, target_id)
     warning = _same_channel_warning(db, body, target_id)
     # A measurement only describes the frequency and mode it was taken on.
@@ -470,6 +498,7 @@ def delete_target(target_id: int, request: Request, user: User = Depends(require
         raise HTTPException(404, "Target not found")
     if user.role != "admin" and _active_uses_locked(db, target_id):
         raise HTTPException(403, "A locked recorder uses this target. Ask an administrator.")
+    _refuse_rtl_tcp(user, target)
     name = target.name
     db.delete(target)
     db.commit()
@@ -540,7 +569,7 @@ class AssignBody(BaseModel):
 
 @router.post("/sources/{source_id}/assign")
 def assign(source_id: int, body: AssignBody, request: Request, user: User = Depends(require("assign")), db=Depends(get_db)):
-    """Set or clear a source's base target. A lock blocks this without its password."""
+    """Set or clear a source's base target. Only an administrator can change a locked one."""
     ctx = ctx_of(request)
     source = db.get(Source, source_id)
     if source is None:
@@ -556,6 +585,7 @@ def assign(source_id: int, body: AssignBody, request: Request, user: User = Depe
         target = db.get(Target, body.target_id)
         if target is None:
             raise HTTPException(404, "Target not found")
+        _refuse_rtl_tcp(user, target)
         warning = _warnings(db, source, target)
         target_name = target.name
         if base is None:
@@ -754,6 +784,7 @@ def _save_recorder(ctx, request, user, db, body: RecorderBody, recorder: Recorde
     source, target = db.get(Source, body.source_id), db.get(Target, body.target_id)
     if source is None or target is None:
         raise HTTPException(404, "Source or target not found")
+    _refuse_rtl_tcp(user, target, db.get(Target, recorder.target_id) if recorder else None)
     # A schedule overrides the base assignment, so it must honour that lock too.
     _check_lock(ctx, request, user, _base_for(db, body.source_id))
     if recorder is None:
@@ -796,6 +827,7 @@ def delete_recorder(recorder_id: int, request: Request,
     ctx = ctx_of(request)
     recorder = _scheduled_recorder(db, recorder_id)
     _check_lock(ctx, request, user, _base_for(db, recorder.source_id))
+    _refuse_rtl_tcp(user, db.get(Target, recorder.target_id))
     name = recorder.name
     db.delete(recorder)
     db.commit()
