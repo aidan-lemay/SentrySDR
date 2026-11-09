@@ -10,6 +10,7 @@
   import Maps from './views/Maps.svelte';
   import Messages from './views/Messages.svelte';
   import Scanner from './views/Scanner.svelte';
+  import Alerts from './views/Alerts.svelte';
   import Account from './views/Account.svelte';
   import Admin from './views/Admin.svelte';
 
@@ -28,11 +29,23 @@
     { id: 'targets', label: 'Targets', show: can('manage_targets') },
     { id: 'maps', label: 'Maps', show: can('maps') },
     { id: 'messages', label: 'Messages', show: can('maps') },
+    { id: 'alerts', label: 'Alerts', show: can('listen_recordings') || can('maps'), count: alertCount },
     { id: 'admin', label: 'Admin', show: user?.role === 'admin' },
     { id: 'account', label: 'My account' },
   ].filter((link) => link.show !== false));
   // Only pages in this user's menu open, even if typed into the address bar. Anything else shows Sources.
   const view = $derived(links.some((link) => link.id === requested) ? requested : 'sources');
+
+  // New keyword matches since this user last looked, for the menu.
+  let alertCount = $state(0);
+  async function refreshAlerts() {
+    if (!user || user.must_change_password || document.hidden) return;
+    try {
+      alertCount = (await api('alerts')).count;
+    } catch {
+      // The next check will try again.
+    }
+  }
 
   async function refreshUser() {
     try {
@@ -56,8 +69,12 @@
       scrollTo(0, 0);
     };
     addEventListener('hashchange', onHash);
-    refreshUser().finally(() => { loading = false; });
-    return () => removeEventListener('hashchange', onHash);
+    refreshUser().finally(() => { loading = false; refreshAlerts(); });
+    const alertTimer = setInterval(refreshAlerts, 30000);
+    return () => {
+      removeEventListener('hashchange', onHash);
+      clearInterval(alertTimer);
+    };
   });
 </script>
 
@@ -70,7 +87,7 @@
     <div class="site-top">
       <span class="site-name">SentrySDR</span>
       {#if !user.must_change_password}
-        <button class="menu-button" aria-expanded={menuOpen} onclick={() => (menuOpen = !menuOpen)}>{menuOpen ? 'Close' : 'Menu'}</button>
+        <button class="menu-button" aria-expanded={menuOpen} onclick={() => (menuOpen = !menuOpen)}>{menuOpen ? 'Close' : 'Menu'}{#if alertCount && !menuOpen}<span class="nav-count" aria-label={`${alertCount} new alerts`}>{alertCount > 99 ? '99+' : alertCount}</span>{/if}</button>
       {:else}
         <button onclick={signOut}>Sign out</button>
       {/if}
@@ -78,7 +95,7 @@
     {#if !user.must_change_password}
       <nav class:open={menuOpen} aria-label="Main">
         {#each links as link (link.id)}
-          <a href={`#/${link.id}`} aria-current={view === link.id ? 'page' : undefined}>{link.label}</a>
+          <a href={`#/${link.id}`} aria-current={view === link.id ? 'page' : undefined}>{link.label}{#if link.count}<span class="nav-count" aria-label={`${link.count} new`}>{link.count > 99 ? '99+' : link.count}</span>{/if}</a>
         {/each}
         <button class="nav-out" onclick={signOut}>Sign out ({user.name})</button>
       </nav>
@@ -100,10 +117,12 @@
       <Targets {user} />
     {:else if view === 'maps'}
       <Maps {user} />
+    {:else if view === 'alerts'}
+      <Alerts onSeen={refreshAlerts} />
     {:else if view === 'scanner'}
       <Scanner />
     {:else if view === 'messages'}
-      <Messages {route} />
+      <Messages {route} {user} />
     {:else if view === 'account'}
       <Account {user} onChange={refreshUser} />
     {:else if view === 'admin'}

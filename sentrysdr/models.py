@@ -35,6 +35,7 @@ class User(Base):
     last_login_at: Mapped[float | None] = mapped_column(nullable=True)
     last_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
     signup_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    alerts_seen_at: Mapped[float | None] = mapped_column(nullable=True)
 
 
 class UserSession(Base):
@@ -223,6 +224,11 @@ class Recording(Base):
     clearcut_system: Mapped[str | None] = mapped_column(String(64), nullable=True)
     clearcut_talkgroup: Mapped[int | None] = mapped_column(nullable=True)
     clearcut_call_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    transcript_at: Mapped[float | None] = mapped_column(nullable=True)  # when the transcript arrived, for alerts
+    # Marked important by hand. Anyone's keywords can also make it important to them.
+    important: Mapped[bool | None] = mapped_column(nullable=True)
+    important_at: Mapped[float | None] = mapped_column(nullable=True)
+    important_by: Mapped[str | None] = mapped_column(String(254), nullable=True)
 
 
 class AcarsMessage(Base):
@@ -246,6 +252,19 @@ class AcarsMessage(Base):
     text: Mapped[str] = mapped_column(String(4000), default="")
     has_text: Mapped[bool] = mapped_column(default=False, index=True)
     fed: Mapped[bool | None] = mapped_column(nullable=True)  # sent to airframes.io
+    important: Mapped[bool | None] = mapped_column(nullable=True)
+    important_at: Mapped[float | None] = mapped_column(nullable=True)
+    important_by: Mapped[str | None] = mapped_column(String(254), nullable=True)
+
+
+class UserKeyword(Base):
+    """A word or phrase one user wants flagged in call transcripts or ACARS messages."""
+    __tablename__ = "user_keywords"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    word: Mapped[str] = mapped_column(String(80))
+    applies: Mapped[str] = mapped_column(String(8), default="both")  # calls|messages|both
+    created_at: Mapped[float] = mapped_column(default=now)
 
 
 class UploadJob(Base):
@@ -376,6 +395,8 @@ def make_session_factory(db_path: Path):
         cursor.execute("PRAGMA foreign_keys=ON")
         cursor.execute("PRAGMA synchronous=NORMAL")
         cursor.close()
+        from .keywords import regexp
+        conn.create_function("regexp", 2, regexp, deterministic=True)  # whole-word keyword matching
 
     Base.metadata.create_all(engine)
     _add_missing_columns(engine)

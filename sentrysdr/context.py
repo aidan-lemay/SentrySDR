@@ -590,6 +590,7 @@ class Context:
                     text = uploaders.transcript_text(call)
                     if text:
                         recording.transcript = text
+                        recording.transcript_at = time.time()
                         found += 1
                 session.commit()
         return found

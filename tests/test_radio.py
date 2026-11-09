@@ -2383,3 +2383,81 @@ def test_recordings_for_a_player(ctx, listener):
     # Oldest first, and a long call that started long ago but just ended is included.
     assert [(i["target_name"], round(now_ - i["ended_at"])) for i in items] == [("T2", 50), ("T1", 10)]
     assert listener.get("/api/recordings?targets=1;DROP").status_code == 422
+
+
+# --- keyword alerts and important calls ------------------------------------------------------
+def add_call(ctx, transcript=None, ended_ago=60, transcript_ago=None, **extra):
+    call = str(uuid.uuid4())
+    with ctx.db() as session:
+        session.add(Recording(id=call, target_name="Fire", started_at=time.time() - ended_ago - 10, ended_at=time.time() - ended_ago,
+                              duration=10, rel_path="x.mp3", transcript=transcript,
+                              transcript_at=time.time() - transcript_ago if transcript_ago is not None else None, **extra))
+        session.commit()
+    return call
+
+
+def test_keywords_are_each_users_own(ctx, admin, listener):
+    made = listener.post("/api/me/keywords", json={"word": "  Structure   FIRE ", "applies": "calls"})
+    assert made.status_code == 201 and made.json()["word"] == "structure fire"
+    assert listener.post("/api/me/keywords", json={"word": "structure fire"}).status_code == 409
+    assert listener.post("/api/me/keywords", json={"word": "x"}).status_code == 422
+    assert listener.post("/api/me/keywords", json={"word": "ok", "applies": "everything"}).status_code == 422
+    assert admin.get("/api/me/keywords").json() == []
+    assert admin.delete(f"/api/me/keywords/{made.json()['id']}").status_code == 404  # not theirs
+    assert listener.delete(f"/api/me/keywords/{made.json()['id']}").status_code == 200
+
+
+def test_important_filter_and_matches(ctx, admin, listener):
+    listener.post("/api/me/keywords", json={"word": "fire", "applies": "calls"}).raise_for_status()
+    hit = add_call(ctx, "Engine 41 responding to a FIRE alarm")
+    add_call(ctx, "The firefighter is on scene")  # not a whole-word match
+    add_call(ctx, "Nothing here")
+    marked = add_call(ctx, "Routine traffic")
+    admin.post(f"/api/recordings/{marked}/important", json={"important": True}).raise_for_status()
+    items = listener.get("/api/recordings?important=true").json()["items"]
+    assert {i["id"] for i in items} == {hit, marked}
+    by_id = {i["id"]: i for i in items}
+    assert by_id[hit]["matches"] == ["fire"] and by_id[marked]["important"] is True and by_id[marked]["important_by"] == ADMIN_EMAIL
+    # Keywords are per user: the admin has none, so only the marked call is important to them.
+    assert [i["id"] for i in admin.get("/api/recordings?important=true").json()["items"]] == [marked]
+
+
+def test_marking_important_protects_and_needs_permission(ctx, admin, operator, listener):
+    call = add_call(ctx, "x")
+    assert listener.post(f"/api/recordings/{call}/important", json={"important": True}).status_code == 403
+    reply = operator.post(f"/api/recordings/{call}/important", json={"important": True})
+    assert reply.json() == {"important": True, "protected": True}
+    reply = operator.post(f"/api/recordings/{call}/important", json={"important": False})
+    assert reply.json() == {"important": False, "protected": True}  # unmarking leaves the protection
+
+
+def test_alerts_count_new_matches_and_clear_when_seen(ctx, listener):
+    listener.post("/api/me/keywords", json={"word": "mayday"}).raise_for_status()
+    add_call(ctx, "MAYDAY mayday, engine failure")
+    add_message(ctx, text="MAYDAY RELAYED", tail="N5")
+    add_message(ctx, text="all normal", tail="N6")
+    got = listener.get("/api/alerts").json()
+    assert got["count"] == 2 and {i["kind"] for i in got["items"]} == {"call", "message"}
+    assert all(i["matches"] == ["mayday"] for i in got["items"])
+    listener.post("/api/alerts/seen").raise_for_status()
+    assert listener.get("/api/alerts").json()["count"] == 0
+    # An old call whose transcript arrives now is a new alert.
+    add_call(ctx, "mayday at last", ended_ago=3600, transcript_ago=0)
+    assert listener.get("/api/alerts").json()["count"] == 1
+
+
+def test_alerts_follow_permissions(ctx, admin, listener):
+    listener.post("/api/me/keywords", json={"word": "mayday"}).raise_for_status()
+    add_call(ctx, "mayday")
+    add_message(ctx, text="mayday")
+    user = next(u for u in admin.get("/api/admin/users").json() if u["role"] == "listener")
+    admin.patch(f"/api/admin/users/{user['id']}", json={"perm_overrides": {"maps": False}}).raise_for_status()
+    assert [i["kind"] for i in listener.get("/api/alerts").json()["items"]] == ["call"]
+
+
+def test_marking_a_message_important(ctx, operator, listener):
+    add_message(ctx, text="hello")
+    with ctx.db() as session:
+        message_id = session.scalars(select(AcarsMessage)).first().id
+    assert operator.post(f"/api/messages/{message_id}/important", json={"important": True}).json() == {"important": True}
+    assert [m["id"] for m in listener.get("/api/messages?important=true").json()["items"]] == [message_id]

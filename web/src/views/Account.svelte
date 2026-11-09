@@ -86,7 +86,29 @@
     }
   }
 
+  // --- keywords
+  let keywordList = $state([]);
+  let newWord = $state('');
+  let newApplies = $state('both');
+
+  async function loadKeywords() {
+    keywordList = await api('me/keywords').catch(() => []);
+  }
+
+  async function addKeyword(event) {
+    event.preventDefault();
+    if (await run(() => api('me/keywords', { method: 'POST', body: { word: newWord, applies: newApplies } }), 'Keyword added.')) {
+      newWord = '';
+      await loadKeywords();
+    }
+  }
+
+  async function removeKeyword(keyword) {
+    if (await run(() => api(`me/keywords/${keyword.id}`, { method: 'DELETE' }), 'Keyword removed.')) await loadKeywords();
+  }
+
   onMount(async () => {
+    if (!forced) loadKeywords();
     if (!forced) activity = (await api('me/audit').catch(() => [])) ?? [];
   });
 </script>
@@ -123,6 +145,31 @@
 </form>
 
 {#if !forced}
+  <form onsubmit={addKeyword}>
+    <fieldset>
+      <legend>Keywords</legend>
+      <p class="small">Calls whose transcript, or ACARS messages whose text, contains one of these are flagged as important for you, and appear under <a href="#/alerts">Alerts</a>. Whole words or phrases, ignoring case: "fire" matches "Fire!" but not "firefighter". Only you see your keywords.</p>
+      {#each keywordList as keyword (keyword.id)}
+        <div class="buttons" style="margin:.2rem 0">
+          <span class="mono">{keyword.word}</span>
+          <span class="small dim">{({ both: 'calls and messages', calls: 'calls', messages: 'messages' })[keyword.applies]}</span>
+          <button type="button" onclick={() => removeKeyword(keyword)}>Remove</button>
+        </div>
+      {:else}
+        <p class="small dim">No keywords yet.</p>
+      {/each}
+      <label class="field"><span>New keyword</span><input bind:value={newWord} minlength="2" maxlength="80" placeholder="structure fire" required /></label>
+      <label class="field"><span>Look in</span>
+        <select bind:value={newApplies}>
+          <option value="both">Calls and ACARS messages</option>
+          <option value="calls">Call transcripts only</option>
+          <option value="messages">ACARS messages only</option>
+        </select>
+      </label>
+      <div class="buttons form-buttons"><button class="main">Add keyword</button></div>
+    </fieldset>
+  </form>
+
   <fieldset>
     <legend>Two-factor sign-in</legend>
     {#if user.totp_enabled}

@@ -6,26 +6,35 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy import func, or_, select
 
+from .. import keywords
 from ..acars import Registrations, normalize_tail
 from ..models import AcarsMessage, User, now
 from .deps import ctx_of, get_db, require
+from .routes_alerts import important_condition, user_words
 
 router = APIRouter(prefix="/api")
 
 MAP_WINDOW_SECONDS = 3600
 
 
-def _view(message: AcarsMessage) -> dict:
-    return {c.name: getattr(message, c.name) for c in AcarsMessage.__table__.columns}
+def _view(message: AcarsMessage, words: list[str] | None = None) -> dict:
+    view = {c.name: getattr(message, c.name) for c in AcarsMessage.__table__.columns}
+    view["important"] = bool(message.important)
+    view["matches"] = keywords.matches(words or [], message.text)
+    return view
 
 
 @router.get("/messages")
 def list_messages(
-    _user: User = Depends(require("maps")), db=Depends(get_db),
+    user: User = Depends(require("maps")), db=Depends(get_db),
     search: str = Query(default="", max_length=200), tail: str = Query(default="", max_length=16),
-    show_empty: bool = False, limit: int = Query(default=50, ge=1, le=200), offset: int = Query(default=0, ge=0),
+    show_empty: bool = False, important: bool = False,
+    limit: int = Query(default=50, ge=1, le=200), offset: int = Query(default=0, ge=0),
 ):
+    words = user_words(db, user, "messages")
     conditions = []
+    if important:
+        conditions.append(important_condition(AcarsMessage.text, AcarsMessage.important, words))
     if not show_empty:
         conditions.append(AcarsMessage.has_text.is_(True))
     if tail:
@@ -43,7 +52,7 @@ def list_messages(
     total = db.scalar(select(func.count()).select_from(AcarsMessage).where(*conditions))
     rows = db.scalars(select(AcarsMessage).where(*conditions)
                       .order_by(AcarsMessage.received_at.desc(), AcarsMessage.id.desc()).limit(limit).offset(offset))
-    return {"items": [_view(m) for m in rows], "total": total}
+    return {"items": [_view(m, words) for m in rows], "total": total}
 
 
 def registrations(request: Request) -> Registrations | None:

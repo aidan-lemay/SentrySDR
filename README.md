@@ -225,6 +225,14 @@ A stick that stays connected but stops working may not show a fault, because it 
 
 Only calls that finish after you start are played, never a backlog. Browsers only play sound after a click on the page, so autoplay starts from the tick or **Start scanning**; if one still blocks it, select **Play** once.
 
+## Keyword alerts
+
+Under **My account > Keywords**, each user keeps their own words and phrases to watch for, in call transcripts, ACARS messages, or both. Matching ignores case and takes whole words: "fire" matches "Fire!" but not "firefighter", and a phrase matches across a line break. Only you see your keywords.
+
+- **Alerts:** the menu shows how many new calls and messages matched since you last looked, including a call whose transcript arrived later. The **Alerts** page lists them; **Mark all seen** clears the count.
+- **Important:** matching calls and messages are outlined in red with the words they matched, and **Important only** on the Recordings and Messages pages shows just those. Anyone with the Protect permission can also **Mark important** by hand, which everyone then sees as important, and which protects a call from automatic deletion.
+- Alerts stay inside SentrySDR for now: nothing is sent by email or other notification.
+
 ## Schedules
 
 On the Schedule page, a schedule puts an SDR on a target for a while. It **repeats every week** on chosen days and times, or runs **once** between two dates and times, such as 9:00 to 11:00 on 22 November. One-off schedules can last up to 31 days, and stay listed as finished afterwards. Times are in the master's time zone (`server.timezone`), whatever the browser's is.
