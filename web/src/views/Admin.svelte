@@ -295,6 +295,15 @@
     }
   }
 
+  const restartSource = (source) => confirm(`Restart ${source.name}? Its tool stops and starts again, which takes a few seconds. A call in progress is saved.`) && run(async () => {
+    await api(`sources/${source.id}/restart`, { method: 'POST' });
+    await loaders.sources();
+  }, `${source.name} restarted.`);
+
+  const restartService = (node) => confirm(`Restart SentrySDR on ${node.name}? Every SDR on it stops for about 10 seconds. Calls in progress are saved.${node.is_local ? ' This page reconnects when it\'s back.' : ''}`) && run(async () => {
+    await api(`nodes/${node.id}/restart`, { method: 'POST' });
+  }, `${node.name} is restarting. It should be back in about 10 seconds.`);
+
   const revokeNode = (node) => confirm(`Revoke ${node.name}? It will disconnect, and need a new token to come back.`) && run(async () => {
     await api(`nodes/${node.id}`, { method: 'DELETE' });
     await loaders.nodes();
@@ -535,6 +544,7 @@
             <td>
               <div class="buttons" style="margin:0">
                 <button onclick={() => editSource(source)}>Edit</button>
+                <button onclick={() => restartSource(source)} disabled={!source.node_online} title="Stop and start this SDR's tool, for a stick that was unplugged">Restart</button>
                 <button class="bad" onclick={() => removeSource(source)}>Remove</button>
               </div>
             </td>
@@ -723,7 +733,12 @@
             </td>
             <td data-label="SDRs"><span class="mono small">{node.serials.join(', ') || 'None'}</span></td>
             <td data-label="Last address"><span class="mono small">{node.last_ip ?? 'None'}</span></td>
-            <td>{#if !node.is_local && node.status !== 'revoked'}<button class="bad" onclick={() => revokeNode(node)}>Revoke</button>{/if}</td>
+            <td>
+              <div class="buttons" style="margin:0">
+                {#if node.status === 'active'}<button onclick={() => restartService(node)} disabled={!node.online && !node.is_local}>Restart service</button>{/if}
+                {#if !node.is_local && node.status !== 'revoked'}<button class="bad" onclick={() => revokeNode(node)}>Revoke</button>{/if}
+              </div>
+            </td>
           </tr>
         </tbody>
       {/each}

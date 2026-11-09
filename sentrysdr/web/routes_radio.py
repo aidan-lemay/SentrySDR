@@ -672,6 +672,34 @@ async def measure_source(source_id: int, body: MeasureBody, request: Request, us
     return {**result, "gain_db": body.gain_db}
 
 
+RESTART_LIMIT = 30
+RESTART_WINDOW = 3600
+
+
+@router.post("/sources/{source_id}/restart")
+async def restart_source(source_id: int, request: Request, admin: User = Depends(admin_user), db=Depends(get_db)):
+    """Stop an SDR's tool and start it again: for a stick that was unplugged and plugged back in."""
+    ctx = ctx_of(request)
+    source = db.get(Source, source_id)
+    if source is None:
+        raise HTTPException(404, "Source not found")
+    node = db.get(Node, source.node_id)
+    if node is None or not ctx.node_online(node):
+        raise HTTPException(409, "That node is offline.")
+    key = f"restart:{admin.id}"
+    if ctx.limiter.blocked(key, RESTART_LIMIT, RESTART_WINDOW):
+        raise HTTPException(429, "Too many restarts. Try again later.")
+    ctx.limiter.hit(key, RESTART_WINDOW)
+    serial, name = source.serial, source.name
+    db.commit()
+    ctx.audit("source.restarted", user=admin, ip=ip_of(request), target=name)
+    try:
+        await ctx.restart_sdr(node, serial)
+    except MeasureError as exc:
+        raise HTTPException(409, str(exc)) from None
+    return {"detail": f"{name} restarted"}
+
+
 class DetectBody(BaseModel):
     node_id: int | None = None
     serial: str = Field(min_length=1, max_length=64)

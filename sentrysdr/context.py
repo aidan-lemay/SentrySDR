@@ -5,11 +5,12 @@ import asyncio
 import contextlib
 import json
 import logging
-import re
-import math
 import logging.handlers
+import math
 import os
+import re
 import shutil
+import signal
 import time
 import uuid
 from datetime import datetime
@@ -30,6 +31,7 @@ from .security import RateLimiter, SecretBox
 
 log = logging.getLogger("sentrysdr")
 MEASURE_TIMEOUT = 45.0
+RESTART_DELAY_SECONDS = 1.0  # long enough for the reply to reach the browser first
 
 SETTING_DEFAULTS = {
     "audit_retention_days": "365",
@@ -296,6 +298,29 @@ class Context:
                     continue
                 result.setdefault(source.node_id, {})[source.serial] = spec
             return result
+
+    async def restart_sdr(self, node: Node, serial: str) -> None:
+        if node.is_local:
+            if self.supervisor is None:
+                raise MeasureError("Radios aren't running on this server.")
+            await self.supervisor.restart(serial)
+            return
+        link = self.node_links.get(node.id)
+        if link is None:
+            raise MeasureError("That node is offline.")
+        link.send({"t": "restart", "serial": serial})
+
+    def restart_service(self, node: Node) -> None:
+        """Ask a node's service to stop cleanly. Under systemd (Restart=always) it starts again by itself."""
+        if node.is_local:
+            if self.loop is None:
+                raise MeasureError("The service isn't running its background tasks.")
+            self.loop.call_later(RESTART_DELAY_SECONDS, os.kill, os.getpid(), signal.SIGTERM)
+            return
+        link = self.node_links.get(node.id)
+        if link is None:
+            raise MeasureError("That node is offline.")
+        link.send({"t": "restart_service"})
 
     async def measure(self, node: Node, serial: str, request: dict) -> dict:
         """Measure on the node that holds the SDR. Raises MeasureError with a user-facing reason."""

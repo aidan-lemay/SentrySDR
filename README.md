@@ -206,7 +206,16 @@ Any of those lines means the connection needs attention, so fix it before you me
 
 A stick that was last closed uncleanly, for example when a tool was killed, can come up with USB errors and then send nothing. When an SDR shows USB errors as it starts, SentrySDR restarts it once so it opens cleanly, and the Sources page notes the time. If it happens again within a minute, it's left running with the note. Seeing this often points to the hub or cable.
 
-If a stick is unplugged, its source shows a fault, and recording resumes by itself when it's back. Other SDRs keep running, and a call in progress is saved. A stick that stays connected but stops working may not show a fault, because it looks the same as a closed squelch.
+If a stick is unplugged, its source shows **SDR disconnected** within a few seconds, and starts again by itself within a few seconds of being plugged back in. That works for every target type, including decoders that hang instead of quitting when their stick disappears: each running SDR checks every 3 seconds that its stick is still on the USB bus, using the kernel's device list, which opens nothing. Other SDRs keep running, and a call in progress is saved.
+
+If an SDR still seems stuck, administrators have two buttons:
+
+- **Restart** an SDR, under **Admin > SDR sources**, or on the Sources page next to an SDR showing a fault. It stops that SDR's tool and starts it again. Other SDRs aren't affected.
+- **Restart service** on a machine, under **Admin > Nodes**, for the master or a slave. Every SDR on it stops for about 10 seconds and calls in progress are saved; systemd then starts it again (`Restart=always` in the service file). Only use this under systemd: run by hand, the service just stops.
+
+Both work on slaves, need the slave to be online and running this version, and are recorded in the audit log.
+
+A stick that stays connected but stops working may not show a fault, because it looks the same as a closed squelch. Try **Restart** first.
 
 ## Antennas
 
@@ -375,7 +384,8 @@ Outbound, the master connects to the upload and feed services you turn on; slave
 
 - **Service log:** `journalctl -u sentrysdr -f`. A file copy is in `log_dir` (`/var/log/sentrysdr`), with `audit.log` holding sign-ins and changes.
 - **Won't start:** `journalctl -u sentrysdr -n 50` usually names the problem. A configuration error says which setting. `Permission denied` or `Read-only file system` means a moved folder; see [Storing recordings on another drive](#storing-recordings-on-another-drive).
-- **An SDR shows "SDR not connected":** check `list-sdrs`, that its serial is in `sdr.serials` on the right node, and that nothing else (GQRX, SDR++, `dump1090-fa`) has it open.
+- **An SDR shows "SDR not connected" or "SDR disconnected":** check it's plugged in, `list-sdrs`, that its serial is in `sdr.serials` on the right node, that no other stick has the same serial, and that nothing else (GQRX, SDR++, `dump1090-fa`) has it open. It starts again by itself once it can.
+- **An SDR seems stuck:** select **Restart** on it, or **Restart service** under **Admin > Nodes** (see [USB connections](#usb-connections)).
 - **"tool not installed":** that target needs a decoder. Re-run the install with `--with-decoders`.
 - **Records nothing, or only static:** see [Tuning call detection](#tuning-call-detection) and [USB connections](#usb-connections).
 - **Upload failures** show on each recording, with the service's reply.

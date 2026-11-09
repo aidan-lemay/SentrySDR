@@ -21,6 +21,7 @@ from sqlalchemy import select
 from .. import aio, feeds, security
 from ..config import SERIAL_RE
 from ..context import Context
+from ..engine import MeasureError
 from ..models import Node, Source, Target, User
 from .deps import admin_user, ctx_of, get_db, ip_of
 
@@ -81,6 +82,29 @@ def revoke_node(node_id: int, request: Request, admin: User = Depends(admin_user
         ctx.loop.call_soon_threadsafe(link.disconnect)
     ctx.audit("node.revoked", user=admin, ip=ip_of(request), target=node.name)
     return {"detail": "Revoked"}
+
+
+SERVICE_RESTART_LIMIT = 10
+SERVICE_RESTART_WINDOW = 3600
+
+
+@router.post("/{node_id}/restart")
+def restart_node_service(node_id: int, request: Request, admin: User = Depends(admin_user), db=Depends(get_db)):
+    """Restart SentrySDR on a node. It saves calls in progress first; systemd starts it again."""
+    ctx = ctx_of(request)
+    node = db.get(Node, node_id)
+    if node is None or node.status != "active":
+        raise HTTPException(404, "Node not found")
+    key = f"service-restart:{admin.id}"
+    if ctx.limiter.blocked(key, SERVICE_RESTART_LIMIT, SERVICE_RESTART_WINDOW):
+        raise HTTPException(429, "Too many restarts. Try again later.")
+    ctx.limiter.hit(key, SERVICE_RESTART_WINDOW)
+    ctx.audit("node.service_restarted", user=admin, ip=ip_of(request), target=node.name)
+    try:
+        ctx.restart_service(node)
+    except MeasureError as exc:
+        raise HTTPException(409, str(exc)) from None
+    return {"detail": f"{node.name} is restarting"}
 
 
 # --- agent endpoints -------------------------------------------------------
@@ -196,6 +220,9 @@ class NodeLink:
 
     def request_measure(self, request_id: str, serial: str, request: dict) -> None:
         self._queue({"t": "measure", "id": request_id, "serial": serial, **request})
+
+    def send(self, message: dict) -> None:
+        self._queue(message)
 
     def _queue(self, message: dict) -> None:
         try:

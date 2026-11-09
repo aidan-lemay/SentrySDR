@@ -98,6 +98,11 @@
     }
   }
 
+  function restart(source) {
+    if (!confirm(`Restart ${source.name}? Its tool stops and starts again, which takes a few seconds.`)) return;
+    act(source, `sources/${source.id}/restart`, { method: 'POST' }, 'Restarted. It may take a few seconds to show Listening.');
+  }
+
   async function setLocked(source, box) {
     const done = await act(source, `sources/${source.id}/lock`, { method: box.checked ? 'POST' : 'DELETE' }, box.checked ? 'Locked.' : 'Unlocked.');
     if (!done) box.checked = source.locked;
@@ -235,6 +240,9 @@
                 {/if}
                 {#if can('listen_recordings') && records(source)}
                   <button onclick={() => toggleRecent(source)}>{recent[source.id] ? 'Hide calls' : 'Calls'}</button>
+                {/if}
+                {#if isAdmin && source.state === 'error' && source.node_online}
+                  <button onclick={() => restart(source)} title="Stop and start this SDR's tool">Restart</button>
                 {/if}
                 {#if can('maps') && source.active_target?.kind === 'acars'}
                   <a class="button" href="#/messages">Messages</a>

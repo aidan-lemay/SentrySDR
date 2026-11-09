@@ -19,7 +19,7 @@ from sqlalchemy import select
 from sentrysdr import capabilities, feeds, pipelines, schedule, sdr, uploaders
 from sentrysdr.context import BROADCASTIFY_RETRY_SECONDS, UPLOAD_MAX_ATTEMPTS
 from sentrysdr.engine import MeasureError, VolumeControl, merge_ais_message
-from sentrysdr.models import AcarsMessage, Antenna, BroadcastifySystem, Node, Recorder, Recording, SdrProfile, Source, Target, UploadJob, make_session_factory
+from sentrysdr.models import AcarsMessage, Antenna, AuditLog, BroadcastifySystem, Node, Recorder, Recording, SdrProfile, Source, Target, UploadJob, make_session_factory
 
 from .conftest import ADMIN_EMAIL, PASSWORD, add_user, client_for
 
@@ -2102,3 +2102,26 @@ def test_slave_rtl_tcp_status_is_cleaned(ctx):
                           ({"address": "<b>evil</b>:1234", "client": True}, {}), ({"address": "10.0.0.1:99999"}, {}), ("x", {})):
         handle_agent_message(ctx, 7, ["S"], {"t": "status", "sources": {"S": {"state": "listening", "rtl_tcp": raw}}})
         assert ctx.status[(7, "S")]["rtl_tcp"] == expected
+
+
+# --- restarting by hand ---------------------------------------------------------------
+def test_restart_routes_are_admin_only_and_reach_the_node(ctx, admin, operator):
+    source = make_source(admin)
+    assert operator.post(f"/api/sources/{source}/restart").status_code == 403
+    assert operator.post(f"/api/nodes/{ctx.local_node_id}/restart").status_code == 403
+    # Radios aren't running in these tests, which is reported, not a crash.
+    assert admin.post(f"/api/sources/{source}/restart").status_code == 409
+    sent = []
+    with ctx.db() as session:
+        session.add(Node(name="Field", status="active", serials=["FIELD1"]))
+        session.commit()
+        field = session.scalar(select(Node).where(Node.name == "Field")).id
+    far = admin.post("/api/sources", json={"node_id": field, "serial": "FIELD1", "name": "Far"}).json()["id"]
+    assert admin.post(f"/api/sources/{far}/restart").status_code == 409  # offline
+    ctx.node_links[field] = SimpleNamespace(send=sent.append)
+    assert admin.post(f"/api/sources/{far}/restart").status_code == 200
+    assert admin.post(f"/api/nodes/{field}/restart").status_code == 200
+    assert sent == [{"t": "restart", "serial": "FIELD1"}, {"t": "restart_service"}]
+    with ctx.db() as session:
+        actions = [a.action for a in session.scalars(select(AuditLog))]
+    assert "source.restarted" in actions and "node.service_restarted" in actions

@@ -29,6 +29,8 @@ log = logging.getLogger("sentrysdr.engine")
 READ_SIZE = 4096
 RESTART_MIN = 2.0
 RESTART_MAX = 60.0
+PRESENCE_SECONDS = 3.0  # how often a running SDR checks its stick is still plugged in
+UNPLUGGED = ("SDR not connected", "SDR disconnected")
 AIS_EXPIRY_SECONDS = 900
 SQUELCH_STUCK_SECONDS = 600
 SQUELCH_STUCK_WARNING = "Squelch has been open for over 10 minutes. If nothing is transmitting, measure this SDR and raise its squelch."
@@ -277,6 +279,15 @@ class Worker:
         else:
             self.task = asyncio.create_task(self._run(spec), name=f"sdr-{self.serial}")
 
+    async def restart(self) -> None:
+        """Stop this SDR's tool and start it again, with a fresh retry delay. For a stuck stick."""
+        if self.measuring:
+            raise MeasureError("This SDR is being measured. Try again in a moment.")
+        await self.stop()
+        self._last_reset_restart = -RESET_RESTART_GAP
+        if self.spec is not None:
+            self.task = asyncio.create_task(self._run(self.spec), name=f"sdr-{self.serial}")
+
     async def stop(self) -> None:
         if self.task:
             self.task.cancel()
@@ -386,33 +397,48 @@ class Worker:
         self.note, self.note_at = text, (time.time() if text else None)
         self._publish()
 
-    async def _watch_resets(self, pipeline: Awaitable[str]) -> str | None:
-        """Run a pipeline. If the stick had USB errors on open, restart it once so it opens cleanly.
+    async def _wait_until_unplugged(self) -> None:
+        """Returns once this SDR's stick has been unplugged. Some tools hang rather than exit when that happens."""
+        while True:
+            await asyncio.sleep(PRESENCE_SECONDS)
+            present = await asyncio.to_thread(self.sup.present)
+            if present is not None and self.serial not in present:
+                return
 
-        Returns None to restart straight away, otherwise the pipeline's exit error.
+    async def _watch_resets(self, pipeline: Awaitable[str]) -> str | None:
+        """Run a pipeline, watching for a stick that opened badly or was unplugged.
+
+        USB errors on open restart it once so it opens cleanly. An unplugged stick
+        stops it, so the retry loop can start it again once the stick is back.
+        Returns None to restart straight away, otherwise why the pipeline ended.
         """
         self._reset_seen.clear()
         task = asyncio.ensure_future(pipeline)
         watcher = asyncio.create_task(self._reset_seen.wait())
+        gone = asyncio.create_task(self._wait_until_unplugged())
+        waiting = {task, watcher, gone}
         try:
-            await asyncio.wait({task, watcher}, return_when=asyncio.FIRST_COMPLETED)
-            if task.done():
-                return task.result()
-            await asyncio.sleep(RESET_SETTLE_SECONDS)  # let the open finish before stopping it
-            clock = time.strftime("%H:%M")
-            if time.monotonic() - self._last_reset_restart < RESET_RESTART_GAP:
-                log.warning("[%s] USB errors again on start; left running", self.serial)
-                self._set_note(f"USB errors on start twice in a row at {clock}. If it records nothing, check its USB connection.")
-                return await task
-            self._last_reset_restart = time.monotonic()
-            log.warning("[%s] USB errors on start; restarting it so it opens cleanly", self.serial)
-            self._set_note(f"USB errors on start at {clock}, so it was restarted. If it records nothing, check its USB connection.")
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
-            return None
+            while True:
+                done, _ = await asyncio.wait(waiting, return_when=asyncio.FIRST_COMPLETED)
+                if task in done:
+                    return task.result()
+                if gone in done:
+                    log.warning("[%s] SDR unplugged; stopping its tool until it's back", self.serial)
+                    return "SDR disconnected"
+                waiting.discard(watcher)
+                await asyncio.sleep(RESET_SETTLE_SECONDS)  # let the open finish before stopping it
+                clock = time.strftime("%H:%M")
+                if time.monotonic() - self._last_reset_restart < RESET_RESTART_GAP:
+                    log.warning("[%s] USB errors again on start; left running", self.serial)
+                    self._set_note(f"USB errors on start twice in a row at {clock}. If it records nothing, check its USB connection.")
+                    continue  # still watching for it being unplugged
+                self._last_reset_restart = time.monotonic()
+                log.warning("[%s] USB errors on start; restarting it so it opens cleanly", self.serial)
+                self._set_note(f"USB errors on start at {clock}, so it was restarted. If it records nothing, check its USB connection.")
+                return None
         finally:
             watcher.cancel()
+            gone.cancel()
             if not task.done():
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -429,7 +455,9 @@ class Worker:
             started = time.monotonic()
             error = ""
             try:
-                devices = await asyncio.to_thread(self.sup.enumerate)
+                # The cheap sysfs check first: enumerating briefly opens every stick, busy ones too.
+                present = await asyncio.to_thread(self.sup.present)
+                devices = await asyncio.to_thread(self.sup.enumerate) if present is None or self.serial in present else []
                 index = sdr.index_for_serial(self.serial, devices)
                 if index is None:
                     if sdr.has_duplicate(self.serial, devices):
@@ -451,6 +479,14 @@ class Worker:
                 error = str(exc)[:300]
             if time.monotonic() - started > RESTART_MAX:
                 delay = RESTART_MIN
+            if error in UNPLUGGED:
+                # Waiting for a stick to come back: check often, and say so once rather than every time.
+                if self.error != error:
+                    log.warning("[%s] %s; starting it again when it's back", self.serial, error)
+                self._publish("error", error)
+                await asyncio.sleep(RESTART_MIN)
+                delay = RESTART_MIN
+                continue
             self._publish("error", error or "pipeline exited")
             log.warning("[%s] restarting in %.0fs: %s", self.serial, delay, self.error)
             await asyncio.sleep(delay)
@@ -711,9 +747,14 @@ class Supervisor:
     """Applies desired assignments, and only ever touches configured serials."""
 
     def __init__(self, cfg: Config, call_sink: CallSink, pcm: PcmSink, tracks: TrackSink, status: Status,
-                 enumerate_fn: Callable[[], list[str]] = sdr.enumerate_serials):
+                 enumerate_fn: Callable[[], list[str]] = sdr.enumerate_serials,
+                 present_fn: Callable[[], set[str] | None] | None = None):
         self.cfg, self.call_sink, self.pcm, self.tracks, self.status = cfg, call_sink, pcm, tracks, status
         self.enumerate = enumerate_fn
+        # Real sticks are checked in sysfs, which opens nothing. A stand-in list answers for itself.
+        if present_fn is None:
+            present_fn = sdr.present_serials if enumerate_fn is sdr.enumerate_serials else (lambda: set(enumerate_fn()))
+        self.present = present_fn
         self.tmp_dir = cfg.recordings_dir / ".tmp"
         self.tmp_dir.mkdir(parents=True, exist_ok=True)
         for leftover in self.tmp_dir.iterdir():
@@ -734,6 +775,12 @@ class Supervisor:
         if request.get("op") == "detect":
             return await worker.detect()
         return await worker.measure(**request)
+
+    async def restart(self, serial: str) -> None:
+        worker = self.workers.get(serial)
+        if worker is None:
+            raise MeasureError("That SDR isn't in sdr.serials on this node.")
+        await worker.restart()
 
     async def shutdown(self) -> None:
         await asyncio.gather(*(w.stop() for w in self.workers.values()), return_exceptions=True)
