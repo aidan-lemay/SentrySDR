@@ -2260,6 +2260,40 @@ def test_quiet_offline_node_and_source(ctx, admin, operator, monkeypatch):
     assert "Roof stick: tool not installed" in warnings_text(operator)  # other faults still warn
 
 
+def add_failed_upload(ctx, destination="rdio", failed_at=None):
+    with ctx.db() as session:
+        rec = Recording(id=str(uuid.uuid4()), started_at=time.time() - 60, ended_at=time.time() - 50, duration=5, rel_path="x.mp3")
+        session.add(rec)
+        session.flush()
+        session.add(UploadJob(recording_id=rec.id, destination=destination, status="failed", failed_at=failed_at or time.time()))
+        session.commit()
+
+
+def test_failed_uploads_can_be_acknowledged(ctx, admin, operator, listener, monkeypatch):
+    monkeypatch.setattr(health_module, "clock_synced", lambda: True)
+    monkeypatch.setattr(health_module, "disk", lambda path: {"free": 10**12, "total": 2 * 10**12})
+    add_failed_upload(ctx, "rdio")
+    add_failed_upload(ctx, "broadcastify")
+    assert "2 uploads failed in the last day (1 to Broadcastify, 1 to RDIO)" in warnings_text(admin)
+    [warning] = [w for w in operator.get("/api/warnings").json() if w["key"] == "uploads.failed"]
+    assert warning["acknowledge"] is True
+    assert listener.post("/api/warnings/acknowledge", json={"key": "uploads.failed"}).status_code == 403
+    assert operator.post("/api/warnings/acknowledge", json={"key": "uploads.failed"}).status_code == 200
+    assert "failed" not in warnings_text(admin) and "failed" not in warnings_text(operator)  # for everyone
+    time.sleep(0.01)
+    add_failed_upload(ctx, "rdio")  # a new one warns again, counting only itself
+    text = warnings_text(admin)
+    assert "1 upload failed since it was acknowledged at" in text and "(1 to RDIO)" in text
+
+
+def test_only_event_warnings_can_be_acknowledged(ctx, admin, monkeypatch):
+    monkeypatch.setattr(health_module, "clock_synced", lambda: True)
+    monkeypatch.setattr(health_module, "disk", lambda path: {"free": 10**12, "total": 2 * 10**12})
+    gone = add_slave(ctx, "Gone", online=False, last_seen=time.time() - 3600)
+    assert admin.post("/api/warnings/acknowledge", json={"key": f"node.offline:{gone}"}).status_code == 409
+    assert admin.post("/api/warnings/acknowledge", json={"key": "uploads.failed"}).status_code == 404
+
+
 def test_clean_health_report():
     report = clean_health({"time": "nonsense", "clock_synced": "yes", "disk": {"free": -1, "total": 5}})
     assert report["skew"] is None and report["clock_synced"] is None and "disk" not in report

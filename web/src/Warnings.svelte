@@ -29,18 +29,32 @@
   });
 
   const bad = $derived(warnings.some((w) => w.level === 'bad'));
+
+  // Failed uploads and the like: noted, so only new ones warn. For everyone who sees warnings.
+  async function acknowledge(warning) {
+    try {
+      await api('warnings/acknowledge', { method: 'POST', body: { key: warning.key } });
+    } catch {
+      // It may have cleared already; the reload shows what's left.
+    }
+    await load();
+    dispatchEvent(new Event('warnings-changed'));
+  }
 </script>
 
 {#if warnings.length}
   <div class={bad ? 'err' : 'warn'} role="status">
     {#if warnings.length === 1}
       <a class="warning-one" href={warnings[0].page}>{warnings[0].text}</a>
+      {#if warnings[0].acknowledge}<button type="button" class="warning-ack" onclick={() => acknowledge(warnings[0])}>Acknowledge</button>{/if}
     {:else}
       <button type="button" class="link-button" onclick={() => (open = !open)} aria-expanded={open}>{warnings.length} things need attention</button>
     {/if}
     {#if open && warnings.length > 1}
       <ul class="warning-list">
-        {#each warnings as warning, i (i)}<li><a href={warning.page}>{warning.text}</a></li>{/each}
+        {#each warnings as warning (warning.key)}
+          <li><a href={warning.page}>{warning.text}</a>{#if warning.acknowledge}{' '}<button type="button" class="warning-ack" onclick={() => acknowledge(warning)}>Acknowledge</button>{/if}</li>
+        {/each}
       </ul>
     {:else if warnings.length > 1}
       <span class="small"> (show)</span>

@@ -99,6 +99,7 @@ main { padding: .6rem; max-width: 1100px; margin: 0 auto; }
 .warning-list { margin: .4rem 0 0; padding-left: 1.2rem; }
 .warning-list li { margin: .2rem 0; }
 .warning-list a, .warning-one, .warning-manage { color: inherit; }
+.warning-ack { margin-left: .5rem; vertical-align: middle; }
 .warning-manage { display: inline-flex; align-items: center; min-height: var(--touch); margin-left: .6rem; }
 .now-playing { position: sticky; top: env(safe-area-inset-top, 0px); z-index: 5; background: var(--box); border: 2px solid var(--ink); padding: .5rem .6rem; margin-bottom: .75rem; }
 .now-playing .buttons { margin-bottom: 0; }
