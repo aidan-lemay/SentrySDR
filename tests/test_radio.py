@@ -8,7 +8,7 @@ import subprocess
 import time
 import uuid
 from array import array
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -2461,3 +2461,32 @@ def test_marking_a_message_important(ctx, operator, listener):
         message_id = session.scalars(select(AcarsMessage)).first().id
     assert operator.post(f"/api/messages/{message_id}/important", json={"important": True}).json() == {"important": True}
     assert [m["id"] for m in listener.get("/api/messages?important=true").json()["items"]] == [message_id]
+
+
+# --- activity --------------------------------------------------------------------------------
+def test_activity_stats(ctx, admin, listener):
+    tz = ctx.cfg.tz
+    today_noon = datetime.now(tz).replace(hour=12, minute=0, second=0, microsecond=0)
+    with ctx.db() as session:
+        for offset_days, hour, target, source, duration in ((0, 12, "Fire", "Roof", 30), (0, 12, "Fire", "Roof", 30),
+                                                            (1, 9, "Net", "Field", 60), (40, 9, "Old", "Roof", 10)):
+            moment = (today_noon - timedelta(days=offset_days)).replace(hour=hour)
+            session.add(Recording(id=str(uuid.uuid4()), started_at=moment.timestamp(), ended_at=moment.timestamp() + duration,
+                                  duration=duration, target_name=target, source_name=source, rel_path="x.mp3"))
+        session.flush()
+        first = session.scalars(select(Recording).where(Recording.target_name == "Fire")).first()
+        session.add_all([UploadJob(recording_id=first.id, destination="broadcastify", status="done"),
+                         UploadJob(recording_id=first.id, destination="rdio", status="failed")])
+        session.commit()
+    got = listener.get("/api/stats?days=7").json()
+    assert got["totals"]["calls"] == 3 and got["totals"]["today"] == 2 and len(got["per_day"]) == 7
+    assert got["per_day"][-1]["calls"] == 2 and got["per_day"][-2]["calls"] == 1
+    assert got["by_hour"][today_noon.weekday()][12] == 2
+    assert [c["name"] for c in got["channels"]] == ["Fire", "Net"] and got["channels"][0]["seconds"] == 60
+    assert got["sdrs"][0]["name"] in ("Roof", "Field") and 0 < got["sdrs"][0]["busy"] < 1
+    assert "uploads" not in got  # listeners don't see upload results
+    uploads = {u["destination"]: u for u in admin.get("/api/stats?days=7").json()["uploads"]}
+    assert uploads["broadcastify"]["sent"] == 1 and uploads["rdio"]["failed"] == 1
+    assert admin.get("/api/stats?days=30").json()["totals"]["calls"] == 3
+    assert admin.get("/api/stats?days=90").json()["totals"]["calls"] == 4
+    assert admin.get("/api/stats?days=12345").json()["days"] == 30

@@ -16,6 +16,8 @@
   --green: #0a6200;
   --amber: #7a4f00;
   --touch: 44px;
+  --viz: #2a78d6;        /* the one chart hue (blue 450), checked on #ffffff */
+  --viz-track: #cde2fb;  /* a lighter step of the same ramp, for meter tracks */
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -32,6 +34,8 @@
     --red: #ff8a80;
     --green: #8fd98a;
     --amber: #e6c060;
+    --viz: #3987e5;        /* blue 400, checked on #202020 */
+    --viz-track: #184f95;
   }
 }
 
@@ -98,6 +102,41 @@ main { padding: .6rem; max-width: 1100px; margin: 0 auto; }
 .warning-list a, .warning-one { color: inherit; }
 .now-playing { position: sticky; top: env(safe-area-inset-top, 0px); z-index: 5; background: var(--box); border: 2px solid var(--ink); padding: .5rem .6rem; margin-bottom: .75rem; }
 .now-playing .buttons { margin-bottom: 0; }
+/* --- activity charts --- */
+.viz.refreshing { opacity: .55; transition: opacity .2s; }
+.tiles { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .5rem; margin-bottom: .75rem; }
+.tile { background: var(--box); border: 1px solid var(--rule); padding: .5rem .6rem; }
+.tile-value { font-size: 1.5rem; font-weight: 600; }
+.chart { position: relative; }
+.columns { display: block; max-width: 100%; overflow: visible; }
+.columns .mark { fill: var(--viz); }
+.columns .grid { stroke: var(--rule); stroke-width: 1; opacity: .35; vector-effect: non-scaling-stroke; }
+.columns .axis { fill: var(--dim); font-size: 11px; }
+.columns .hit { fill: transparent; outline: none; }
+.columns .hit:hover, .columns .hit:focus-visible { fill: var(--ink); fill-opacity: .06; }
+.tip { position: absolute; transform: translate(-50%, calc(-100% - 6px)); background: var(--box); border: 1px solid var(--rule); padding: .25rem .45rem; pointer-events: none; white-space: nowrap; z-index: 3; box-shadow: 0 1px 3px rgba(0,0,0,.15); }
+.tip.tip-start { transform: translate(0, calc(-100% - 6px)); }
+.tip.tip-end { transform: translate(-100%, calc(-100% - 6px)); }
+.heat { max-width: 46rem; display: grid; grid-template-columns: 2.4em repeat(24, minmax(0, 1fr)); gap: 2px; align-items: center; }
+.heat .cell { aspect-ratio: 1; border-radius: 2px; background: color-mix(in srgb, var(--viz) calc(var(--level) * 100%), transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--rule) 25%, transparent); outline: none; }
+.heat .cell:hover, .heat .cell:focus-visible { box-shadow: inset 0 0 0 2px var(--ink); }
+.heat .axis-h, .heat .axis-d { font-size: 11px; color: var(--dim); text-align: center; }
+.heat .axis-d { text-align: left; }
+.heat-key { display: flex; align-items: center; gap: .4rem; margin-top: .4rem; }
+.heat-key .ramp { width: 6rem; height: .6rem; border-radius: 2px; background: linear-gradient(to right, color-mix(in srgb, var(--viz) 12%, transparent), var(--viz)); }
+.rank { display: grid; grid-template-columns: minmax(0, 7rem) minmax(0, 1fr); gap: .5rem; align-items: center; margin: .35rem 0; }
+.rank-name { overflow-wrap: anywhere; font-size: .875rem; }
+.rank-track { display: flex; align-items: center; gap: .4rem; min-width: 0; }
+.rank-bar { height: 14px; min-width: 2px; background: var(--viz); border-radius: 0 4px 4px 0; flex: none; width: calc((100% - 8.5rem) * var(--share)); }  /* room kept for the value */
+.rank-value { font-size: .8rem; color: var(--dim); white-space: nowrap; }
+.table-scroll { overflow-x: auto; }
+.chart details summary { padding: .45rem 0; }
+table.data { border-collapse: collapse; font-size: .875rem; margin-top: .4rem; }
+table.data th, table.data td { border: 1px solid var(--rule); padding: .15rem .4rem; text-align: right; font-variant-numeric: tabular-nums; }
+table.data th:first-child, table.data td:first-child { text-align: left; }
+.meter { display: inline-block; width: 4rem; height: 8px; border-radius: 4px; background: var(--viz-track); vertical-align: middle; overflow: hidden; }
+.meter > span { display: block; height: 100%; background: var(--viz); }
+@media (min-width: 760px) { .tiles { grid-template-columns: repeat(4, minmax(0, 1fr)); } .rank { grid-template-columns: 14rem minmax(0, 1fr); } }
 .copyable { user-select: all; overflow-wrap: anywhere; }
 .secret { font-family: Consolas, Menlo, monospace; overflow-wrap: anywhere; user-select: all; background: var(--page); border: 1px solid var(--rule); padding: .4rem; margin-top: .3rem; }
 

@@ -225,6 +225,10 @@ A stick that stays connected but stops working may not show a fault, because it 
 
 Only calls that finish after you start are played, never a backlog. Browsers only play sound after a click on the page, so autoplay starts from the tick or **Start scanning**; if one still blocks it, select **Play** once.
 
+## Activity
+
+The Activity page shows the last 7, 30 or 90 days: calls and airtime, calls per day, the busiest hours of the week as a heatmap (in the master's time zone), the busiest channels, and how much of the time each SDR spent in a call. Admins and operators also see upload results per service: sent, skipped as duplicates, failed and waiting. Hover or tab to a column or cell for its numbers, and each chart has **Show as a table**. Anyone who can play recordings can open it.
+
 ## Keyword alerts
 
 Under **My account > Keywords**, each user keeps their own words and phrases to watch for, in call transcripts, ACARS messages, or both. Matching ignores case and takes whole words: "fire" matches "Fire!" but not "firefighter", and a phrase matches across a line break. Only you see your keywords.
