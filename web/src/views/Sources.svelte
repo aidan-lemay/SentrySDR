@@ -29,6 +29,9 @@
   const isAdmin = user.role === 'admin';
   const canAssign = isAdmin || user.permissions.includes('assign');
   const MODE_LABELS = { adsb: 'ADS-B', rtltcp: 'rtl_tcp' };
+  // What to paste into GQRX's Device string. The buffer settings help over a network.
+  const gqrxString = (address) => `rtl_tcp=${address},buffers=16,psize=16384`;
+  const wildcard = (address) => /^(0\.0\.0\.0|::|\[::\]):/.test(address);
   // Only administrators can put an SDR on rtl_tcp. The current one stays listed so the picker shows it.
   const assignable = (source) => targets.filter((t) => t.kind !== 'rtltcp' || isAdmin || t.id === source.base_target_id);
   // Only voice targets make calls. An idle SDR still offers the calls it made before.
@@ -227,14 +230,16 @@
                 {/if}
                 {#if canAssign && source.feeds?.local_clients != null}<br /><span class="small">Local port: {source.feeds.local_clients} program{source.feeds.local_clients === 1 ? '' : 's'} reading</span>{/if}
                 {#if canAssign && source.rtl_tcp?.address}
-                  <br /><span class="small">rtl_tcp on <span class="mono">{source.rtl_tcp.address}</span>, <span class={source.rtl_tcp.client ? 'st-ok' : ''}>{source.rtl_tcp.client ? 'a program is connected' : 'waiting for a program to connect'}</span></span>
+                  <br /><span class="small">rtl_tcp, <span class={source.rtl_tcp.client ? 'st-ok' : ''}>{source.rtl_tcp.client ? 'a program is connected' : 'waiting for a program to connect'}</span>. GQRX device string:</span>
+                  <br /><span class="mono small copyable" title="Double-click to select">{gqrxString(source.rtl_tcp.address)}</span>
+                  {#if wildcard(source.rtl_tcp.address)}<br /><span class="small st-warn">It listens on every address, so replace {source.rtl_tcp.address.replace(/:\d+$/, '')} with this machine's own.</span>{/if}
                 {/if}
                 {#if canAssign && source.feeds?.sending?.length}<br /><span class="small">Sending to {source.feeds.sending.map(feedLabel).join(', ')}</span>{/if}
               </div>
             </td>
             <td data-label="Last activity"><span class="small">{formatTime(source.last_call_at)}</span></td>
-            <td>
-              <div class="buttons" style="margin:0">
+            <td class="actions">
+              <div class="buttons">
                 {#if can('listen_live') && source.active_target?.kind === 'audio'}
                   <button onclick={() => (listening = listening === source.id ? null : source.id)}>{listening === source.id ? 'Stop' : 'Listen'}</button>
                 {/if}

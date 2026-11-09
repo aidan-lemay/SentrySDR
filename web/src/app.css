@@ -108,6 +108,7 @@ button, .button {
   font: inherit; color: var(--ink); background: var(--button);
   border: 1px solid var(--rule); border-radius: 2px;
   min-height: var(--touch); padding: 0 .75rem; cursor: pointer; text-decoration: none;
+  white-space: nowrap;  /* a label never breaks inside its button; rows of buttons still wrap */
 }
 button:active:not(:disabled), .button:active { background: var(--button-down); }
 button:disabled { color: var(--dim); cursor: default; opacity: .7; }
@@ -156,7 +157,8 @@ legend { font-weight: bold; padding: 0 .3rem; }
 .table td[data-label] { display: grid; grid-template-columns: 6.5rem minmax(0, 1fr); gap: .5rem; }
 .table td[data-label]::before { content: attr(data-label); color: var(--dim); font-size: .875rem; }
 .table td.empty { color: var(--dim); }
-.table td.wide-only { display: none; }  /* an empty cell keeps desktop columns lined up */
+.table td.wide-only { display: none; }
+.table td.actions .buttons { margin: 0; }  /* an empty cell keeps desktop columns lined up */
 .table .title-cell { font-weight: bold; }
 
 /* --- calls --- */
@@ -209,6 +211,7 @@ audio { width: 100%; }
   }
   .table td[data-label]::before { content: none; }
   .table td.wide-only { display: table-cell; }
+  .table td.actions { width: 1%; }  /* as wide as its widest button, no wider */
   .table .title-cell { font-weight: normal; }
 
   .tabs { display: flex; flex-wrap: wrap; gap: 2px; margin-bottom: .75rem; }

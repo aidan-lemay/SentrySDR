@@ -277,7 +277,7 @@ An **rtl_tcp** target hands an SDR to `rtl_tcp`, so a program such as GQRX or SD
 2. **Check the port** under **Admin > SDR sources**. Each SDR gets one automatically, 1234 and up, unique per machine. If the machine has a firewall, allow that port from your network (see [nftables.example.conf](deploy/nftables.example.conf)).
 3. **Make a target** on the Targets page with the type **rtl_tcp**, and a starting frequency.
 4. **Assign it** to the SDR on the Sources page, or schedule it. The SDR's status then shows the address to use, such as `192.168.1.20:1234`, and whether a program is connected.
-5. **In GQRX**, choose the device *Other*, with the string `rtl_tcp=192.168.1.20:1234`. In SDR++, choose the RTL-TCP source and enter the address and port.
+5. **In GQRX**, choose the device *Other* and paste the device string the SDR's status shows, such as `rtl_tcp=192.168.1.20:1234,buffers=16,psize=16384`; the buffer settings help over a network. In SDR++, choose the RTL-TCP source and enter the address and port.
 
 - Only administrators can create, assign or schedule rtl_tcp targets. Operators see them, and can still move an SDR onto another target, which closes the port.
 - rtl_tcp serves one program at a time. The program sets the frequency, gain and sample rate itself.
