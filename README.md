@@ -146,7 +146,7 @@ Each permission except the admin-only ones can be allowed or denied per user, un
 | SDR sources | Each SDR's name, description, antenna, gain, frequency correction and capabilities |
 | Antennas | Antennas and their frequency ranges |
 | Nodes | Slaves: create a one-time enrolment token, or revoke a slave |
-| Settings | How long recordings, ACARS messages and audit logs are kept (0 keeps them forever); sign-ups; the map tile server |
+| Settings | How long recordings, ACARS messages and audit logs are kept (0 keeps them forever); a size limit for recordings; sign-ups; the map tile server; a backup download |
 | Uploads and feeds | RDIO and ClearCut servers and keys; the Broadcastify upload address and systems; the airframes.io station ID and address |
 
 Upload API keys are never shown again once saved. Leave a key's box blank to keep it.
@@ -357,11 +357,26 @@ sudo ./scripts/install.sh master        # or slave; add --with-decoders to rebui
 sudo systemctl restart sentrysdr
 ```
 
-Re-running the script keeps the configuration file, database, recordings and keys. It replaces `/opt/sentrysdr`, so don't keep anything of your own there. Database changes apply on the first start. The decoders only need rebuilding with `--with-decoders` if you want newer versions of them. Upgrade the master and slaves together: measuring and detecting SDRs on a slave need matching versions.
+Re-running the script keeps the configuration file, database, recordings and keys. It replaces `/opt/sentrysdr`, so don't keep anything of your own there. Database changes apply on the first start. The decoders only need rebuilding with `--with-decoders` if you want newer versions of them. Upgrade the master and slaves together: measuring, detecting and restarting SDRs on a slave need matching versions. **Admin > Nodes** shows each machine's version and a build ID that changes with any change to the code, and warns when a slave's differs from the master's.
+
+## Health warnings
+
+Admins and operators see a banner at the top of every page when something needs attention. It's checked every 30 seconds:
+
+- a slave offline for more than 5 minutes, or running a different version from the master
+- an SDR in use that shows a fault, such as **SDR disconnected**
+- uploads that failed in the last day
+- a machine whose clock isn't synced, or is more than 5 seconds off the master's (Broadcastify rejects calls with wrong times)
+- a recordings disk with less than 2 GB or 5% free
+- protected recordings that alone exceed the recordings size limit
+
+Each warning links to the page to look at. Warnings only appear in SentrySDR for now; nothing is sent by email or other notification. A recordings **size limit** under **Admin > Settings** (0 means none) deletes the oldest unprotected recordings once all of them together pass it, as well as the limit in days.
 
 ## Backups
 
-Everything the master knows is in `data_dir` (`/var/lib/sentrysdr` by default):
+The quickest way is **Download backup** under **Admin > Settings**: it asks for your password again, and gives one file holding a consistent copy of the database and `secret.key`, taken while the service runs. Recordings aren't in it. It's recorded in the audit log, and the file holds every account and API key, so keep it private.
+
+To back up by hand, everything the master knows is in `data_dir` (`/var/lib/sentrysdr` by default):
 
 - `sentrysdr.db`: users, settings, SDRs, targets, schedules, recordings' details, ACARS messages. Back it up while the service is stopped, or with `sqlite3 sentrysdr.db ".backup /path/to/copy.db"` while it runs.
 - `secret.key`: decrypts the upload API keys and two-factor secrets in the database. Without it, those have to be entered again. Keep it as private as the database.

@@ -92,6 +92,10 @@ main { padding: .6rem; max-width: 1100px; margin: 0 auto; }
 .warn { border: 2px solid var(--amber); }
 .notice { display: flex; justify-content: space-between; align-items: flex-start; gap: .6rem; width: 100%; min-height: 0; text-align: left; border-radius: 0; }
 .notice-x { color: var(--dim); font-size: 1.1rem; line-height: 1; }
+.link-button { background: none; border: 0; padding: 0; min-height: 0; font: inherit; color: inherit; text-align: left; white-space: normal; cursor: pointer; text-decoration: underline; }
+.warning-list { margin: .4rem 0 0; padding-left: 1.2rem; }
+.warning-list li { margin: .2rem 0; }
+.warning-list a, .warning-one { color: inherit; }
 .copyable { user-select: all; overflow-wrap: anywhere; }
 .secret { font-family: Consolas, Menlo, monospace; overflow-wrap: anywhere; user-select: all; background: var(--page); border: 1px solid var(--rule); padding: .4rem; margin-top: .3rem; }
 

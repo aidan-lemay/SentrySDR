@@ -1,5 +1,6 @@
 <script>
   import { onMount } from 'svelte';
+  import Warnings from './Warnings.svelte';
   import { api, setSignedOutHandler } from './lib.js';
   import Auth from './views/Auth.svelte';
   import Sources from './views/Sources.svelte';
@@ -86,6 +87,7 @@
     {/if}
   </header>
   <main>
+    {#if !user.must_change_password && (user.role === 'admin' || user.role === 'operator')}<Warnings />{/if}
     {#if user.must_change_password}
       <Account {user} onChange={refreshUser} forced />
     {:else if view === 'schedule'}

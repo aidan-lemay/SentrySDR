@@ -1,6 +1,6 @@
 <script>
   import { onMount, tick } from 'svelte';
-  import { ANTENNA_UNITS, DEFAULT_GAIN_DB, OTHER_USES, RECORDED_USES, api, formatRange, formatRanges, formatTime, nearestStep } from '../lib.js';
+  import { ANTENNA_UNITS, DEFAULT_GAIN_DB, formatSize, OTHER_USES, RECORDED_USES, api, formatRange, formatRanges, formatTime, nearestStep } from '../lib.js';
   import Notice from '../Notice.svelte';
   import { clearAfter, NOTICE_MS } from '../notice.svelte.js';
   import GainField from '../GainField.svelte';
@@ -335,6 +335,7 @@
       clearcut_page_url: settings.clearcut_page_url, map_tile_url: settings.map_tile_url,
       broadcastify_server: settings.broadcastify_server,
       message_retention_days: Number(settings.message_retention_days),
+      recording_retention_gb: Number(settings.recording_retention_gb || 0),
       airframes_station_id: settings.airframes_station_id.trim(), airframes_feed: settings.airframes_feed.trim(),
     };
     for (const name of ['rdio_api_key', 'clearcut_api_key']) {
@@ -344,6 +345,38 @@
     if (reply) {
       settings = reply;
       keys = { rdio_api_key: '', clearcut_api_key: '' };
+    }
+  }
+
+  // --- backup
+  let backupPassword = $state('');
+  let backingUp = $state(false);
+
+  async function downloadBackup(event) {
+    event.preventDefault();
+    backingUp = true;
+    error = '';
+    try {
+      const response = await fetch('api/admin/backup', {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json', 'X-SentrySDR': '1' },
+        body: JSON.stringify({ password: backupPassword }),
+      });
+      if (!response.ok) {
+        error = (await response.json().catch(() => ({}))).detail ?? `Backup failed (${response.status})`;
+        scrollTo(0, 0);
+        return;
+      }
+      const name = /filename="?([^";]+)"?/.exec(response.headers.get('content-disposition') ?? '')?.[1] ?? 'sentrysdr-backup.tar.gz';
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(await response.blob());
+      link.download = name;
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(link.href), 10000);
+      backupPassword = '';
+      message = 'Backup downloaded.';
+    } finally {
+      backingUp = false;
     }
   }
 
@@ -720,7 +753,7 @@
   {/if}
   <div class="box">
     <table class="table">
-      <thead><tr><th>Name</th><th>Type</th><th>Status</th><th>SDRs</th><th>Last address</th><th>Actions</th></tr></thead>
+      <thead><tr><th>Name</th><th>Type</th><th>Status</th><th>Version</th><th>SDRs</th><th>Last address</th><th>Actions</th></tr></thead>
       {#each nodes as node (node.id)}
         <tbody>
           <tr>
@@ -729,6 +762,12 @@
             <td data-label="Status">
               <span>
                 <span class={statusClass(node.status)}>{node.status}</span>{#if node.status === 'active'}, <span class={node.online ? 'st-ok' : 'st-warn'}>{node.online ? 'online' : 'offline'}</span>{/if}
+              </span>
+            </td>
+            <td data-label="Version">
+              <span class="small">
+                {node.version ?? 'Unknown'}{#if node.build}{' '}<span class="mono dim">{node.build}</span>{/if}
+                {#if !node.matches_master && node.status === 'active' && !node.is_local}<br /><span class="st-warn">Differs from this server. Upgrade it.</span>{/if}
               </span>
             </td>
             <td data-label="SDRs"><span class="mono small">{node.serials.join(', ') || 'None'}</span></td>
@@ -826,6 +865,10 @@
         <input type="number" inputmode="numeric" min="0" bind:value={settings.audit_retention_days} />
         <span class="hint">0 keeps them forever.</span>
       </label>
+      <label class="field"><span>Recordings size limit (GB)</span>
+        <input type="number" inputmode="decimal" min="0" step="any" bind:value={settings.recording_retention_gb} />
+        <span class="hint">0 means no limit. Over it, the oldest unprotected recordings are deleted first. Using {formatSize(settings.recordings_bytes)}{settings.disk ? `, with ${formatSize(settings.disk.free)} free on that disk` : ''}.</span>
+      </label>
       <label class="field"><span>ACARS messages (days)</span>
         <input type="number" inputmode="numeric" min="0" bind:value={settings.message_retention_days} />
         <span class="hint">0 keeps them forever.</span>
@@ -872,6 +915,16 @@
     {/if}
     <div class="buttons"><button class="main">{tab === 'uploads' ? 'Save uploads and feeds' : 'Save settings'}</button></div>
   </form>
+  {#if tab === 'settings'}
+    <form onsubmit={downloadBackup}>
+      <fieldset>
+        <legend>Backup</legend>
+        <p class="small">The database and <span class="mono">secret.key</span>, as one file: every account, setting, SDR, target, schedule and recording's details, and the key that decrypts the saved API keys. Recordings themselves aren't included. Keep the file private.</p>
+        <label class="field"><span>Your password</span><input type="password" bind:value={backupPassword} required autocomplete="current-password" /></label>
+        <div class="buttons form-buttons"><button disabled={backingUp}>{backingUp ? 'Preparing...' : 'Download backup'}</button></div>
+      </fieldset>
+    </form>
+  {/if}
   {#if tab === 'uploads'}
   <form onsubmit={saveSystem}>
     <fieldset>

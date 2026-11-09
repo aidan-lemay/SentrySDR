@@ -2125,3 +2125,132 @@ def test_restart_routes_are_admin_only_and_reach_the_node(ctx, admin, operator):
     with ctx.db() as session:
         actions = [a.action for a in session.scalars(select(AuditLog))]
     assert "source.restarted" in actions and "node.service_restarted" in actions
+
+
+# --- machine health -------------------------------------------------------------------
+import sentrysdr as sentrysdr_package
+from sentrysdr import health as health_module
+from sentrysdr.web.routes_nodes import clean_health
+
+
+def add_slave(ctx, name="Field", online=True, build=None, version="0.1.0", last_seen=None):
+    with ctx.db() as session:
+        node = Node(name=name, status="active", serials=["FIELD1"], build=build, version=version,
+                    last_seen_at=last_seen if last_seen is not None else time.time())
+        session.add(node)
+        session.commit()
+        node_id = node.id
+    if online:
+        ctx.node_links[node_id] = SimpleNamespace(send=lambda m: None)
+    return node_id
+
+
+def warnings_text(client):
+    return " | ".join(w["text"] for w in client.get("/api/warnings").json())
+
+
+def test_node_versions_shown_and_compared(ctx, admin):
+    add_slave(ctx, "Same", build=sentrysdr_package.BUILD_ID, version=sentrysdr_package.__version__)
+    add_slave(ctx, "Old", build="0123456789ab", version="0.1.0")
+    nodes = {n["name"]: n for n in admin.get("/api/nodes").json()}
+    local = next(n for n in nodes.values() if n["is_local"])
+    assert local["version"] == sentrysdr_package.__version__ and local["matches_master"] is True
+    assert nodes["Same"]["matches_master"] is True and nodes["Old"]["matches_master"] is False
+    assert "Old runs a different version (0.1.0)" in warnings_text(admin) and "Same runs" not in warnings_text(admin)
+
+
+def test_health_warnings(ctx, admin, operator, listener, monkeypatch):
+    add_slave(ctx, "Gone", online=False, last_seen=time.time() - 3600)
+    add_slave(ctx, "Briefly", online=False, last_seen=time.time() - 30)
+    skewed = add_slave(ctx, "Skewed", build=sentrysdr_package.BUILD_ID)
+    ctx.node_health[skewed] = clean_health({"time": time.time() - 40, "clock_synced": True, "disk": {"free": 10**12, "total": 2 * 10**12}})
+    unsynced = add_slave(ctx, "Unsynced", build=sentrysdr_package.BUILD_ID)
+    ctx.node_health[unsynced] = clean_health({"time": time.time(), "clock_synced": False, "disk": {"free": 10**8, "total": 10**11}})
+    monkeypatch.setattr(health_module, "clock_synced", lambda: True)
+    monkeypatch.setattr(health_module, "disk", lambda path: {"free": 10**12, "total": 2 * 10**12})
+    text = warnings_text(admin)
+    assert "Gone is offline since" in text and "Briefly" not in text
+    assert "Skewed's clock is 40 seconds off" in text
+    assert "Unsynced's clock isn't synced" in text and "Unsynced has 0.1 GB free" in text
+    assert text == warnings_text(operator)
+    assert listener.get("/api/warnings").json() == []
+
+
+def test_sdr_faults_and_failed_uploads_warn(ctx, admin, monkeypatch):
+    monkeypatch.setattr(health_module, "clock_synced", lambda: True)
+    monkeypatch.setattr(health_module, "disk", lambda path: {"free": 10**12, "total": 2 * 10**12})
+    source = make_source(admin, name="Roof stick")
+    admin.post(f"/api/sources/{source}/assign", json={"target_id": make_target(admin)}).raise_for_status()
+    ctx.set_status(ctx.local_node_id, "SER1", {"state": "error", "error": "SDR disconnected"})
+    assert "Roof stick: SDR disconnected" in warnings_text(admin)
+    with ctx.db() as session:
+        session.add(Recording(id=str(uuid.uuid4()), started_at=time.time() - 60, ended_at=time.time(), duration=5, rel_path="x.mp3"))
+        session.flush()
+        rec_id = session.scalars(select(Recording)).first().id
+        session.add_all([UploadJob(recording_id=rec_id, destination="rdio", status="failed"),
+                         UploadJob(recording_id=rec_id, destination="clearcut", status="failed")])
+        session.commit()
+    assert "2 uploads failed in the last day" in warnings_text(admin)
+
+
+def test_clean_health_report():
+    report = clean_health({"time": "nonsense", "clock_synced": "yes", "disk": {"free": -1, "total": 5}})
+    assert report["skew"] is None and report["clock_synced"] is None and "disk" not in report
+
+
+def test_kernel_clock_reading_works_here():
+    assert health_module.clock_synced() in (True, False, None)
+
+
+def add_recording(ctx, age_days, size, protected=False):
+    call = str(uuid.uuid4())
+    path = ctx.cfg.recordings_dir / f"{call}.mp3"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"ID3" + b"x" * 10)
+    with ctx.db() as session:
+        session.add(Recording(id=call, started_at=time.time() - age_days * 86400, ended_at=time.time(), duration=5,
+                              rel_path=path.name, size_bytes=size, protected=protected))
+        session.commit()
+    return call, path
+
+
+def test_size_limit_removes_oldest_unprotected_first(ctx, admin):
+    ctx.set_setting("recording_retention_days", "0")
+    oldest_protected = add_recording(ctx, 10, 400_000_000, protected=True)
+    old, old_path = add_recording(ctx, 9, 400_000_000)
+    middle, _ = add_recording(ctx, 5, 400_000_000)
+    new, _ = add_recording(ctx, 1, 400_000_000)
+    admin.patch("/api/admin/settings", json={"recording_retention_gb": 1}).raise_for_status()
+    assert ctx.apply_retention()["over_size"] == 2
+    with ctx.db() as session:
+        left = {r.id for r in session.scalars(select(Recording))}
+    assert left == {oldest_protected[0], new} and not old_path.exists()
+    assert admin.get("/api/admin/settings").json()["recordings_bytes"] == 800_000_000
+
+
+def test_protected_recordings_over_the_limit_warn(ctx, admin, monkeypatch):
+    monkeypatch.setattr(health_module, "clock_synced", lambda: True)
+    monkeypatch.setattr(health_module, "disk", lambda path: {"free": 10**12, "total": 2 * 10**12})
+    add_recording(ctx, 1, 2_000_000_000, protected=True)
+    ctx.set_setting("recording_retention_gb", "1")
+    ctx.apply_retention()
+    assert "Protected recordings alone (2.0 GB) exceed the 1 GB limit" in warnings_text(admin)
+
+
+def test_backup_needs_the_password_and_holds_the_database(ctx, admin, operator, tmp_path):
+    import io, tarfile
+    assert operator.post("/api/admin/backup", json={"password": PASSWORD}).status_code == 403
+    assert admin.post("/api/admin/backup", json={"password": "wrong-password-123"}).status_code == 403
+    reply = admin.post("/api/admin/backup", json={"password": PASSWORD})
+    assert reply.status_code == 200 and reply.headers["content-type"] == "application/gzip"
+    with tarfile.open(fileobj=io.BytesIO(reply.content)) as tar:
+        names = tar.getnames()
+        tar.extractall(tmp_path / "restore", filter="data")
+    assert sorted(names) == ["secret.key", "sentrysdr.db"]
+    copy = sqlite3.connect(tmp_path / "restore" / "sentrysdr.db")
+    assert copy.execute("SELECT count(*) FROM users WHERE email = ?", (ADMIN_EMAIL,)).fetchone()[0] == 1
+    copy.close()
+    assert (tmp_path / "restore" / "secret.key").read_bytes() == (ctx.cfg.data_dir / "secret.key").read_bytes()
+    assert list(ctx.cfg.data_dir.glob("backup-*")) == []  # the temporary copy is gone
+    with ctx.db() as session:
+        assert session.scalar(select(AuditLog).where(AuditLog.action == "admin.backup_downloaded"))

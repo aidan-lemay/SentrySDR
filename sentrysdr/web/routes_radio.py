@@ -31,6 +31,15 @@ MAX_ANTENNA_RANGES = 20
 _live_counts: dict[int, int] = {}
 
 
+# --- health ----------------------------------------------------------------
+@router.get("/warnings")
+def health_warnings(request: Request, user: User = Depends(current_user)):
+    """Machine problems, for admins and operators. Others see an empty list."""
+    if user.role not in ("admin", "operator"):
+        return []
+    return ctx_of(request).health_warnings()
+
+
 # --- antennas --------------------------------------------------------------
 class RangeBody(BaseModel):
     low_hz: int = Field(ge=0, le=10_000_000_000)

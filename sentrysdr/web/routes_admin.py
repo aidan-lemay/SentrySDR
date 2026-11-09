@@ -2,19 +2,27 @@
 from __future__ import annotations
 
 import ipaddress
+import os
 import secrets as pysecrets
+import shutil
+import sqlite3
+import tarfile
+import tempfile
+import time
+from pathlib import Path
 from urllib.parse import urlsplit
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import or_, select
 
-from .. import acars, security, uploaders
+from .. import acars, health, security, uploaders
 from ..context import SECRET_SETTINGS, SETTING_DEFAULTS
 from ..models import AuditLog, Ban, BroadcastifySystem, Target, User, UserSession
 from .deps import ALL_PERMISSIONS, admin_user, ctx_of, effective_permissions, get_db, ip_of
-from .routes_account import check_new_password, normalize_email, revoke_sessions
+from .routes_account import check_new_password, confirm_password, normalize_email, revoke_sessions
 
 router = APIRouter(prefix="/api/admin", dependencies=[Depends(admin_user)])
 
@@ -292,12 +300,15 @@ def get_settings(request: Request):
     values.update({f"{key}_set": bool(ctx.get_setting(key)) for key in SECRET_SETTINGS})
     values["recordings_dir"] = str(ctx.cfg.recordings_dir)
     values["log_dir"] = str(ctx.cfg.log_dir)
+    values["recordings_bytes"] = ctx.recordings_size()
+    values["disk"] = health.disk(ctx.cfg.recordings_dir)
     return values
 
 
 class SettingsBody(BaseModel):
     audit_retention_days: int | None = Field(default=None, ge=0, le=36500)
     recording_retention_days: int | None = Field(default=None, ge=0, le=36500)
+    recording_retention_gb: float | None = Field(default=None, ge=0, le=1_000_000)
     registration_open: bool | None = None
     rdio_server: str | None = Field(default=None, max_length=500)
     rdio_api_key: str | None = Field(default=None, max_length=500)
@@ -336,3 +347,40 @@ def update_settings(body: SettingsBody, request: Request, admin: User = Depends(
         changed.append(key)
     ctx.audit("admin.settings_updated", user=admin, ip=ip_of(request), details={"keys": changed})
     return get_settings(request)
+
+
+# --- backup ----------------------------------------------------------------
+class BackupBody(BaseModel):
+    password: str = Field(max_length=security.MAX_PASSWORD_LENGTH)
+
+
+@router.post("/backup")
+def backup(body: BackupBody, request: Request, background: BackgroundTasks, admin: User = Depends(admin_user)):
+    """The database and the key that decrypts its secrets, as one file. Recordings aren't included.
+
+    It holds every account, setting and API key, so it needs the admin's password again.
+    """
+    ctx = ctx_of(request)
+    confirm_password(ctx, admin, body.password, "Password is incorrect")
+    folder = Path(tempfile.mkdtemp(prefix="backup-", dir=ctx.cfg.data_dir))
+    background.add_task(shutil.rmtree, folder, True)
+    copy = folder / "sentrysdr.db"
+    source = sqlite3.connect(ctx.cfg.data_dir / "sentrysdr.db")
+    try:
+        target = sqlite3.connect(copy)
+        with target:
+            source.backup(target)  # consistent while the service keeps writing
+        target.close()
+    finally:
+        source.close()
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    archive = folder / f"sentrysdr-backup-{stamp}.tar.gz"
+    with tarfile.open(archive, "w:gz") as tar:
+        tar.add(copy, arcname="sentrysdr.db")
+        key = ctx.cfg.data_dir / "secret.key"
+        if key.is_file():
+            tar.add(key, arcname="secret.key")
+    os.chmod(archive, 0o600)
+    ctx.audit("admin.backup_downloaded", user=admin, ip=ip_of(request))
+    return FileResponse(archive, media_type="application/gzip", filename=archive.name,
+                        headers={"Cache-Control": "no-store"})

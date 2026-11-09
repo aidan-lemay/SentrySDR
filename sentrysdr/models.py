@@ -83,6 +83,8 @@ class Node(Base):
     last_seen_at: Mapped[float | None] = mapped_column(nullable=True)
     last_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[float] = mapped_column(default=now)
+    version: Mapped[str | None] = mapped_column(String(32), nullable=True)  # as the node reported it
+    build: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
 
 class Source(Base):

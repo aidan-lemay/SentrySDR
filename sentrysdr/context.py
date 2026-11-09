@@ -18,10 +18,10 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import httpx
-from sqlalchemy import delete, or_, select
+from sqlalchemy import delete, func, or_, select
 
 from . import aio
-from . import acars, capabilities, pipelines, schedule, uploaders
+from . import BUILD_ID, __version__, acars, capabilities, health, pipelines, schedule, uploaders
 from .config import Config
 from .engine import MeasureError, Supervisor
 from .live import LiveHub
@@ -43,6 +43,7 @@ SETTING_DEFAULTS = {
     "broadcastify_server": "https://api.broadcastify.com/call-upload",
     "map_tile_url": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
     "message_retention_days": "30",
+    "recording_retention_gb": "0",
     "airframes_station_id": "",
     "airframes_feed": acars.AIRFRAMES_DEFAULT,
 }
@@ -86,6 +87,10 @@ TRANSCRIPT_WINDOW_SECONDS = 86400
 TRANSCRIPT_POLL_SECONDS = 60
 TRANSCRIPT_MAX_LOOKUPS = 20
 NODE_OFFLINE_SECONDS = 45
+NODE_OFFLINE_WARN_SECONDS = 300
+CLOCK_SKEW_WARN_SECONDS = 5
+DISK_WARN_BYTES = 2_000_000_000
+DISK_WARN_FRACTION = 0.05
 
 
 def setup_logging(cfg: Config) -> None:
@@ -117,6 +122,7 @@ class Context:
         self.limiter = RateLimiter()
         self.enumerate = enumerate_fn
         self.status: dict[tuple[int, str], dict] = {}
+        self.node_health: dict[int, dict] = {}  # each slave's latest clock and disk report
         self.tracks: dict[str, dict[str, dict]] = {"adsb": {}, "ais": {}}
         self.live = LiveHub(cfg, self._live_demand)
         self.node_links: dict[int, object] = {}
@@ -597,7 +603,7 @@ class Context:
 
     def apply_retention(self, now: float | None = None) -> dict:
         now = now or time.time()
-        removed = {"recordings": 0, "audit": 0, "messages": 0}
+        removed = {"recordings": 0, "audit": 0, "messages": 0, "over_size": 0}
         message_days = int(self.get_setting("message_retention_days") or 0)
         recording_days = int(self.get_setting("recording_retention_days") or 0)
         audit_days = int(self.get_setting("audit_retention_days") or 0)
@@ -613,6 +619,9 @@ class Context:
                     session.delete(recording)
                     removed["recordings"] += 1
             removed["sessions"] = session.execute(delete(UserSession).where(UserSession.expires_at < now)).rowcount
+            limit_gb = float(self.get_setting("recording_retention_gb") or 0)
+            if limit_gb > 0:
+                removed["over_size"] = self._trim_to_size(session, int(limit_gb * 1e9))
             if message_days > 0:
                 result = session.execute(delete(AcarsMessage).where(AcarsMessage.received_at < now - message_days * 86400))
                 removed["messages"] = result.rowcount
@@ -622,6 +631,80 @@ class Context:
                 self._expire_audit_files(now - audit_days * 86400)
             session.commit()
         return removed
+
+    def _trim_to_size(self, session, limit: int) -> int:
+        """Delete the oldest unprotected recordings until all of them fit in limit bytes."""
+        total = session.scalar(select(func.coalesce(func.sum(Recording.size_bytes), 0)))
+        removed = 0
+        while total > limit:
+            batch = list(session.scalars(select(Recording).where(Recording.protected.is_(False))
+                                         .order_by(Recording.started_at).limit(200)))
+            if not batch:
+                break  # only protected recordings are left
+            for recording in batch:
+                if total <= limit:
+                    break
+                path = self.recording_path(recording)
+                if path:
+                    path.unlink(missing_ok=True)
+                total -= recording.size_bytes or 0
+                session.delete(recording)
+                removed += 1
+            session.flush()
+        return removed
+
+    def recordings_size(self) -> int:
+        with self.db() as session:
+            return session.scalar(select(func.coalesce(func.sum(Recording.size_bytes), 0)))
+
+    # --- health ------------------------------------------------------------
+    def health_warnings(self) -> list[dict]:
+        """Problems an admin or operator should know about. Each has a level, text and a page to look at."""
+        warnings: list[dict] = []
+        now_ = time.time()
+
+        def add(level: str, text: str, page: str) -> None:
+            warnings.append({"level": level, "text": text, "page": page})
+
+        with self.db() as session:
+            for node in session.scalars(select(Node).where(Node.status == "active")):
+                online = self.node_online(node)
+                if not node.is_local and not online and (now_ - (node.last_seen_at or 0)) > NODE_OFFLINE_WARN_SECONDS:
+                    since = f" since {datetime.fromtimestamp(node.last_seen_at, self.cfg.tz):%Y-%m-%d %H:%M}" if node.last_seen_at else ""
+                    add("bad", f"{node.name} is offline{since}.", "#/admin")
+                if not node.is_local and online and node.build != BUILD_ID:
+                    add("warn", f"{node.name} runs a different version ({node.version or 'unknown'}) from this server "
+                                f"({__version__}). Upgrade it so measuring, detecting and restarts work.", "#/admin")
+                report = {"clock_synced": health.clock_synced(), "disk": health.disk(self.cfg.recordings_dir), "skew": 0} \
+                    if node.is_local else (self.node_health.get(node.id) if online else None)
+                if not report:
+                    continue
+                if report.get("clock_synced") is False:
+                    add("warn", f"{node.name}'s clock isn't synced. Broadcastify rejects calls with wrong times; check timedatectl.", "#/admin")
+                elif report.get("skew") is not None and abs(report["skew"]) > CLOCK_SKEW_WARN_SECONDS:
+                    add("warn", f"{node.name}'s clock is {abs(report['skew']):.0f} seconds off this server's.", "#/admin")
+                disk = report.get("disk")
+                if disk and (disk["free"] < DISK_WARN_BYTES or disk["free"] < disk["total"] * DISK_WARN_FRACTION):
+                    add("bad", f"{node.name} has {disk['free'] / 1e9:.1f} GB free of {disk['total'] / 1e9:.0f} GB."
+                               f"{' Set a size limit for recordings under Admin > Settings.' if node.is_local else ''}", "#/admin")
+            winners = schedule.resolve(list(session.scalars(select(Recorder))), datetime.now(self.cfg.tz))
+            for source in session.scalars(select(Source).order_by(Source.name)):
+                node = session.get(Node, source.node_id)
+                status = self.status.get((source.node_id, source.serial), {})
+                if source.id in winners and node and self.node_online(node) and status.get("state") == "error":
+                    add("bad", f"{source.name}: {status.get('error') or 'fault'}", "#/sources")
+            failed = session.scalar(select(func.count()).select_from(UploadJob).join(Recording).where(
+                UploadJob.status == "failed", Recording.started_at > now_ - 86400))
+            if failed:
+                add("warn", f"{failed} upload{'s' if failed != 1 else ''} failed in the last day. The reason shows on each recording.",
+                    "#/recordings")
+            limit_gb = float(self.get_setting("recording_retention_gb") or 0)
+            if limit_gb > 0:
+                protected = session.scalar(select(func.coalesce(func.sum(Recording.size_bytes), 0)).where(Recording.protected.is_(True)))
+                if protected > limit_gb * 1e9:
+                    add("warn", f"Protected recordings alone ({protected / 1e9:.1f} GB) exceed the {limit_gb:g} GB limit, "
+                                "so nothing more can be removed to stay under it.", "#/recordings")
+        return warnings
 
     def _expire_audit_files(self, cutoff: float) -> None:
         for path in self.cfg.log_dir.glob("audit.log.*"):
