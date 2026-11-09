@@ -1097,31 +1097,37 @@ def test_app_never_uses_asyncio_wait_for():
 
 # --- rtl_tcp ------------------------------------------------------------------------------
 FAKE_RTL_TCP = """#!/usr/bin/env python3
-import sys, time
+import socket, sys, time
 open(sys.argv[0] + ".args", "w").write(" ".join(sys.argv[1:]))
-sys.stderr.write("Found 1 device(s):\\nListening...\\n"); sys.stderr.flush(); time.sleep(0.6)
-sys.stderr.write("client accepted! 192.168.1.50 51234\\n"); sys.stderr.flush(); time.sleep(0.6)
-sys.stderr.write("all threads dead..\\nListening...\\n"); sys.stderr.flush()
-time.sleep(60)
+host, port = sys.argv[sys.argv.index("-a") + 1], int(sys.argv[sys.argv.index("-p") + 1])
+server = socket.socket(); server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); server.bind((host, port)); server.listen(1)
+while True:
+    conn, _ = server.accept()
+    while conn.recv(1024):
+        pass
+    conn.close()
 """
 
 
-async def test_rtl_tcp_worker_reports_clients(tmp_path):
+async def test_rtl_tcp_worker_reports_clients(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "RTL_TCP_CHECK_SECONDS", 0.2)
     bins = tmp_path / "bin"
     install_tool(bins, "rtl_tcp", FAKE_RTL_TCP)
-    cfg = make_config(tmp_path, bin_dirs=[bins], rtl_tcp_bind="192.168.1.20")
-    seen = []
-    sup = supervisor(cfg, [], statuses={})
+    probe = socket.socket(); probe.bind(("127.0.0.1", 0)); port = probe.getsockname()[1]; probe.close()
+    cfg = make_config(tmp_path, bin_dirs=[bins], rtl_tcp_bind="127.0.0.1")
+    sup = supervisor(cfg, [])
     worker = sup.workers["SER1"]
     try:
-        await sup.apply({"SER1": spec(kind="rtltcp", modulation="rtltcp", frequency_hz=162_550_000, squelch=0, rtl_tcp_port=1240)})
+        await sup.apply({"SER1": spec(kind="rtltcp", modulation="rtltcp", frequency_hz=162_550_000, squelch=0, rtl_tcp_port=port)})
         assert await wait_for(lambda: worker.state == "listening")
-        assert worker.rtl_tcp == {"address": "192.168.1.20:1240", "client": False}
+        assert worker.rtl_tcp == {"address": f"127.0.0.1:{port}", "client": False}
+        await asyncio.sleep(0.5)
+        client = socket.create_connection(("127.0.0.1", port))
         assert await wait_for(lambda: worker.rtl_tcp.get("client") is True, 5)
         assert worker.snapshot()["rtl_tcp"]["client"] is True
+        client.close()
         assert await wait_for(lambda: worker.rtl_tcp.get("client") is False, 5)
-        args = (bins / "rtl_tcp.args").read_text()
-        assert args == "-a 192.168.1.20 -p 1240 -d 0 -f 162550000"
+        assert (bins / "rtl_tcp.args").read_text() == f"-a 127.0.0.1 -p {port} -d 0 -f 162550000"
     finally:
         await sup.shutdown()
 
@@ -1132,7 +1138,7 @@ async def test_going_idle_clears_old_feed_and_rtl_tcp_status(tmp_path):
     sup = supervisor(make_config(tmp_path, bin_dirs=[bins]), [])
     worker = sup.workers["SER1"]
     try:
-        await sup.apply({"SER1": spec(kind="rtltcp", modulation="rtltcp", frequency_hz=162_550_000, squelch=0, rtl_tcp_port=1240)})
+        await sup.apply({"SER1": spec(kind="rtltcp", modulation="rtltcp", frequency_hz=162_550_000, squelch=0, rtl_tcp_port=31251)})
         assert await wait_for(lambda: worker.rtl_tcp)
         worker.feed_status = {"aggregators": {"adsbx": False}}
         await sup.apply({"SER1": None})

@@ -36,6 +36,7 @@ MEASURE_SECONDS = 6.0
 MEASURE_ATTEMPTS = 3
 DETECT_SECONDS = 8.0
 FEED_CHECK_EVERY = 5  # ADS-B loop turns (2 s each) between feed connection checks
+RTL_TCP_CHECK_SECONDS = 2.0  # how often an rtl_tcp worker looks for a connected program
 # Signs that a stick didn't open cleanly: USB timeouts (-7), librtlsdr resetting it,
 # or a setup step failing. Seen on real hardware after a tool was killed without
 # closing the stick. It may then send nothing, which looks the same as a closed squelch.
@@ -592,33 +593,32 @@ class Worker:
     async def _run_rtltcp(self, index: int, spec: dict) -> str:
         """Hand the stick to rtl_tcp, so a program such as GQRX can use it over the network."""
         tail: list[str] = []
+        port = spec["rtl_tcp_port"]
         proc = await asyncio.create_subprocess_exec(
             *pipelines.rtltcp_args(self.cfg, index, spec),
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE, env=self.cfg.tool_env(),
         )
-        self.rtl_tcp = {"address": f"{self.cfg.rtl_tcp_bind}:{spec['rtl_tcp_port']}", "client": False}
-        reader = asyncio.create_task(_log_stderr(self.serial, proc.stderr, tail, self._on_reset, self._rtltcp_line))
+        self.rtl_tcp = {"address": f"{self.cfg.rtl_tcp_bind}:{port}", "client": False}
+        reader = asyncio.create_task(_log_stderr(self.serial, proc.stderr, tail, self._on_reset))
         self._publish("listening", "")
         try:
-            await proc.wait()
+            while proc.returncode is None:
+                try:
+                    await aio.wait_for(proc.wait(), RTL_TCP_CHECK_SECONDS)
+                except asyncio.TimeoutError:
+                    pass
+                # rtl_tcp's own messages go to a buffered stdout, so count connections to its port instead.
+                connected = any(local[1] == port for local, _ in feeds.established(proc.pid))
+                if connected != self.rtl_tcp.get("client"):
+                    self.rtl_tcp = {**self.rtl_tcp, "client": connected}
+                    if connected:
+                        self.last_call_at = time.time()
+                    self._publish()
             detail = tail[-1] if tail else ""
             return f"rtl_tcp exited ({proc.returncode}) {detail}".strip()
         finally:
             await stop_process(proc)
             reader.cancel()
-
-    def _rtltcp_line(self, text: str) -> None:
-        # rtl_tcp prints these as a client connects and leaves (rtl_tcp.c). It serves one client at a time.
-        if "client accepted" in text:
-            connected = True
-        elif "all threads dead" in text or text.lower().startswith("listening"):
-            connected = False
-        else:
-            return
-        if self.rtl_tcp.get("client") != connected:
-            self.rtl_tcp = {**self.rtl_tcp, "client": connected}
-            self.last_call_at = time.time() if connected else self.last_call_at
-            self._publish()
 
     async def _run_acars(self, index: int, spec: dict) -> str:
         tail: list[str] = []

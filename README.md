@@ -178,7 +178,7 @@ Upload API keys are never shown again once saved. Leave a key's box blank to kee
 | `readsb`, tar1090 | Run on a real RTL-SDR with real aircraft |
 | `AIS-catcher` | Run on a real RTL-SDR, and its output checked with a known message; no live ship received yet |
 | `acarsdec` | Not yet run on a real stick: tested against a stand-in that follows acarsdec's documented options and JSON output |
-| `rtl_tcp` | Not yet run on a real stick: tested against a stand-in that follows rtl_tcp's options and messages |
+| `rtl_tcp` | Run through SentrySDR on a real RTL-SDR: streams samples at the default rate, the connected-program status follows a client, and it stops cleanly. Not yet tried with GQRX itself |
 | `dsd-fme` | DMR tested on air: a real simplex transmission recorded and played back clearly, with correct speed and call splitting, and live audio in step. P25, NXDN, D-STAR and YSF use the same pipeline but haven't been tested on air |
 
 Squelch, calls and noise measurement have been tested on air with NFM on three tuners: R820T (NESDR Mini), R828D and FC0012. Noise readings and squelch numbers differ between them, so measure each stick.
