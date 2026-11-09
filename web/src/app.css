@@ -222,6 +222,7 @@ audio { width: 100%; }
 
 .signin { max-width: 26rem; margin: 1.5rem auto 0; padding: 0 .6rem; }
 .map { height: 62vh; min-height: 300px; }
+.receiver-mark { background: var(--viz); border: 2px solid var(--box); border-radius: 2px; box-shadow: 0 0 0 1px var(--ink); }
 .pager { display: flex; justify-content: space-between; align-items: center; gap: .5rem; }
 
 @media (min-width: 760px) {

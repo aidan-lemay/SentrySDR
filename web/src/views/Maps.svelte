@@ -6,6 +6,9 @@
   let { user } = $props();
   let kind = $state('adsb');
   let items = $state([]);
+  let receivers = $state([]);
+  let showTrails = $state(true);
+  let showCoverage = $state(true);
   let error = $state('');
   let host;
   let map;
@@ -41,7 +44,25 @@
   function draw() {
     if (!layer) return;
     layer.clearLayers();
+    const hue = getComputedStyle(document.documentElement).getPropertyValue('--viz').trim() || '#2a78d6';
+    for (const receiver of receivers) {
+      if (showCoverage && receiver.coverage?.length) {
+        L.polygon(receiver.coverage, { color: hue, weight: 1, fillOpacity: 0.12, interactive: false }).addTo(layer);
+      }
+      const node = document.createElement('div');
+      for (const line of [receiver.name, receiver.farthest_km ? `Farthest aircraft: ${Math.round(receiver.farthest_km)} km` : null].filter(Boolean)) {
+        const row = document.createElement('div');
+        row.textContent = line;
+        node.append(row);
+      }
+      L.marker([receiver.lat, receiver.lon], {
+        icon: L.divIcon({ className: 'receiver-mark', iconSize: [14, 14] }), keyboard: true, title: receiver.name,
+      }).bindPopup(node).addTo(layer);
+    }
     for (const item of located) {
+      if (kind === 'adsb' && showTrails && item.trail?.length > 1) {
+        L.polyline(item.trail, { color: hue, weight: 2, opacity: 0.6, interactive: false }).addTo(layer);
+      }
       L.circleMarker([item.lat, item.lon], { radius: 7, color: '#a80000', weight: 2, fillOpacity: 0.5 })
         .bindTooltip(String(label(item)))
         .bindPopup(() => popup(item))
@@ -55,7 +76,9 @@
 
   async function refresh() {
     try {
-      items = (await api(`maps/${kind}`)).items;
+      const reply = await api(`maps/${kind}`);
+      items = reply.items;
+      receivers = reply.receivers ?? [];
       error = '';
       draw();
     } catch (failure) {
@@ -95,10 +118,15 @@
   <button aria-pressed={kind === 'ais'} style:font-weight={kind === 'ais' ? 'bold' : 'normal'} onclick={() => choose('ais')}>Ships</button>
   {#if user.tar1090_available}<a class="button" href="api/tar1090/index.html" target="_blank" rel="noopener">Open tar1090</a>{/if}
 </div>
+<div class="flags">
+  {#if kind === 'adsb'}<label class="tick small"><input type="checkbox" bind:checked={showTrails} onchange={draw} /> Trails</label>{/if}
+  {#if kind === 'adsb'}<label class="tick small"><input type="checkbox" bind:checked={showCoverage} onchange={draw} /> Coverage</label>{/if}
+</div>
 <div class="box">
   <div class="map" bind:this={host}></div>
 </div>
 <p class="small">
   {located.length} {kind === 'adsb' ? 'aircraft' : 'ships'} with a position{items.length !== located.length ? `, ${items.length - located.length} without` : ''}.
   {#if !items.length}Assign an {kind === 'adsb' ? 'ADS-B' : 'AIS'} target to a source to see traffic here.{/if}
+  {#if receivers.length}Squares are receivers{kind === 'adsb' ? ', and each outline is how far one has heard aircraft' : ''}.{:else if user.role === 'admin'}Give an SDR a location under Admin &gt; SDR sources to show it here.{/if}
 </p>

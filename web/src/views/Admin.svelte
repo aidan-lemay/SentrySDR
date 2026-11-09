@@ -27,7 +27,7 @@
   let nodes = $state([]);
   const blankSource = () => ({
     id: null, key: '', name: '', description: '', antenna_id: '', gain: DEFAULT_GAIN_DB, ppm: 0,
-    tuner: '', steps: '', capMin: '', capMax: '', uses: [], rtlTcpPort: '',
+    tuner: '', steps: '', capMin: '', capMax: '', uses: [], rtlTcpPort: '', lat: '', lon: '', alt: '',
   });
   const TUNERS = ['R820T', 'R820T2', 'R828D', 'FC0012', 'FC0013', 'FC2580', 'E4000'];
   let detecting = $state(false);
@@ -155,6 +155,8 @@
       cap_min_hz: filled(sourceForm.capMin) ? toHz(sourceForm.capMin) : null,
       cap_max_hz: filled(sourceForm.capMax) ? toHz(sourceForm.capMax) : null, uses: sourceForm.uses,
       rtl_tcp_port: filled(sourceForm.rtlTcpPort) ? Number(sourceForm.rtlTcpPort) : null,
+      lat: filled(sourceForm.lat) ? Number(sourceForm.lat) : null, lon: filled(sourceForm.lon) ? Number(sourceForm.lon) : null,
+      alt_m: filled(sourceForm.alt) ? Number(sourceForm.alt) : null,
     };
     if (body.gain_steps.some(Number.isNaN)) {
       error = 'Gain steps must be numbers, separated by spaces or commas.';
@@ -177,6 +179,7 @@
       tuner: source.tuner, steps: source.gain_steps.join(' '),
       capMin: source.cap_min_hz == null ? '' : plain(source.cap_min_hz), capMax: source.cap_max_hz == null ? '' : plain(source.cap_max_hz),
       uses: [...source.uses], rtlTcpPort: source.rtl_tcp_port ?? '',
+      lat: source.lat ?? '', lon: source.lon ?? '', alt: source.alt_m ?? '',
     };
     document.getElementById('source-form')?.scrollIntoView();
   }
@@ -629,6 +632,16 @@
         {/if}
       </label>
       <label class="field"><span>Frequency correction (ppm)</span><input type="number" min="-500" max="500" bind:value={sourceForm.ppm} /></label>
+      <div class="field"><span>Location</span>
+        <div class="pair">
+          <input class="mono" type="number" inputmode="decimal" step="any" min="-90" max="90" aria-label="Latitude" placeholder="Latitude" bind:value={sourceForm.lat} />
+          <input class="mono" type="number" inputmode="decimal" step="any" min="-180" max="180" aria-label="Longitude" placeholder="Longitude" bind:value={sourceForm.lon} />
+        </div>
+      </div>
+      <label class="field"><span>Antenna height (m)</span>
+        <input class="mono" type="number" inputmode="decimal" step="any" min="-500" max="10000" bind:value={sourceForm.alt} />
+        <span class="hint">Optional. Where the antenna is, in decimal degrees (43.1566, -77.6088), for the map's receiver marker and ADS-B coverage. Anyone who can see maps sees it. Moving it starts the coverage again.</span>
+      </label>
       <label class="field"><span>rtl_tcp port</span>
         <input class="mono" type="number" inputmode="numeric" min="1024" max="65535" placeholder="Picked for you" bind:value={sourceForm.rtlTcpPort} />
         <span class="hint">Used when this SDR is on an rtl_tcp target. Each SDR on one machine needs its own. The address is set in that machine's configuration file.</span>

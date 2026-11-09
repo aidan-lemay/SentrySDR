@@ -229,6 +229,16 @@ Only calls that finish after you start are played, never a backlog. Browsers onl
 
 The Activity page shows the last 7, 30 or 90 days: calls and airtime, calls per day, the busiest hours of the week as a heatmap (in the master's time zone), the busiest channels, and how much of the time each SDR spent in a call. Admins and operators also see upload results per service: sent, skipped as duplicates, failed and waiting. Hover or tab to a column or cell for its numbers, and each chart has **Show as a table**. Anyone who can play recordings can open it.
 
+## Map
+
+The Maps page shows aircraft from every ADS-B receiver, and ships from every AIS one, merged.
+
+- **Trails:** a line behind each aircraft for its last 10 minutes.
+- **Receivers:** give an SDR a location (latitude, longitude, and optionally antenna height) under **Admin > SDR sources**, and it shows as a square. Anyone who can see maps sees where it is.
+- **Coverage:** for each located ADS-B receiver, an outline through the farthest aircraft it has heard in each 10° direction. Positions over 450 km away are ignored as bad decodes. It's saved, so it survives restarts, and starts again if the receiver is moved.
+
+Trails and coverage can each be turned off above the map.
+
 ## Keyword alerts
 
 Under **My account > Keywords**, each user keeps their own words and phrases to watch for, in call transcripts, ACARS messages, or both. Matching ignores case and takes whole words: "fire" matches "Fire!" but not "firefighter", and a phrase matches across a line break. Only you see your keywords.

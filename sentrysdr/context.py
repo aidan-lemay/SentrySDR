@@ -21,7 +21,7 @@ import httpx
 from sqlalchemy import delete, func, or_, select
 
 from . import aio
-from . import BUILD_ID, __version__, acars, capabilities, health, pipelines, schedule, uploaders
+from . import BUILD_ID, __version__, acars, capabilities, coverage, health, pipelines, schedule, uploaders
 from .config import Config
 from .engine import MeasureError, Supervisor
 from .live import LiveHub
@@ -123,6 +123,10 @@ class Context:
         self.enumerate = enumerate_fn
         self.status: dict[tuple[int, str], dict] = {}
         self.node_health: dict[int, dict] = {}  # each slave's latest clock and disk report
+        self.trails = coverage.Trails()
+        self._coverage: dict | None = None  # {source id: {"home": [lat, lon], "sectors": [...]}}, saved now and then
+        self._coverage_saved = 0.0
+        self._receivers: tuple[float, dict] = (0.0, {})  # (when read, {(node, serial): (source id, lat, lon)})
         self.tracks: dict[str, dict[str, dict]] = {"adsb": {}, "ais": {}}
         self.live = LiveHub(cfg, self._live_demand)
         self.node_links: dict[int, object] = {}
@@ -222,6 +226,9 @@ class Context:
             return
         field = "aircraft" if kind == "adsb" else "vessels"
         data = {field: clean_track_items(data.get(field), strict=kind == "adsb")}
+        if kind == "adsb":
+            self.trails.add(data["aircraft"])
+            self._widen_coverage(node_id, serial, data["aircraft"])
         self.tracks.setdefault(kind, {})[f"{node_id}:{serial}"] = {"at": time.time(), "data": data}
 
     def ingest_acars(self, node_id: int, serial: str, data: dict) -> None:
@@ -255,6 +262,48 @@ class Context:
             task = self.loop.create_task(self.airframes.send(self.get_setting("airframes_feed"), payload))
             self.tasks.append(task)
             task.add_done_callback(lambda done: done in self.tasks and self.tasks.remove(done))
+
+    # --- receiver locations and coverage ------------------------------------
+    def receiver_locations(self) -> dict:
+        """(node id, serial) -> (source id, lat, lon) for SDRs with a location. Read at most once a minute."""
+        read_at, cached = self._receivers
+        if time.monotonic() - read_at < 60:
+            return cached
+        with self.db() as session:
+            cached = {(s.node_id, s.serial): (s.id, s.lat, s.lon) for s in session.scalars(select(Source))
+                      if s.lat is not None and s.lon is not None}
+        self._receivers = (time.monotonic(), cached)
+        return cached
+
+    def coverage(self) -> dict:
+        if self._coverage is None:
+            try:
+                saved = json.loads(self.get_setting("coverage") or "{}")
+            except ValueError:
+                saved = {}
+            self._coverage = saved if isinstance(saved, dict) else {}
+        return self._coverage
+
+    def _widen_coverage(self, node_id: int, serial: str, aircraft: list[dict]) -> None:
+        found = self.receiver_locations().get((node_id, serial))
+        if not found:
+            return
+        source_id, lat, lon = found
+        record = self.coverage().get(str(source_id))
+        if not record or record.get("home") != [lat, lon]:
+            # A new or moved receiver starts again: its old reach was from somewhere else.
+            record = self.coverage()[str(source_id)] = {"home": [lat, lon], "sectors": [0.0] * coverage.SECTORS}
+        if coverage.update_sectors(record["sectors"], (lat, lon), aircraft) and time.time() - self._coverage_saved > 600:
+            self.save_coverage()
+
+    def save_coverage(self) -> None:
+        self._coverage_saved = time.time()
+        self.set_setting("coverage", json.dumps(self.coverage()))
+
+    def forget_receiver(self, source_id: int) -> None:
+        self.coverage().pop(str(source_id), None)
+        self._receivers = (0.0, {})
+        self.save_coverage()
 
     def current_tracks(self, kind: str) -> list[dict]:
         """Merge every receiver's view. The freshest report wins for duplicates."""
@@ -449,6 +498,8 @@ class Context:
             self.tasks.append(asyncio.create_task(coroutine(), name=coroutine.__name__))
 
     async def stop(self) -> None:
+        if self._coverage:
+            self.save_coverage()
         for task in self.tasks:
             task.cancel()
         await asyncio.gather(*self.tasks, return_exceptions=True)

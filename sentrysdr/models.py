@@ -111,6 +111,10 @@ class Source(Base):
     uses: Mapped[list | None] = mapped_column(JSON, nullable=True)
     feeder_uuid: Mapped[str | None] = mapped_column(String(36), nullable=True)  # identifies this receiver to aggregators
     rtl_tcp_port: Mapped[int | None] = mapped_column(nullable=True)  # unique per node; the address is in each node's config
+    # Where the antenna is, for the map's receiver marker and coverage. Optional.
+    lat: Mapped[float | None] = mapped_column(nullable=True)
+    lon: Mapped[float | None] = mapped_column(nullable=True)
+    alt_m: Mapped[float | None] = mapped_column(nullable=True)
     __table_args__ = (Index("uq_source_node_serial", "node_id", "serial", unique=True),)
 
 

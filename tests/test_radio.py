@@ -17,7 +17,7 @@ import pytest
 from sqlalchemy import select
 
 from sentrysdr import capabilities, feeds, pipelines, schedule, sdr, uploaders
-from sentrysdr.context import BROADCASTIFY_RETRY_SECONDS, UPLOAD_MAX_ATTEMPTS
+from sentrysdr.context import BROADCASTIFY_RETRY_SECONDS, UPLOAD_MAX_ATTEMPTS, Context
 from sentrysdr.engine import MeasureError, VolumeControl, merge_ais_message
 from sentrysdr.models import AcarsMessage, Antenna, AuditLog, BroadcastifySystem, Node, Recorder, Recording, SdrProfile, Source, Target, UploadJob, make_session_factory
 
@@ -2490,3 +2490,46 @@ def test_activity_stats(ctx, admin, listener):
     assert admin.get("/api/stats?days=30").json()["totals"]["calls"] == 3
     assert admin.get("/api/stats?days=90").json()["totals"]["calls"] == 4
     assert admin.get("/api/stats?days=12345").json()["days"] == 30
+
+
+# --- map: trails, receivers and coverage -------------------------------------------------------
+def test_receiver_location_and_coverage(ctx, admin, listener):
+    source = make_source(admin)
+    assert admin.put(f"/api/sources/{source}", json={"serial": "SER1", "name": "Roof", "lat": 43.1}).status_code == 422
+    admin.put(f"/api/sources/{source}", json={"serial": "SER1", "name": "Roof", "lat": 43.0, "lon": -77.0, "alt_m": 150}).raise_for_status()
+    assert next(s for s in admin.get("/api/sources").json() if s["id"] == source)["lat"] == 43.0
+    assert "lat" not in listener.get("/api/sources").json()[0]  # admins only, outside the map
+    ctx.update_tracks("adsb", ctx.local_node_id, "SER1", {"aircraft": [
+        {"hex": "a1", "lat": 44.0, "lon": -77.0}, {"hex": "a2", "lat": 43.0, "lon": -76.0}, {"hex": "a3", "lat": 52.0, "lon": -77.0}]})
+    ctx.update_tracks("adsb", ctx.local_node_id, "SER1", {"aircraft": [{"hex": "a1", "lat": 44.1, "lon": -77.0}]})
+    got = listener.get("/api/maps/adsb").json()
+    receiver = got["receivers"][0]
+    assert receiver["name"] == "Roof" and len(receiver["coverage"]) == 0  # two directions heard: not a shape yet
+    ctx.update_tracks("adsb", ctx.local_node_id, "SER1", {"aircraft": [{"hex": "a4", "lat": 42.0, "lon": -77.0}]})
+    receiver = listener.get("/api/maps/adsb").json()["receivers"][0]
+    assert len(receiver["coverage"]) == 3  # only the directions heard
+    assert 120 < receiver["farthest_km"] < 125  # 44.1 N is about 122 km; the 1000 km decode was ignored
+    trail = next(i for i in got["items"] if i["hex"] == "a1")["trail"]
+    assert trail == [[44.0, -77.0], [44.1, -77.0]]
+    ctx.save_coverage()
+    admin.put(f"/api/sources/{source}", json={"serial": "SER1", "name": "Roof", "lat": 45.0, "lon": -77.0}).raise_for_status()
+    assert listener.get("/api/maps/adsb").json()["receivers"][0]["coverage"] == []  # moved: starts again
+
+
+def test_coverage_survives_a_restart(ctx, admin, tmp_path):
+    source = make_source(admin)
+    admin.put(f"/api/sources/{source}", json={"serial": "SER1", "name": "Roof", "lat": 43.0, "lon": -77.0}).raise_for_status()
+    ctx.update_tracks("adsb", ctx.local_node_id, "SER1", {"aircraft": [{"hex": "a1", "lat": 44.0, "lon": -77.0}]})
+    ctx.save_coverage()
+    fresh = Context(ctx.cfg)
+    assert max(fresh.coverage()[str(source)]["sectors"]) > 100
+
+
+def test_trails_forget_quiet_aircraft():
+    from sentrysdr import coverage
+    trails = coverage.Trails()
+    trails.add([{"hex": "a1", "lat": 1, "lon": 1}], now=1000)
+    trails.add([{"hex": "a1", "lat": 1, "lon": 1}], now=1001)  # same spot: not repeated
+    trails.add([{"hex": "b2", "lat": 2, "lon": 2}], now=1000 + coverage.TRAIL_SECONDS + 5)
+    assert trails.get("a1", now=1000 + coverage.TRAIL_SECONDS + 5) == [] and "a1" not in trails.points
+    assert trails.get("b2", now=1000 + coverage.TRAIL_SECONDS + 5) == [[2, 2]]

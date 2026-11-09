@@ -13,7 +13,7 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 
-from .. import aio, capabilities, feeds, pipelines, schedule
+from .. import aio, capabilities, coverage, feeds, pipelines, schedule
 from ..config import SERIAL_RE
 from ..context import Context
 from ..engine import MeasureError
@@ -145,6 +145,9 @@ class SourceBody(BaseModel):
     cap_max_hz: int | None = Field(default=None, ge=0, le=10_000_000_000)
     uses: list[str] = Field(default_factory=list, max_length=len(capabilities.USES) + len(capabilities.RETIRED_USES))
     rtl_tcp_port: int | None = Field(default=None, ge=pipelines.RTL_TCP_MIN_PORT, le=65535)  # None keeps or picks one
+    lat: float | None = Field(default=None, ge=-90, le=90)
+    lon: float | None = Field(default=None, ge=-180, le=180)
+    alt_m: float | None = Field(default=None, ge=-500, le=10000)
 
     @field_validator("gain_steps")
     @classmethod
@@ -235,6 +238,7 @@ def list_sources(request: Request, user: User = Depends(current_user), db=Depend
         if user.role == "admin":
             view["feeder_uuid"] = source.feeder_uuid
             view["rtl_tcp_port"] = source.rtl_tcp_port
+            view.update(lat=source.lat, lon=source.lon, alt_m=source.alt_m)
         if "assign" not in effective_permissions(user):
             view["assigned_by"] = ""  # other people's email addresses
         views.append(view)
@@ -268,6 +272,8 @@ def _validate_source(ctx: Context, db, body: SourceBody) -> Node:
         raise HTTPException(422, "That antenna doesn't exist")
     if body.cap_min_hz is not None and body.cap_max_hz is not None and body.cap_min_hz > body.cap_max_hz:
         raise HTTPException(422, "The stick's frequency range starts above where it ends")
+    if (body.lat is None) != (body.lon is None):
+        raise HTTPException(422, "Give both latitude and longitude, or neither")
     return node
 
 
@@ -328,10 +334,13 @@ def update_source(source_id: int, body: SourceBody, request: Request, admin: Use
     values = body.model_dump()
     values["node_id"] = node.id
     values["rtl_tcp_port"] = _rtl_tcp_port(db, node, body.rtl_tcp_port, source)
+    moved = (source.lat, source.lon) != (body.lat, body.lon)
     for key, value in values.items():
         setattr(source, key, value)
     db.commit()
     ctx.audit("source.updated", user=admin, ip=ip_of(request), target=source.name)
+    if moved:
+        ctx.forget_receiver(source.id)  # its coverage was measured from somewhere else
     ctx.kick()
     return {"id": source.id, "warning": _gain_warning(source)}
 
@@ -953,10 +962,21 @@ async def live_audio(source_id: int, request: Request, user: User = Depends(requ
 def map_tracks(kind: str, request: Request, _user: User = Depends(require("maps")), db=Depends(get_db)):
     if kind not in ("adsb", "ais"):
         raise HTTPException(404, "Unknown map")
-    items = ctx_of(request).current_tracks(kind)
+    ctx = ctx_of(request)
+    items = ctx.current_tracks(kind)
     if kind == "adsb":
-        items = annotate_aircraft(request, db, items)
-    return {"items": items}
+        items = [{**item, "trail": ctx.trails.get(item.get("hex"))} for item in annotate_aircraft(request, db, items)]
+    winners = schedule.resolve(list(db.scalars(select(Recorder))), datetime.now(ctx.cfg.tz))
+    receivers = []
+    for source in db.scalars(select(Source).where(Source.lat.is_not(None), Source.lon.is_not(None)).order_by(Source.name)):
+        active = winners.get(source.id)
+        target = db.get(Target, active.target_id) if active else None
+        record = ctx.coverage().get(str(source.id))
+        reach = coverage.outline((source.lat, source.lon), record["sectors"]) \
+            if kind == "adsb" and record and record.get("home") == [source.lat, source.lon] else []
+        receivers.append({"name": source.name, "lat": source.lat, "lon": source.lon, "listening": target.kind if target else None,
+                          "coverage": reach, "farthest_km": max(record["sectors"]) if reach else None})
+    return {"items": items, "receivers": receivers}
 
 
 def _tar1090_json(ctx: Context, name: str) -> Response:
