@@ -180,7 +180,7 @@ async def send_broadcastify(cfg, client: httpx.AsyncClient, server: str, system_
             # Code 1 is a final answer about this call, so a retry can't change it.
             raise UploadRejected(f"Rejected by Broadcastify: {_clean_reply(reply, api_key)}")
         if code == "100":
-            raise UploadRejected(f"Broadcastify refused the API key, so correct it under Admin > Settings: {_clean_reply(reply, api_key)}")
+            raise UploadRejected(f"Broadcastify refused the API key, so correct it under Admin > Uploads and feeds: {_clean_reply(reply, api_key)}")
         if code != "0":
             raise UploadError(f"Broadcastify replied: {_clean_reply(f'{code} {reply}', api_key)}")
         try:

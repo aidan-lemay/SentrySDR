@@ -65,8 +65,20 @@ build_dsd() {
   install -m755 "$SRC/dsd-fme/build/dsd-fme" "$PREFIX/bin/dsd-fme"
 }
 
+build_acarsdec() {
+  # JSON output needs cJSON (libcjson-dev on Debian/Raspberry Pi OS).
+  if ! pkg-config --exists libcjson; then
+    echo "acarsdec needs cJSON: install your distro's package (libcjson-dev on Debian/Raspberry Pi OS)" >&2
+    return 1
+  fi &&
+  fetch acarsdec https://github.com/f00b4r0/acarsdec.git &&
+  cmake -S "$SRC/acarsdec" -B "$SRC/acarsdec/build" -DCMAKE_BUILD_TYPE=Release &&
+  cmake --build "$SRC/acarsdec/build" -j"$JOBS" &&
+  install -m755 "$SRC/acarsdec/build/acarsdec" "$PREFIX/bin/acarsdec"
+}
+
 status=0
-for name in readsb ais tar1090 dsd; do
+for name in readsb ais tar1090 dsd acarsdec; do
   echo "=== building $name ==="
   if ( "build_$name" ); then
     RESULT[$name]=ok
@@ -77,7 +89,7 @@ for name in readsb ais tar1090 dsd; do
 done
 
 echo "=== summary ==="
-for name in readsb ais tar1090 dsd; do
+for name in readsb ais tar1090 dsd acarsdec; do
   printf '%-8s %s\n' "$name" "${RESULT[$name]}"
 done
 exit "$status"

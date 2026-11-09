@@ -5,6 +5,8 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
+import math
 import logging.handlers
 import os
 import shutil
@@ -17,11 +19,12 @@ from urllib.parse import urlsplit
 import httpx
 from sqlalchemy import delete, or_, select
 
-from . import pipelines, schedule, uploaders
+from . import aio
+from . import acars, capabilities, pipelines, schedule, uploaders
 from .config import Config
 from .engine import MeasureError, Supervisor
 from .live import LiveHub
-from .models import AuditLog, BroadcastifySystem, Node, Recorder, Recording, SdrProfile, Setting, Source, Target, UploadJob, make_session_factory
+from .models import AcarsMessage, AuditLog, BroadcastifySystem, Node, Recorder, Recording, SdrProfile, Setting, Source, Target, UploadJob, UserSession, make_session_factory
 from .sdr import enumerate_serials
 from .security import RateLimiter, SecretBox
 
@@ -37,9 +40,42 @@ SETTING_DEFAULTS = {
     "clearcut_page_url": "",
     "broadcastify_server": "https://api.broadcastify.com/call-upload",
     "map_tile_url": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+    "message_retention_days": "30",
+    "airframes_station_id": "",
+    "airframes_feed": acars.AIRFRAMES_DEFAULT,
 }
 SECRET_SETTINGS = {"rdio_api_key", "clearcut_api_key"}
 TRACK_EXPIRY_SECONDS = 60
+MAX_TRACK_ITEMS = 3000
+# Per SDR, one-minute window. Busy ACARS sites reach a few messages a minute; this is far above that.
+ACARS_LIMIT_PER_MINUTE = 600
+_FIELD_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,31}$")
+_UNSAFE_TEXT = re.compile(r"[^\x20-\x7e]|[<>&\"'`\\]")
+_CONTROL_TEXT = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def clean_track_value(value, depth: int = 0, strict: bool = True):
+    """Aircraft and ship data can come from a slave. Aircraft are also shown by tar1090,
+    a third-party page, so their text keeps only plain characters. Ship names may have
+    apostrophes and only appear on SentrySDR's own map, which never parses them as HTML."""
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, (int, float)):
+        return value if math.isfinite(value) and abs(value) < 1e12 else None
+    if isinstance(value, str):
+        return (_UNSAFE_TEXT if strict else _CONTROL_TEXT).sub("", value)[:64]
+    if depth < 2 and isinstance(value, list):
+        return [clean_track_value(v, depth + 1, strict) for v in value[:32]]
+    if depth < 2 and isinstance(value, dict):
+        return {k: clean_track_value(v, depth + 1, strict) for k, v in list(value.items())[:64]
+                if isinstance(k, str) and _FIELD_RE.match(k)}
+    return None
+
+
+def clean_track_items(items, strict: bool = True) -> list[dict]:
+    if not isinstance(items, list):
+        return []
+    return [clean_track_value(item, 0, strict) for item in items[:MAX_TRACK_ITEMS] if isinstance(item, dict)]
 UPLOAD_MAX_ATTEMPTS = 12
 BROADCASTIFY_RETRY_SECONDS = 10
 DUPLICATE_UPLOAD_NOTE = "Skipped: another SDR on this channel already recorded this call."
@@ -82,7 +118,9 @@ class Context:
         self.tracks: dict[str, dict[str, dict]] = {"adsb": {}, "ais": {}}
         self.live = LiveHub(cfg, self._live_demand)
         self.node_links: dict[int, object] = {}
-        self.pending_measures: dict[str, tuple[int, asyncio.Future]] = {}
+        self.acars_duplicates = acars.Duplicates()
+        self.airframes = acars.AirframesFeed()
+        self.pending_measures: dict[str, tuple[int, asyncio.Future, str]] = {}
         self.bans_cache: tuple[float, list] = (0.0, [])
         self._tile_origin: str | None = None
         self.local_node_id = self._ensure_local_node()
@@ -167,7 +205,48 @@ class Context:
             link.request_live(serial, on)
 
     def update_tracks(self, kind: str, node_id: int, serial: str, data: dict) -> None:
+        if kind == "acars":
+            key = f"acars:{node_id}:{serial}"
+            if self.limiter.blocked(key, ACARS_LIMIT_PER_MINUTE, 60):
+                return  # a flood, whatever its cause, mustn't fill the database
+            self.limiter.hit(key, 60)
+            self.ingest_acars(node_id, serial, data)
+            return
+        field = "aircraft" if kind == "adsb" else "vessels"
+        data = {field: clean_track_items(data.get(field), strict=kind == "adsb")}
         self.tracks.setdefault(kind, {})[f"{node_id}:{serial}"] = {"at": time.time(), "data": data}
+
+    def ingest_acars(self, node_id: int, serial: str, data: dict) -> None:
+        """Store one decoded ACARS message, and feed it on if its target says so."""
+        raw = data.get("message")
+        if not isinstance(raw, dict):
+            return
+        message = acars.clean(raw)
+        if not self.acars_duplicates.first(message):
+            return  # another SDR on this channel got it first
+        try:
+            target_id = int(data.get("target_id"))
+        except (TypeError, ValueError):
+            target_id = None
+        with self.db() as session:
+            node = session.get(Node, node_id)
+            source = session.scalar(select(Source).where(Source.node_id == node_id, Source.serial == serial))
+            target = session.get(Target, target_id) if target_id else None
+            if target is not None and target.kind != "acars":
+                target = None
+            station = self.get_setting("airframes_station_id")
+            feed = bool(target and target.airframes_enabled and station)
+            session.add(AcarsMessage(
+                received_at=time.time(), node_name=node.name if node else "", serial=serial[:64],
+                source_name=source.name if source else "", target_id=target.id if target else None,
+                target_name=target.name if target else "", fed=feed or None, **message,
+            ))
+            session.commit()
+        if feed and self.loop is not None:
+            payload = acars.feed_payload(raw, station)
+            task = self.loop.create_task(self.airframes.send(self.get_setting("airframes_feed"), payload))
+            self.tasks.append(task)
+            task.add_done_callback(lambda done: done in self.tasks and self.tasks.remove(done))
 
     def current_tracks(self, kind: str) -> list[dict]:
         """Merge every receiver's view. The freshest report wins for duplicates."""
@@ -207,6 +286,9 @@ class Context:
                         "squelch": profile.squelch if profile else target.squelch,
                         "gain_db": profile.gain_db if profile else source.gain_db,
                         "ppm": source.ppm, "volume_db": target.volume_db or 0,
+                        "channels": target.acars_channels or [] if target.kind == "acars" else [],
+                        "feeds": target.feeds or {} if target.kind in ("adsb", "ais") else {},
+                        "feeder_uuid": source.feeder_uuid,
                     })
                 except pipelines.SpecError as exc:
                     log.error("recorder %s has an invalid configuration: %s", recorder.id, exc)
@@ -225,10 +307,10 @@ class Context:
             raise MeasureError("That node is offline.")
         request_id = uuid.uuid4().hex
         future = asyncio.get_running_loop().create_future()
-        self.pending_measures[request_id] = (node.id, future)
+        self.pending_measures[request_id] = (node.id, future, request.get("op", "measure"))
         try:
             link.request_measure(request_id, serial, request)
-            return await asyncio.wait_for(future, MEASURE_TIMEOUT)
+            return await aio.wait_for(future, MEASURE_TIMEOUT)
         except asyncio.TimeoutError:
             raise MeasureError("The node didn't answer. Check that it runs the same version as this server.") from None
         finally:
@@ -238,17 +320,20 @@ class Context:
         pending = self.pending_measures.get(str(message.get("id")))
         if pending is None or pending[0] != node_id or pending[1].done():
             return  # late, unknown, or from a node that wasn't asked
-        future = pending[1]
+        future, op = pending[1], pending[2]
         if not message.get("ok"):
             future.set_exception(MeasureError(str(message.get("error") or "The measurement failed.")[:300]))
             return
         try:
             result = message["result"]
+            if op == "detect":
+                future.set_result(capabilities.clean_detected(result))
+                return
             future.set_result({
                 "low": int(result["low"]), "typical": int(result["typical"]), "high": int(result["high"]),
                 "suggested": int(result["suggested"]), "moved": bool(result["moved"]),
             })
-        except (KeyError, TypeError, ValueError):
+        except (AttributeError, KeyError, TypeError, ValueError):
             future.set_exception(MeasureError("The node sent an unreadable result."))
 
     def kick(self) -> None:
@@ -346,7 +431,7 @@ class Context:
             except Exception:
                 log.exception("scheduler pass failed")
             try:
-                await asyncio.wait_for(self.wake.wait(), 5.0)
+                await aio.wait_for(self.wake.wait(), 5.0)
             except asyncio.TimeoutError:
                 pass
             self.wake.clear()
@@ -486,7 +571,8 @@ class Context:
 
     def apply_retention(self, now: float | None = None) -> dict:
         now = now or time.time()
-        removed = {"recordings": 0, "audit": 0}
+        removed = {"recordings": 0, "audit": 0, "messages": 0}
+        message_days = int(self.get_setting("message_retention_days") or 0)
         recording_days = int(self.get_setting("recording_retention_days") or 0)
         audit_days = int(self.get_setting("audit_retention_days") or 0)
         with self.db() as session:
@@ -500,6 +586,10 @@ class Context:
                         path.unlink(missing_ok=True)
                     session.delete(recording)
                     removed["recordings"] += 1
+            removed["sessions"] = session.execute(delete(UserSession).where(UserSession.expires_at < now)).rowcount
+            if message_days > 0:
+                result = session.execute(delete(AcarsMessage).where(AcarsMessage.received_at < now - message_days * 86400))
+                removed["messages"] = result.rowcount
             if audit_days > 0:
                 result = session.execute(delete(AuditLog).where(AuditLog.ts < now - audit_days * 86400))
                 removed["audit"] = result.rowcount

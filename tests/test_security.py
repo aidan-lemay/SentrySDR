@@ -1,14 +1,18 @@
 """Internet-facing behaviour: who can get in, and what they can't do."""
 from __future__ import annotations
 
+import re
+import time
+
 import pyotp
+
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
 from sentrysdr.config import Config, ConfigError, validate
 from sentrysdr.context import Context
-from sentrysdr.models import AuditLog, User
+from sentrysdr.models import AuditLog, User, UserSession
 from sentrysdr.security import client_ip
 from sentrysdr.web import create_app
 
@@ -143,15 +147,28 @@ def test_every_route_is_guarded_or_explicitly_public(app):
               "/api/nodes/agent/enroll", "/api/nodes/agent/calls", "/api/nodes/agent/ws",
               "/api/{_rest:path}", "/{path:path}"}
     client = client_for(app)
-    for route in app.routes:
+    routes = all_routes(app)
+    assert len([r for r in routes if getattr(r, "path", "").startswith("/api/")]) > 60  # the walk really found them
+    for route in routes:
         path = getattr(route, "path", "")
         if not path.startswith("/api") or path in public or not getattr(route, "methods", None):
             continue
-        url = path.replace("{source_id}", "1").replace("{user_id}", "1").replace("{path:path}", "x")
-        for name in ("{target_id}", "{recorder_id}", "{recording_id}", "{node_id}", "{ban_id}", "{kind}", "{name}"):
-            url = url.replace(name, "1")
+        url = re.sub(r"\{[a-z_]+(:path)?\}", "1", path)
         for method in route.methods - {"HEAD", "OPTIONS"}:
             assert client.request(method, url, json={}).status_code == 401, f"{method} {path} is open"
+
+
+def all_routes(app):
+    """Every route, including those inside included routers, which newer FastAPI wraps."""
+    found, stack = [], list(app.routes)
+    while stack:
+        route = stack.pop()
+        inner = getattr(route, "original_router", None)
+        if inner is not None:
+            stack.extend(inner.routes)
+        else:
+            found.append(route)
+    return found
 
 
 @pytest.mark.parametrize("method,path", [
@@ -521,3 +538,55 @@ def test_proxy_that_sets_forwarded_proto_counts_as_a_proxy(tmp_path):
     response = client.post("/api/auth/login", json={"email": ADMIN_EMAIL, "password": PASSWORD},
                            headers={"X-Forwarded-Proto": "https"})
     assert "secure" in response.headers["set-cookie"].lower()
+
+
+
+# --- audit fixes ---------------------------------------------------------------
+def test_turning_two_factor_off_needs_a_current_code(ctx, app):
+    add_user(ctx, "t@example.com")
+    client = client_for(app, "t@example.com")
+    secret = client.post("/api/me/totp/setup", json={"password": PASSWORD}).json()["secret"]
+    totp = pyotp.TOTP(secret)
+    client.post("/api/me/totp/enable", json={"code": totp.now()}).raise_for_status()
+    assert client.post("/api/me/totp/disable", json={"password": PASSWORD}).status_code == 403
+    assert client.post("/api/me/totp/disable", json={"password": PASSWORD, "code": "000000"}).status_code == 403
+    next_code = totp.at(time.time() + 30)  # the current one was used to enable it
+    assert client.post("/api/me/totp/disable", json={"password": PASSWORD, "code": next_code}).json()["totp_enabled"] is False
+
+
+def test_password_checks_in_account_settings_are_rate_limited(ctx, app):
+    add_user(ctx, "g@example.com")
+    client = client_for(app, "g@example.com")
+    for _ in range(8):
+        assert client.post("/api/me/totp/setup", json={"password": "wrong-password-123"}).status_code == 403
+    # A session thief can't keep guessing: even the right password is refused for a while.
+    assert client.post("/api/me/totp/setup", json={"password": PASSWORD}).status_code == 429
+    assert client.patch("/api/me", json={"email": "new@example.com", "current_password": PASSWORD}).status_code == 429
+
+
+def test_lists_keep_private_details_from_listeners(ctx, admin, listener):
+    admin.post("/api/sources", json={"serial": "SER1", "name": "S"}).raise_for_status()
+    made = admin.post("/api/targets", json={
+        "name": "Ships", "kind": "ais", "modulation": "ais", "frequency_hz": 162_000_000,
+        "feeds": {"udp": [{"service": "marinetraffic", "host": "5.9.207.224", "port": 10000}]}}).json()
+    admin.post("/api/targets", json={"name": "Fire", "frequency_hz": 154_430_000, "rdio_enabled": True,
+                                     "rdio_system": 11, "rdio_talkgroup": 5}).raise_for_status()
+    admin.post("/api/sources/1/assign", json={"target_id": made["id"]}).raise_for_status()
+    for target in listener.get("/api/targets").json():
+        assert target["feeds"] is None and target["rdio_talkgroup"] is None
+    assert any(t["feeds"] for t in admin.get("/api/targets").json())
+    assert listener.get("/api/sources").json()[0]["assigned_by"] == ""
+    assert all(r["assigned_by"] == "" for r in listener.get("/api/recorders").json())
+    assert admin.get("/api/sources").json()[0]["assigned_by"] == ADMIN_EMAIL
+
+
+def test_expired_sessions_are_cleared(ctx, app):
+    add_user(ctx, "e@example.com")
+    client_for(app, "e@example.com")
+    with ctx.db() as session:
+        for row in session.query(UserSession):
+            row.expires_at = time.time() - 1
+        session.commit()
+    assert ctx.apply_retention()["sessions"] >= 1
+    with ctx.db() as session:
+        assert session.query(UserSession).count() == 0

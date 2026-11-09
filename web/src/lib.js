@@ -66,7 +66,7 @@ export const formatRanges = (ranges) => (ranges?.length
 // An antenna with no ranges entered isn't judged, as on the server.
 export const antennaCovers = (ranges, hz) => !ranges?.length || ranges.some(([low, high]) => low <= hz && hz <= high);
 export const ANTENNA_UNITS = [['in', 'inches'], ['ft', 'feet'], ['cm', 'cm'], ['m', 'metres']];
-export const formatTime = (epoch) => (epoch ? new Date(epoch * 1000).toLocaleString() : 'None');
+export const formatTime = (epoch) => (epoch ? new Date(epoch * 1000).toLocaleString() : 'Never');
 
 export function formatDuration(seconds) {
   const total = Math.round(seconds ?? 0);
@@ -91,4 +91,45 @@ export const DEFAULT_GAIN_DB = 40.2;
 
 export const STATE_LABELS = {
   listening: 'Listening', idle: 'Idle', error: 'Fault', offline: 'Offline', measuring: 'Measuring noise',
+  detecting: 'Detecting tuner',
 };
+
+// What a stick can do. Keep in step with sentrysdr/capabilities.py.
+export const RECORDED_USES = [['voice', 'Analog voice'], ['digital', 'Digital voice'], ['adsb', 'ADS-B'], ['ais', 'AIS'], ['acars', 'ACARS']];
+export const OTHER_USES = [['broadcast_fm', 'Broadcast FM']];
+const ANALOG_MODES = ['nfm', 'am', 'wfm'];
+export const useLabel = (key) => [...RECORDED_USES, ...OTHER_USES].find(([id]) => id === key)?.[1] ?? key;
+
+// The step the stick will really use when a gain isn't one of its steps, else null.
+export function nearestStep(steps, gain) {
+  if (!steps?.length || gain === '' || gain === null || gain === undefined) return null;
+  const value = Number(gain);
+  const nearest = steps.reduce((best, step) => (Math.abs(step - value) < Math.abs(best - value) ? step : best));
+  return Math.abs(nearest - value) <= 0.05 ? null : nearest;
+}
+
+function neededUses(target) {
+  if (['adsb', 'ais', 'acars'].includes(target.kind)) return [target.kind];
+  if (target.modulation === 'wfm') return ['voice', 'broadcast_fm'];
+  if (ANALOG_MODES.includes(target.modulation)) return ['voice'];
+  return ['digital'];
+}
+
+// Short reasons a stick may not suit a target, for marking pickers. Unset values aren't judged.
+export function stickProblems(source, target) {
+  if (!source || !target) return [];
+  const found = [];
+  const hz = target.frequency_hz;
+  if ((source.cap_min_hz != null && hz < source.cap_min_hz) || (source.cap_max_hz != null && hz > source.cap_max_hz)) found.push('outside stick range');
+  if (source.uses?.length && !neededUses(target).some((use) => source.uses.includes(use))) found.push('stick not set up for this');
+  if (!antennaCovers(source.antenna_ranges, hz)) found.push('outside antenna range');
+  return found;
+}
+// Short, so a long target name still fits in a dropdown. The hint below it gives the reasons.
+export const problemNote = (source, target) => (stickProblems(source, target).length ? ' (may not suit)' : '');
+export const formatRange = (low, high) => (low == null && high == null ? 'Not set' : `${low == null ? '?' : plainMHz(low)} to ${high == null ? '?' : plainMHz(high)} MHz`);
+
+// Feeding other services. Keep in step with sentrysdr/feeds.py.
+export const ADSB_AGGREGATORS = [['adsbx', 'ADS-B Exchange'], ['airplanes_live', 'airplanes.live'], ['adsb_lol', 'adsb.lol'], ['adsb_fi', 'adsb.fi']];
+export const AIS_SERVICES = [['marinetraffic', 'MarineTraffic'], ['aishub', 'AISHub'], ['vesselfinder', 'VesselFinder']];
+export const feedLabel = (key) => [...ADSB_AGGREGATORS, ...AIS_SERVICES, ['community', 'aiscatcher.org']].find(([id]) => id === key)?.[1] ?? key;

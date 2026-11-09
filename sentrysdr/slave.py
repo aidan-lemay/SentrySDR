@@ -18,6 +18,7 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx
 import websockets
 
+from . import aio
 from . import pipelines
 from .config import Config
 from .engine import MeasureError, Supervisor
@@ -206,7 +207,7 @@ class Slave:
             except httpx.HTTPError as exc:
                 log.warning("spool upload deferred: %s", exc)
             with contextlib.suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(self.spool_event.wait(), 30)
+                await aio.wait_for(self.spool_event.wait(), 30)
             self.spool_event.clear()
 
     # --- master link ------------------------------------------------------
@@ -268,7 +269,7 @@ class Slave:
     async def _measure(self, message: dict) -> None:
         reply = {"t": "measure_result", "id": str(message.get("id", ""))[:64], "ok": False}
         try:
-            request = pipelines.sanitize_measure(message)
+            request = {"op": "detect"} if message.get("op") == "detect" else pipelines.sanitize_measure(message)
             reply["result"] = await self.supervisor.measure(str(message.get("serial", "")), **request)
             reply["ok"] = True
         except (pipelines.SpecError, MeasureError) as exc:

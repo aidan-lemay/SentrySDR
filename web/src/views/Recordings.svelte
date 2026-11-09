@@ -133,23 +133,24 @@
 <h1>Recordings</h1>
 <p class="small">
   {total} call{total === 1 ? '' : 's'}{#if sourceFilter}, from one source. <a href="#/recordings">Show all</a>{/if}
-  {#if user.clearcut_page_url} | <a href={user.clearcut_page_url} target="_blank" rel="noopener noreferrer">Open ClearCut</a>{/if}
+  {#if user.clearcut_page_url}{' | '}<a href={user.clearcut_page_url} target="_blank" rel="noopener noreferrer">Open ClearCut</a>{/if}
 </p>
 
 {#if error}<div class="err" role="alert">{error}</div>{/if}
 
 <form onsubmit={applyFilters}>
-  <fieldset>
-    <legend>Search</legend>
-    <label class="field"><span>Target, source or transcript</span><input type="search" bind:value={search} /></label>
+  <div class="search">
+    <div class="pair">
+      <input type="search" bind:value={search} aria-label="Search recordings" placeholder="Target, source or transcript" />
+      <button class="main">Search</button>
+    </div>
     <details>
-      <summary class="small" style="padding:.3rem 0">Date and other filters</summary>
+      <summary class="small">Date and other filters</summary>
       <label class="field"><span>From</span><input type="datetime-local" bind:value={start} /></label>
       <label class="field"><span>To</span><input type="datetime-local" bind:value={end} /></label>
       <div class="field"><span>Protected</span><label class="tick"><input type="checkbox" bind:checked={protectedOnly} /> Protected calls only</label></div>
     </details>
-    <div class="buttons form-buttons"><button class="main">Search</button></div>
-  </fieldset>
+  </div>
 </form>
 
 <div class="box">

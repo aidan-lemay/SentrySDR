@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import tempfile
 import time
 import uuid
@@ -16,7 +17,7 @@ from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Reque
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 
-from .. import security
+from .. import aio, feeds, security
 from ..config import SERIAL_RE
 from ..context import Context
 from ..models import Node, Source, Target, User
@@ -136,6 +137,9 @@ def clean_meta(raw: dict, node: Node, db) -> dict:
         }
     except (KeyError, TypeError, ValueError) as exc:
         raise HTTPException(422, "Invalid call metadata") from exc
+    times = (meta["started_at"], meta["ended_at"])
+    if not all(_epoch(t) for t in times) or not 0 <= meta["duration"] <= 86400 or not math.isfinite(meta["duration"]):
+        raise HTTPException(422, "Invalid call times")
     if serial not in (node.serials or []):
         raise HTTPException(403, "That serial doesn't belong to this node")
     source = db.scalar(select(Source).where(Source.node_id == node.id, Source.serial == serial))
@@ -230,6 +234,29 @@ def decode_live_frame(frame: bytes) -> tuple[str, int, bytes] | None:
     return serial, rate, frame[5 + length:]
 
 
+def _epoch(value) -> float | None:
+    """A time from a slave, or None if it isn't a plausible one."""
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) and 0 < value < 32503680000 else None
+
+
+def clean_feed_status(raw) -> dict:
+    """A slave's report of its feeds, keeping only what the page shows."""
+    if not isinstance(raw, dict):
+        return {}
+    clean = {}
+    if isinstance(raw.get("aggregators"), dict):
+        clean["aggregators"] = {k: bool(v) for k, v in raw["aggregators"].items() if k in feeds.ADSB_AGGREGATORS}
+    if isinstance(raw.get("local_clients"), int) and 0 <= raw["local_clients"] < 1000:
+        clean["local_clients"] = raw["local_clients"]
+    if isinstance(raw.get("sending"), list):
+        clean["sending"] = [s for s in raw["sending"] if s in feeds.AIS_SERVICES or s == "community"][:10]
+    return clean
+
+
 def handle_agent_message(ctx: Context, node_id: int, allowed: list[str], message: dict) -> None:
     kind = message.get("t")
     if kind == "status":
@@ -237,14 +264,15 @@ def handle_agent_message(ctx: Context, node_id: int, allowed: list[str], message
             if serial in allowed and isinstance(status, dict):
                 ctx.set_status(node_id, serial, {
                     "state": str(status.get("state", ""))[:16], "error": str(status.get("error", ""))[:300],
-                    "in_call": bool(status.get("in_call")), "call_started": status.get("call_started"),
-                    "last_call_at": status.get("last_call_at"),
+                    "in_call": bool(status.get("in_call")), "call_started": _epoch(status.get("call_started")),
+                    "last_call_at": _epoch(status.get("last_call_at")),
+                    "note": str(status.get("note") or "")[:300], "feeds": clean_feed_status(status.get("feeds")),
                 })
     elif kind == "measure_result":
         ctx.finish_measure(node_id, message)
     elif kind == "tracks":
         serial, track_kind = message.get("serial"), message.get("kind")
-        if serial in allowed and track_kind in ("adsb", "ais") and isinstance(message.get("data"), dict):
+        if serial in allowed and track_kind in ("adsb", "ais", "acars") and isinstance(message.get("data"), dict):
             ctx.update_tracks(track_kind, node_id, serial, message["data"])
 
 
@@ -265,7 +293,7 @@ async def agent_socket(websocket: WebSocket):
     allowed: list[str] = []
     writer = None
     try:
-        hello = json.loads(await asyncio.wait_for(websocket.receive_text(), 15))
+        hello = json.loads(await aio.wait_for(websocket.receive_text(), 15))
         allowed = [s for s in hello.get("serials", []) if isinstance(s, str) and SERIAL_RE.match(s)][:64]
         with ctx.db() as db:
             node = db.get(Node, node_id)

@@ -1,6 +1,6 @@
 <script>
   import { onMount } from 'svelte';
-  import { antennaCovers, api, DAYS, formatMHz, formatSchedule } from '../lib.js';
+  import { api, DAYS, formatMHz, formatSchedule, problemNote, stickProblems } from '../lib.js';
   import Notice from '../Notice.svelte';
   import { clearAfter } from '../notice.svelte.js';
 
@@ -81,7 +81,7 @@
 </script>
 
 <h1>Schedule</h1>
-<p class="small">A schedule takes over its source for the times shown, then the source goes back to its assigned target.{#if tz} Times are in {tz}.{/if}</p>
+<p class="small">A schedule takes over its source for the times shown, then the source goes back to its assigned target.{tz ? ` Times are in ${tz}.` : ''}</p>
 
 {#if error}<div class="err" role="alert">{error}</div>{/if}
 {#if message}<Notice ondismiss={() => (message = '')}>{message}</Notice>{/if}
@@ -93,7 +93,7 @@
     <tbody>
       {#each scheduled as recorder (recorder.id)}
         <tr>
-          <td class="title-cell">{recorder.name}{#if !recorder.enabled} <span class="st-warn">(off)</span>{/if}</td>
+          <td class="title-cell">{recorder.name}{#if !recorder.enabled}{' '}<span class="st-warn">(off)</span>{/if}</td>
           <td data-label="Source"><span>{recorder.source_name}</span></td>
           <td data-label="Target"><span>{recorder.target_name} <span class="mono small nowrap">{formatMHz(recorder.frequency_hz)}</span></span></td>
           <td data-label="When"><span>{formatSchedule(recorder)}</span></td>
@@ -117,13 +117,13 @@
   <div class="box">
     <h2>Always on</h2>
     <table class="table">
-      <thead><tr><th>Source</th><th>Target</th><th>Assigned by</th></tr></thead>
+      <thead><tr><th>Source</th><th>Target</th>{#if canEdit}<th>Assigned by</th>{/if}</tr></thead>
       <tbody>
         {#each alwaysOn as recorder (recorder.id)}
           <tr>
             <td class="title-cell">{recorder.source_name}</td>
             <td data-label="Target"><span>{recorder.target_name} <span class="mono small nowrap">{formatMHz(recorder.frequency_hz)}</span></span></td>
-            <td data-label="Assigned by"><span>{recorder.assigned_by}</span></td>
+            {#if canEdit}<td data-label="Assigned by"><span>{recorder.assigned_by}</span></td>{/if}
           </tr>
         {/each}
       </tbody>
@@ -142,13 +142,13 @@
           {#each sources as source (source.id)}<option value={source.id}>{source.name}</option>{/each}
         </select>
       </label>
-      <label class="field"><span>Target</span>
+      <label class="field wide"><span>Target</span>
         <select bind:value={form.target_id} required>
           <option value="" disabled>Choose...</option>
-          {#each targets as target (target.id)}<option value={target.id}>{target.name} ({formatMHz(target.frequency_hz)}){antennaCovers(chosenSource?.antenna_ranges, target.frequency_hz) ? '' : ', outside antenna range'}</option>{/each}
+          {#each targets as target (target.id)}<option value={target.id}>{target.name} ({formatMHz(target.frequency_hz)}){problemNote(chosenSource, target)}</option>{/each}
         </select>
-        {#if chosenSource?.antenna_name && form.target_id !== '' && !antennaCovers(chosenSource.antenna_ranges, targets.find((t) => t.id === Number(form.target_id))?.frequency_hz)}
-          <span class="hint st-warn">{chosenSource.antenna_name} on {chosenSource.name} doesn't cover this frequency, so reception may be poor.</span>
+        {#if form.target_id !== '' && stickProblems(chosenSource, targets.find((t) => t.id === Number(form.target_id))).length}
+          <span class="hint st-warn">{chosenSource.name} may not suit that target: {stickProblems(chosenSource, targets.find((t) => t.id === Number(form.target_id))).join(', ')}. You can still schedule it.</span>
         {/if}
       </label>
       <label class="field"><span>Start time</span><input type="time" bind:value={form.start} required /></label>

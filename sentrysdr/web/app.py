@@ -16,7 +16,7 @@ from ..models import Node
 from ..security import (
     client_ip, hash_token, host_of, host_permitted, is_direct_plain_http, origin_permitted, peer_permitted,
 )
-from . import routes_account, routes_admin, routes_nodes, routes_radio, routes_recordings
+from . import routes_account, routes_admin, routes_messages, routes_nodes, routes_radio, routes_recordings
 from .deps import ip_banned
 
 WEB_DIST = Path(__file__).resolve().parent.parent.parent / "web" / "dist"
@@ -155,7 +155,7 @@ def create_app(ctx: Context, run_background: bool = True) -> FastAPI:
     app.state.ctx = ctx
     app.add_middleware(SecurityMiddleware, ctx=ctx)
 
-    for module in (routes_account, routes_admin, routes_radio, routes_recordings, routes_nodes):
+    for module in (routes_account, routes_admin, routes_radio, routes_recordings, routes_messages, routes_nodes):
         app.include_router(module.router)
 
     @app.get("/api/health")

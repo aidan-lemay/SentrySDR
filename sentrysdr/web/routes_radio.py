@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import uuid
 import time
 from datetime import datetime
 from pathlib import Path
@@ -12,12 +13,13 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 
-from .. import pipelines, schedule
+from .. import aio, capabilities, feeds, pipelines, schedule
 from ..config import SERIAL_RE
 from ..context import Context
 from ..engine import MeasureError
 from ..models import ANTENNA_UNITS, Antenna, BroadcastifySystem, Node, Recorder, SdrProfile, Source, Target, User, now
-from .deps import admin_user, ctx_of, current_user, get_db, ip_of, require
+from .deps import admin_user, ctx_of, current_user, effective_permissions, get_db, ip_of, require
+from .routes_messages import annotate_aircraft
 
 router = APIRouter(prefix="/api")
 
@@ -128,6 +130,27 @@ class SourceBody(BaseModel):
     antenna_id: int | None = None
     gain_db: float | None = Field(default=None, ge=0, le=60)
     ppm: int = Field(default=0, ge=-500, le=500)
+    tuner: str | None = Field(default=None, max_length=40)
+    gain_steps: list[float] = Field(default_factory=list, max_length=capabilities.MAX_GAIN_STEPS)
+    cap_min_hz: int | None = Field(default=None, ge=0, le=10_000_000_000)
+    cap_max_hz: int | None = Field(default=None, ge=0, le=10_000_000_000)
+    uses: list[str] = Field(default_factory=list, max_length=len(capabilities.USES) + len(capabilities.RETIRED_USES))
+
+    @field_validator("gain_steps")
+    @classmethod
+    def _steps(cls, value: list[float]) -> list[float]:
+        if any(not -20 <= step <= 70 for step in value):
+            raise ValueError("gain steps must be between -20 and 70 dB")
+        return sorted({round(step, 1) for step in value})
+
+    @field_validator("uses")
+    @classmethod
+    def _uses(cls, value: list[str]) -> list[str]:
+        value = [use for use in value if use not in capabilities.RETIRED_USES]  # from a page opened before they went
+        unknown = set(value) - set(capabilities.USES)
+        if unknown:
+            raise ValueError(f"unknown uses: {', '.join(sorted(unknown))}")
+        return sorted(set(value))
 
     @field_validator("serial")
     @classmethod
@@ -153,8 +176,11 @@ def _source_view(ctx: Context, db, source: Source, winners: dict, recorders: lis
         "description": source.description, "antenna_id": antenna.id if antenna else None,
         "antenna_name": antenna.name if antenna else "", "antenna_ranges": antenna.ranges if antenna else [],
         "gain_db": source.gain_db, "ppm": source.ppm,
+        "tuner": source.tuner or "", "gain_steps": source.gain_steps or [],
+        "cap_min_hz": source.cap_min_hz, "cap_max_hz": source.cap_max_hz, "uses": source.uses or [],
         "state": status.get("state", "offline" if not online else "idle"),
         "error": status.get("error", ""), "in_call": status.get("in_call", False),
+        "note": status.get("note", ""), "feeds": status.get("feeds") or {},
         "call_started": status.get("call_started"), "last_call_at": status.get("last_call_at"),
         "locked": bool(base and base.locked),
         "base_recorder_id": base.id if base else None,
@@ -188,11 +214,20 @@ def _winners(ctx: Context, db) -> tuple[dict, list[Recorder]]:
 
 
 @router.get("/sources")
-def list_sources(request: Request, _user: User = Depends(current_user), db=Depends(get_db)):
+def list_sources(request: Request, user: User = Depends(current_user), db=Depends(get_db)):
     ctx = ctx_of(request)
     winners, recorders = _winners(ctx, db)
     sources = db.scalars(select(Source).order_by(Source.name))
-    return [_source_view(ctx, db, s, winners, recorders) for s in sources]
+    views = []
+    for source in sources:
+        view = _source_view(ctx, db, source, winners, recorders)
+        # Admins only: with the ID, someone else could feed aggregators as this receiver.
+        if user.role == "admin":
+            view["feeder_uuid"] = source.feeder_uuid
+        if "assign" not in effective_permissions(user):
+            view["assigned_by"] = ""  # other people's email addresses
+        views.append(view)
+    return views
 
 
 @router.get("/sources/available")
@@ -220,23 +255,42 @@ def _validate_source(ctx: Context, db, body: SourceBody) -> Node:
         raise HTTPException(422, "That serial isn't in the node's sdr.serials configuration")
     if body.antenna_id is not None and db.get(Antenna, body.antenna_id) is None:
         raise HTTPException(422, "That antenna doesn't exist")
+    if body.cap_min_hz is not None and body.cap_max_hz is not None and body.cap_min_hz > body.cap_max_hz:
+        raise HTTPException(422, "The stick's frequency range starts above where it ends")
     return node
+
+
+def _refuse_off_step(steps: list[float] | None, gain: float | None, unchanged: float | None = None) -> None:
+    """Once a stick's steps are known, only those can be chosen. A gain saved before then may stay."""
+    if gain is None or (unchanged is not None and abs(gain - unchanged) < 1e-9):
+        return
+    nearest = capabilities.nearest_step(steps, gain)
+    if nearest is not None:
+        raise HTTPException(422, f"{gain:g} dB isn't one of this stick's gain steps. The nearest is {nearest:g} dB.")
+
+
+def _gain_warning(source: Source) -> str | None:
+    nearest = capabilities.nearest_step(source.gain_steps, source.gain_db)
+    if nearest is None:
+        return None
+    return f"{source.gain_db:g} dB isn't one of this stick's gain steps, so it will use {nearest:g} dB."
 
 
 @router.post("/sources", status_code=201)
 def create_source(body: SourceBody, request: Request, admin: User = Depends(admin_user), db=Depends(get_db)):
     ctx = ctx_of(request)
     node = _validate_source(ctx, db, body)
+    _refuse_off_step(body.gain_steps, body.gain_db)
     if db.scalar(select(Source).where(Source.node_id == node.id, Source.serial == body.serial)):
         raise HTTPException(409, "That SDR is already defined")
     values = body.model_dump()
     values["node_id"] = node.id
-    source = Source(**values)
+    source = Source(**values, feeder_uuid=str(uuid.uuid4()))
     db.add(source)
     db.commit()
     ctx.audit("source.created", user=admin, ip=ip_of(request), target=source.name)
     ctx.kick()
-    return {"id": source.id}
+    return {"id": source.id, "warning": _gain_warning(source)}
 
 
 @router.put("/sources/{source_id}")
@@ -246,6 +300,7 @@ def update_source(source_id: int, body: SourceBody, request: Request, admin: Use
     if source is None:
         raise HTTPException(404, "Source not found")
     node = _validate_source(ctx, db, body)
+    _refuse_off_step(body.gain_steps, body.gain_db, source.gain_db)
     values = body.model_dump()
     values["node_id"] = node.id
     for key, value in values.items():
@@ -253,7 +308,7 @@ def update_source(source_id: int, body: SourceBody, request: Request, admin: Use
     db.commit()
     ctx.audit("source.updated", user=admin, ip=ip_of(request), target=source.name)
     ctx.kick()
-    return {"id": source.id}
+    return {"id": source.id, "warning": _gain_warning(source)}
 
 
 @router.delete("/sources/{source_id}")
@@ -287,12 +342,29 @@ class TargetBody(BaseModel):
     broadcastify_enabled: bool = False
     broadcastify_system_ref: int | None = None
     broadcastify_slot: int | None = Field(default=None, ge=1)
+    acars_channels: list[int] | None = Field(default_factory=list, max_length=pipelines.ACARS_MAX_CHANNELS)
+    airframes_enabled: bool = False
+    feeds: dict | None = None
 
 
 def _validate_target(body: TargetBody, db, target_id: int | None = None) -> None:
-    allowed = {"audio": pipelines.ANALOG | set(pipelines.DIGITAL), "adsb": {"adsb"}, "ais": {"ais"}}
+    allowed = {"audio": pipelines.ANALOG | set(pipelines.DIGITAL), "adsb": {"adsb"}, "ais": {"ais"}, "acars": {"acars"}}
     if body.modulation not in allowed.get(body.kind, set()):
         raise HTTPException(422, f"Modulation {body.modulation} doesn't fit a {body.kind} target")
+    if body.kind == "acars":
+        body.acars_channels = sorted(set(body.acars_channels or []))
+        problem = pipelines.acars_channel_problem(body.acars_channels)
+        if problem:
+            raise HTTPException(422, problem)
+        body.frequency_hz = body.acars_channels[0]  # the lowest, for range checks and lists
+    else:
+        if body.acars_channels or body.airframes_enabled:  # None is fine too
+            raise HTTPException(422, "Only ACARS targets have channels or feed airframes.io")
+        body.acars_channels = None
+    try:
+        body.feeds = feeds.clean(body.kind, body.feeds) or None
+    except feeds.FeedError as exc:
+        raise HTTPException(422, str(exc)) from None
     if body.clearcut_enabled and (body.clearcut_id is None or not body.clearcut_system):
         raise HTTPException(422, "ClearCut upload needs a system ID and a talkgroup")
     if body.rdio_enabled and (body.rdio_system is None or body.rdio_talkgroup is None):
@@ -332,9 +404,21 @@ def broadcastify_choices(_user: User = Depends(require("manage_targets")), db=De
             for s in db.scalars(select(BroadcastifySystem).order_by(BroadcastifySystem.name))]
 
 
+# Upload IDs and feed addresses (some services' ports identify your station) are only for
+# people who manage targets. Everyone else gets what the pages they can see actually use.
+TARGET_PRIVATE_FIELDS = (
+    "clearcut_system", "clearcut_id", "rdio_system", "rdio_talkgroup", "broadcastify_system_ref", "broadcastify_slot", "feeds",
+)
+
+
 @router.get("/targets")
-def list_targets(_user: User = Depends(current_user), db=Depends(get_db)):
-    return [_target_view(t) for t in db.scalars(select(Target).order_by(Target.name))]
+def list_targets(user: User = Depends(current_user), db=Depends(get_db)):
+    views = [_target_view(t) for t in db.scalars(select(Target).order_by(Target.name))]
+    if "manage_targets" not in effective_permissions(user):
+        for view in views:
+            for field in TARGET_PRIVATE_FIELDS:
+                view[field] = None
+    return views
 
 
 @router.post("/targets", status_code=201)
@@ -435,8 +519,18 @@ def _other_sdr_warning(db, source: Source, target: Target) -> str | None:
     return f"{', '.join(names)} can also record this channel. If both run together, only the first copy of each call is uploaded."
 
 
+def _stick_warning(db, source: Source, target: Target) -> str | None:
+    profile = db.scalar(select(SdrProfile).where(SdrProfile.source_id == source.id, SdrProfile.target_id == target.id))
+    gain = profile.gain_db if profile else source.gain_db
+    found = capabilities.problems(source, target.frequency_hz, target.kind, target.modulation, gain)
+    if not found:
+        return None
+    return f"{target.name} {' and '.join(found)} on {source.name}. It will still be tried."
+
+
 def _warnings(db, source: Source, target: Target) -> str | None:
-    found = [w for w in (_range_warning(db, source, target), _other_sdr_warning(db, source, target)) if w]
+    found = [w for w in (_stick_warning(db, source, target), _range_warning(db, source, target),
+                         _other_sdr_warning(db, source, target)) if w]
     return " ".join(found) or None
 
 
@@ -548,6 +642,32 @@ async def measure_source(source_id: int, body: MeasureBody, request: Request, us
     return {**result, "gain_db": body.gain_db}
 
 
+class DetectBody(BaseModel):
+    node_id: int | None = None
+    serial: str = Field(min_length=1, max_length=64)
+
+
+@router.post("/sources/detect")
+async def detect_stick(body: DetectBody, request: Request, admin: User = Depends(admin_user), db=Depends(get_db)):
+    """Read a stick's tuner and gain steps. Pauses its recording for a few seconds. Saves nothing."""
+    ctx = ctx_of(request)
+    node = db.get(Node, body.node_id or ctx.local_node_id)
+    if node is None or node.status != "active" or body.serial not in (node.serials or []):
+        raise HTTPException(404, "That SDR isn't configured on that node")
+    if not ctx.node_online(node):
+        raise HTTPException(409, "That node is offline.")
+    key = f"measure:{admin.id}"
+    if ctx.limiter.blocked(key, MEASURE_LIMIT, MEASURE_WINDOW):
+        raise HTTPException(429, "Too many measurements. Try again later.")
+    ctx.limiter.hit(key, MEASURE_WINDOW)
+    db.commit()  # ends the read transaction: detection takes seconds
+    ctx.audit("source.detected", user=admin, ip=ip_of(request), target=body.serial)
+    try:
+        return await ctx.measure(node, body.serial, {"op": "detect"})
+    except MeasureError as exc:
+        raise HTTPException(409, str(exc)) from None
+
+
 class ProfileBody(BaseModel):
     squelch: int = Field(ge=0, le=100000)
     gain_db: float | None = Field(default=None, ge=0, le=60)
@@ -560,6 +680,7 @@ def save_profile(source_id: int, target_id: int, body: ProfileBody, request: Req
     source, target = _source_and_audio_target(db, source_id, target_id)
     _refuse_if_locked(db, user, source_id)
     profile = db.scalar(select(SdrProfile).where(SdrProfile.source_id == source_id, SdrProfile.target_id == target_id))
+    _refuse_off_step(source.gain_steps, body.gain_db, profile.gain_db if profile else None)
     if profile is None:
         profile = SdrProfile(source_id=source_id, target_id=target_id)
         db.add(profile)
@@ -570,7 +691,9 @@ def save_profile(source_id: int, target_id: int, body: ProfileBody, request: Req
     ctx.audit("profile.saved", user=user, ip=ip_of(request), target=source.name,
               details={"target": target.name, "squelch": body.squelch, "gain_db": body.gain_db})
     ctx.kick()
-    return _profile_view(profile)
+    nearest = capabilities.nearest_step(source.gain_steps, body.gain_db)
+    warning = f"{body.gain_db:g} dB isn't one of this stick's gain steps, so it will use {nearest:g} dB." if nearest is not None else None
+    return {**_profile_view(profile), "warning": warning}
 
 
 @router.delete("/sources/{source_id}/profiles/{target_id}")
@@ -618,8 +741,12 @@ def _recorder_view(db, recorder: Recorder) -> dict:
 
 
 @router.get("/recorders")
-def list_recorders(_user: User = Depends(current_user), db=Depends(get_db)):
-    return [_recorder_view(db, r) for r in db.scalars(select(Recorder).order_by(Recorder.id))]
+def list_recorders(user: User = Depends(current_user), db=Depends(get_db)):
+    views = [_recorder_view(db, r) for r in db.scalars(select(Recorder).order_by(Recorder.id))]
+    if "assign" not in effective_permissions(user):
+        for view in views:
+            view["assigned_by"] = ""  # other people's email addresses
+    return views
 
 
 def _save_recorder(ctx, request, user, db, body: RecorderBody, recorder: Recorder | None):
@@ -696,7 +823,7 @@ async def live_audio(source_id: int, request: Request, user: User = Depends(requ
         try:
             while True:
                 try:
-                    yield await asyncio.wait_for(queue.get(), 15)
+                    yield await aio.wait_for(queue.get(), 15)
                 except asyncio.TimeoutError:
                     if await request.is_disconnected():
                         return
@@ -713,10 +840,13 @@ async def live_audio(source_id: int, request: Request, user: User = Depends(requ
 
 # --- maps ------------------------------------------------------------------
 @router.get("/maps/{kind}")
-def map_tracks(kind: str, request: Request, _user: User = Depends(require("maps"))):
+def map_tracks(kind: str, request: Request, _user: User = Depends(require("maps")), db=Depends(get_db)):
     if kind not in ("adsb", "ais"):
         raise HTTPException(404, "Unknown map")
-    return {"items": ctx_of(request).current_tracks(kind)}
+    items = ctx_of(request).current_tracks(kind)
+    if kind == "adsb":
+        items = annotate_aircraft(request, db, items)
+    return {"items": items}
 
 
 def _tar1090_json(ctx: Context, name: str) -> Response:

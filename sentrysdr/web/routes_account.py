@@ -38,6 +38,16 @@ def check_new_password(password: str) -> None:
         raise HTTPException(422, problem)
 
 
+def confirm_password(ctx, user: User, password: str, message: str) -> None:
+    """Checks a signed-in user's password, with the same limit as signing in, so a stolen session can't guess it."""
+    key = f"password:{user.id}"
+    if ctx.limiter.blocked(key, LOGIN_LIMIT_ACCOUNT, LOGIN_WINDOW):
+        raise HTTPException(429, "Too many attempts. Try again later.")
+    if not security.verify_password(user.password_hash, password):
+        ctx.limiter.hit(key, LOGIN_WINDOW)
+        raise HTTPException(403, message)
+
+
 def user_view(user: User) -> dict:
     return {
         "id": user.id, "email": user.email, "name": user.name, "role": user.role,
@@ -178,8 +188,7 @@ def update_me(body: ProfileBody, request: Request, user: User = Depends(current_
         email = normalize_email(body.email)
         if email != user.email:
             # Changing the sign-in email requires proof that it's really the owner.
-            if not security.verify_password(user.password_hash, body.current_password or ""):
-                raise HTTPException(403, "Enter your current password to change your email")
+            confirm_password(ctx, user, body.current_password or "", "Enter your current password to change your email")
             if email_banned(ctx, email) or db.scalar(select(User).where(func.lower(User.email) == email)):
                 raise HTTPException(409, "That email can't be used")
             user.email = email
@@ -197,12 +206,7 @@ class PasswordBody(BaseModel):
 def change_password(body: PasswordBody, request: Request, user: User = Depends(session_user), db=Depends(get_db)):
     ctx = ctx_of(request)
     user = db.merge(user)
-    key = f"password:{user.id}"
-    if ctx.limiter.blocked(key, LOGIN_LIMIT_ACCOUNT, LOGIN_WINDOW):
-        raise HTTPException(429, "Too many attempts. Try again later.")
-    if not security.verify_password(user.password_hash, body.current_password):
-        ctx.limiter.hit(key, LOGIN_WINDOW)
-        raise HTTPException(403, "Current password is incorrect")
+    confirm_password(ctx, user, body.current_password, "Current password is incorrect")
     check_new_password(body.new_password)
     if body.new_password == body.current_password:
         raise HTTPException(422, "Choose a different password")
@@ -222,8 +226,7 @@ class ConfirmPassword(BaseModel):
 def totp_setup(body: ConfirmPassword, request: Request, user: User = Depends(current_user), db=Depends(get_db)):
     ctx = ctx_of(request)
     user = db.merge(user)
-    if not security.verify_password(user.password_hash, body.password):
-        raise HTTPException(403, "Password is incorrect")
+    confirm_password(ctx, user, body.password, "Password is incorrect")
     if user.totp_enabled:
         raise HTTPException(409, "Two-factor authentication is already on")
     secret = security.new_totp_secret()
@@ -236,13 +239,24 @@ class TotpCode(BaseModel):
     code: str = Field(max_length=12)
 
 
+class DisableTotp(BaseModel):
+    password: str = Field(max_length=security.MAX_PASSWORD_LENGTH)
+    code: str = Field(default="", max_length=12)
+
+
 @router.post("/me/totp/enable")
 def totp_enable(body: TotpCode, request: Request, user: User = Depends(current_user), db=Depends(get_db)):
     ctx = ctx_of(request)
     user = db.merge(user)
+    if user.totp_enabled:
+        raise HTTPException(409, "Two-factor authentication is already on")
+    key = f"totp:{user.id}"
+    if ctx.limiter.blocked(key, LOGIN_LIMIT_ACCOUNT, LOGIN_WINDOW):
+        raise HTTPException(429, "Too many attempts. Try again later.")
     secret = ctx.secrets.open(user.totp_secret_enc or "")
     step = security.verify_totp(secret, body.code, 0) if secret else None
     if step is None:
+        ctx.limiter.hit(key, LOGIN_WINDOW)
         raise HTTPException(422, "Incorrect code")
     user.totp_enabled, user.totp_last_step = True, step
     db.commit()
@@ -251,11 +265,20 @@ def totp_enable(body: TotpCode, request: Request, user: User = Depends(current_u
 
 
 @router.post("/me/totp/disable")
-def totp_disable(body: ConfirmPassword, request: Request, user: User = Depends(current_user), db=Depends(get_db)):
+def totp_disable(body: DisableTotp, request: Request, user: User = Depends(current_user), db=Depends(get_db)):
+    """Needs the password and a current code: a stolen session plus a leaked password isn't enough."""
     ctx = ctx_of(request)
     user = db.merge(user)
-    if not security.verify_password(user.password_hash, body.password):
-        raise HTTPException(403, "Password is incorrect")
+    confirm_password(ctx, user, body.password, "Password is incorrect")
+    if user.totp_enabled:
+        key = f"totp:{user.id}"
+        if ctx.limiter.blocked(key, LOGIN_LIMIT_ACCOUNT, LOGIN_WINDOW):
+            raise HTTPException(429, "Too many attempts. Try again later.")
+        secret = ctx.secrets.open(user.totp_secret_enc or "")
+        step = security.verify_totp(secret, body.code, user.totp_last_step) if secret else None
+        if step is None:
+            ctx.limiter.hit(key, LOGIN_WINDOW)
+            raise HTTPException(403, "Enter a current code from your authenticator app")
     user.totp_enabled, user.totp_secret_enc, user.totp_last_step = False, None, 0
     db.commit()
     ctx.audit("account.totp_disabled", user=user, ip=ip_of(request))

@@ -1,6 +1,7 @@
 """Database schema. Timestamps are UTC epoch seconds."""
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 
@@ -98,6 +99,14 @@ class Source(Base):
     gain_db: Mapped[float | None] = mapped_column(nullable=True)  # None = tuner AGC
     ppm: Mapped[int] = mapped_column(default=0)
     antenna_id: Mapped[int | None] = mapped_column(nullable=True)  # Antenna.id, cleared when it's removed
+    # What the stick can do. Unset values aren't checked. Not freq_min_hz/freq_max_hz,
+    # which are retired: filling those would turn them into an antenna on the next start.
+    tuner: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    gain_steps: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    cap_min_hz: Mapped[int | None] = mapped_column(nullable=True)
+    cap_max_hz: Mapped[int | None] = mapped_column(nullable=True)
+    uses: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    feeder_uuid: Mapped[str | None] = mapped_column(String(36), nullable=True)  # identifies this receiver to aggregators
     __table_args__ = (Index("uq_source_node_serial", "node_id", "serial", unique=True),)
 
 
@@ -134,6 +143,9 @@ class Target(Base):
     broadcastify_enabled: Mapped[bool | None] = mapped_column(nullable=True)
     broadcastify_system_ref: Mapped[int | None] = mapped_column(nullable=True)  # BroadcastifySystem.id
     broadcastify_slot: Mapped[int | None] = mapped_column(nullable=True)  # the node's frequency slot
+    acars_channels: Mapped[list | None] = mapped_column(JSON, nullable=True)  # Hz; frequency_hz is the lowest
+    airframes_enabled: Mapped[bool | None] = mapped_column(nullable=True)  # feed messages to airframes.io
+    feeds: Mapped[dict | None] = mapped_column(JSON, nullable=True)  # ADS-B and AIS sharing, see feeds.clean
 
 
 class BroadcastifySystem(Base):
@@ -203,6 +215,29 @@ class Recording(Base):
     clearcut_system: Mapped[str | None] = mapped_column(String(64), nullable=True)
     clearcut_talkgroup: Mapped[int | None] = mapped_column(nullable=True)
     clearcut_call_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+
+class AcarsMessage(Base):
+    """One decoded ACARS message. Copies of the names are kept, like recordings."""
+    __tablename__ = "acars_messages"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    received_at: Mapped[float] = mapped_column(index=True)
+    node_name: Mapped[str] = mapped_column(String(120), default="")
+    serial: Mapped[str] = mapped_column(String(64), default="")
+    source_name: Mapped[str] = mapped_column(String(120), default="")
+    target_id: Mapped[int | None] = mapped_column(nullable=True)
+    target_name: Mapped[str] = mapped_column(String(120), default="")
+    frequency_hz: Mapped[int] = mapped_column(default=0)
+    level: Mapped[float | None] = mapped_column(nullable=True)
+    mode: Mapped[str] = mapped_column(String(4), default="")
+    label: Mapped[str] = mapped_column(String(4), default="", index=True)
+    block_id: Mapped[str] = mapped_column(String(4), default="")
+    msgno: Mapped[str] = mapped_column(String(8), default="")
+    tail: Mapped[str] = mapped_column(String(16), default="", index=True)  # without the leading dot
+    flight: Mapped[str] = mapped_column(String(16), default="", index=True)
+    text: Mapped[str] = mapped_column(String(4000), default="")
+    has_text: Mapped[bool] = mapped_column(default=False, index=True)
+    fed: Mapped[bool | None] = mapped_column(nullable=True)  # sent to airframes.io
 
 
 class UploadJob(Base):
@@ -275,6 +310,25 @@ def _convert_source_antennas(engine) -> None:
             )
 
 
+def _drop_retired_uses(engine) -> None:
+    """Some stick uses were removed from the app. Take them off sticks that had them."""
+    from .capabilities import RETIRED_USES
+    with engine.begin() as connection:
+        for source_id, uses in connection.execute(text("SELECT id, uses FROM sources WHERE uses IS NOT NULL")).all():
+            current = json.loads(uses) if isinstance(uses, str) else uses
+            if isinstance(current, list) and set(current) & RETIRED_USES:
+                kept = [u for u in current if u not in RETIRED_USES]
+                connection.execute(text("UPDATE sources SET uses = :u WHERE id = :s"), {"u": json.dumps(kept), "s": source_id})
+
+
+def _fill_feeder_uuids(engine) -> None:
+    """Each receiver gets a stable random ID, which aggregators use to tell feeders apart."""
+    import uuid
+    with engine.begin() as connection:
+        for (source_id,) in connection.execute(text("SELECT id FROM sources WHERE feeder_uuid IS NULL")).all():
+            connection.execute(text("UPDATE sources SET feeder_uuid = :u WHERE id = :s"), {"u": str(uuid.uuid4()), "s": source_id})
+
+
 def make_session_factory(db_path: Path):
     db_path.parent.mkdir(parents=True, exist_ok=True)
     engine = create_engine(
@@ -294,6 +348,8 @@ def make_session_factory(db_path: Path):
     _add_missing_columns(engine)
     _retire_lock_passwords(engine)
     _convert_source_antennas(engine)
+    _drop_retired_uses(engine)
+    _fill_feeder_uuids(engine)
     try:
         db_path.chmod(0o600)
     except OSError:

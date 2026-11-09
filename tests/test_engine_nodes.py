@@ -664,7 +664,7 @@ async def test_measuring_twice_at_once_is_refused(tmp_path, monkeypatch):
     try:
         running = asyncio.create_task(sup.measure("SER1", **MEASURE))
         assert await wait_for(lambda: sup.workers["SER1"].measuring)
-        with pytest.raises(engine.MeasureError, match="already"):
+        with pytest.raises(engine.MeasureError, match="busy"):
             await sup.measure("SER1", **MEASURE)
         await running
     finally:
@@ -841,3 +841,255 @@ def test_list_sdrs_with_nothing_usable_prints_no_line(tmp_path, monkeypatch, cap
         monkeypatch.setattr("sentrysdr.sdr.enumerate_serials", lambda: devices)
         cmd_list_sdrs(make_config(tmp_path))
         assert "serials = " not in capsys.readouterr().out
+
+
+# --- a stick that didn't open cleanly ---------------------------------------
+@pytest.mark.parametrize("line,flagged", [
+    ("rtlsdr_write_reg failed with -7", True), ("Resetting device...", True),
+    ("WARNING: Failed to set sample rate.", True), ("Found Rafael Micro R828D tuner", False),
+])
+async def test_usb_fault_lines(line, flagged):
+    stream = asyncio.StreamReader()
+    stream.feed_data(f"{line}\n".encode()); stream.feed_eof()
+    seen = []
+    await engine._log_stderr("S", stream, [], lambda: seen.append(1))
+    assert bool(seen) is flagged
+
+
+async def test_errors_while_exiting_are_ignored():
+    stream = asyncio.StreamReader()
+    stream.feed_data(b"Signal caught, exiting!\nUser cancel, exiting...\nrtlsdr_demod_write_reg failed with -9\nrtlsdr_write_reg failed with -7\n")
+    stream.feed_eof()
+    seen = []
+    await engine._log_stderr("S", stream, [], lambda: seen.append(1))
+    assert seen == []
+
+def resetting_tool(starts, resets_on):
+    """A fake rtl_fm that prints librtlsdr's reset message on the given starts (1-based)."""
+    return f"""#!/usr/bin/env python3
+import sys, time
+with open({str(starts)!r}, "a") as f: f.write("x")
+n = len(open({str(starts)!r}).read())
+if n in {sorted(resets_on)!r}:
+    sys.stderr.write("rtlsdr_write_reg failed with -7\\nResetting device...\\n"); sys.stderr.flush()
+time.sleep(60)
+"""
+
+
+@pytest.fixture
+def fast_reset(monkeypatch):
+    monkeypatch.setattr(engine, "RESET_SETTLE_SECONDS", 0.2)
+
+
+async def test_reset_on_open_restarts_once_and_notes_it(tmp_path, fast_reset):
+    bins, starts = tmp_path / "bin", tmp_path / "starts"
+    install_tool(bins, "rtl_fm", resetting_tool(starts, {1}))
+    sup = supervisor(make_config(tmp_path, bin_dirs=[bins]), [])
+    worker = sup.workers["SER1"]
+    try:
+        await sup.apply({"SER1": spec()})
+        assert await wait_for(lambda: starts.exists() and len(starts.read_text()) == 2)
+        assert await wait_for(lambda: worker.state == "listening")
+        await asyncio.sleep(1.5)
+        assert len(starts.read_text()) == 2  # one restart, then left alone
+        assert worker.error == "" and "so it was restarted" in worker.note and "USB errors" in worker.note
+        assert worker.snapshot()["note"] == worker.note
+    finally:
+        await sup.shutdown()
+
+
+async def test_reset_every_open_doesnt_loop(tmp_path, fast_reset):
+    bins, starts = tmp_path / "bin", tmp_path / "starts"
+    install_tool(bins, "rtl_fm", resetting_tool(starts, {1, 2, 3, 4, 5}))
+    sup = supervisor(make_config(tmp_path, bin_dirs=[bins]), [])
+    worker = sup.workers["SER1"]
+    try:
+        await sup.apply({"SER1": spec()})
+        assert await wait_for(lambda: "twice in a row" in worker.note)
+        await asyncio.sleep(2.0)
+        assert len(starts.read_text()) == 2 and worker.state == "listening"
+    finally:
+        await sup.shutdown()
+
+
+async def test_new_assignment_clears_the_note(tmp_path, fast_reset):
+    bins, starts = tmp_path / "bin", tmp_path / "starts"
+    install_tool(bins, "rtl_fm", resetting_tool(starts, {1}))
+    sup = supervisor(make_config(tmp_path, bin_dirs=[bins]), [])
+    worker = sup.workers["SER1"]
+    try:
+        await sup.apply({"SER1": spec()})
+        assert await wait_for(lambda: worker.note)
+        await sup.apply({"SER1": spec(frequency_hz=145_000_000)})
+        assert await wait_for(lambda: worker.state == "listening" and worker.note == "")
+    finally:
+        await sup.shutdown()
+
+
+async def test_reset_note_reaches_the_sources_page(ctx, admin):
+    admin.post("/api/sources", json={"serial": "SER1", "name": "S"}).raise_for_status()
+    ctx.status[(ctx.local_node_id, "SER1")] = {"state": "listening", "error": "", "note": "Reset itself on start"}
+    assert admin.get("/api/sources").json()[0]["note"] == "Reset itself on start"
+
+
+# --- detecting a stick's tuner --------------------------------------------------
+FAKE_RTL_TEST = """#!/usr/bin/env python3
+import sys
+sys.stderr.write("Found 1 device(s):\\nUsing device 0: Generic RTL2832U OEM\\nFound Rafael Micro R828D tuner\\n")
+sys.stderr.write("Supported gain values (3): 0.0 19.7 49.6 \\nNo E4000 tuner found, aborting.\\n")
+"""
+
+
+async def test_detect_pauses_reads_and_resumes(tmp_path):
+    bins = tmp_path / "bin"
+    install_tool(bins, "rtl_test", FAKE_RTL_TEST)
+    install_tool(bins, "rtl_fm", "#!/bin/sh\nsleep 60\n")
+    sup = supervisor(make_config(tmp_path, bin_dirs=[bins]), [])
+    worker = sup.workers["SER1"]
+    try:
+        await sup.apply({"SER1": spec()})
+        assert await wait_for(lambda: worker.state == "listening")
+        found = await sup.measure("SER1", op="detect")
+        assert found == {"tuner": "R828D", "gain_steps": [0.0, 19.7, 49.6], "freq_min_hz": 24_000_000, "freq_max_hz": 1_766_000_000}
+        assert await wait_for(lambda: worker.state == "listening")
+    finally:
+        await sup.shutdown()
+
+
+async def test_detect_with_no_tuner_found_is_an_error(tmp_path):
+    bins = tmp_path / "bin"
+    install_tool(bins, "rtl_test", "#!/bin/sh\necho 'usb_claim_interface error -6'\n")
+    sup = supervisor(make_config(tmp_path, bin_dirs=[bins]), [])
+    try:
+        with pytest.raises(engine.MeasureError, match="usb_claim_interface"):
+            await sup.measure("SER1", op="detect")
+    finally:
+        await sup.shutdown()
+
+
+async def test_slave_answers_a_detect_request(tmp_path):
+    bins = tmp_path / "bin"
+    install_tool(bins, "rtl_test", FAKE_RTL_TEST)
+    cfg = make_config(tmp_path, role="slave", master_url="https://sentry.example.com", bin_dirs=[bins], serials=["FIELD1"])
+    slave = Slave(cfg, enumerate_fn=lambda: ["FIELD1"])
+    slave.outgoing = asyncio.Queue()
+    try:
+        await slave.handle_message({"t": "measure", "id": "d1", "serial": "FIELD1", "op": "detect"})
+        reply = json.loads(await asyncio.wait_for(slave.outgoing.get(), 15))
+        assert reply["ok"] and reply["result"]["tuner"] == "R828D"
+    finally:
+        await slave.supervisor.shutdown()
+
+
+# --- ACARS ------------------------------------------------------------------------
+FAKE_ACARSDEC = """#!/usr/bin/env python3
+import json, sys, time
+open(sys.argv[0] + ".args", "w").write(" ".join(sys.argv[1:]))
+print("not json")
+print("x" * 70000)
+print(json.dumps({"freq": 131.55, "tail": ".N123UA", "text": "HELLO", "label": "H1"}))
+sys.stdout.flush()
+time.sleep(60)
+"""
+
+
+async def test_acars_worker_passes_messages_on(tmp_path):
+    bins = tmp_path / "bin"
+    install_tool(bins, "acarsdec", FAKE_ACARSDEC)
+    got = []
+    sup = supervisor(make_config(tmp_path, bin_dirs=[bins]), [], tracks=lambda kind, serial, data: got.append((kind, serial, data)))
+    try:
+        await sup.apply({"SER1": spec(kind="acars", modulation="acars", frequency_hz=130_025_000, squelch=0,
+                                      channels=[130_025_000, 131_550_000], gain_db=40.2)})
+        assert await wait_for(lambda: got)
+        await asyncio.sleep(0.3)
+    finally:
+        await sup.shutdown()
+    assert len(got) == 1  # the junk lines are skipped
+    kind, serial, data = got[0]
+    assert kind == "acars" and serial == "SER1" and data["target_id"] == 1 and data["message"]["tail"] == ".N123UA"
+    args = (bins / "acarsdec.args").read_text()
+    assert args == "--output json:file:path=- --rtlsdr 0 -g 40.2 130.025 131.550"
+
+
+# --- feed connection checks -------------------------------------------------------
+def test_established_connections_are_found_and_sorted(tmp_path):
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen()
+    port = server.getsockname()[1]
+    client = socket.create_connection(("127.0.0.1", port))
+    accepted, _ = server.accept()
+    try:
+        cfg = make_config(tmp_path)
+        sup = supervisor(cfg, [])
+        worker = sup.workers["SER1"]
+        # In this process the client looks like an outbound feed, and the accepted side like a local reader.
+        worker._check_feeds(os.getpid(), {"adsbx": {"127.0.0.1"}, "adsb_fi": {"192.0.2.1"}}, port)
+        assert worker.feed_status["aggregators"] == {"adsbx": True, "adsb_fi": False}
+        assert worker.feed_status["local_clients"] == 1
+        assert worker.snapshot()["feeds"] == worker.feed_status
+    finally:
+        for s in (client, accepted, server):
+            s.close()
+
+
+
+# --- what slaves send is checked ---------------------------------------------------
+def test_aircraft_data_is_cleaned_and_capped(ctx):
+    from sentrysdr import context as context_module
+    hostile = {"hex": "a00001", "flight": "<img src=x onerror=alert(1)>", "lat": 43.1, "lon": float("nan"),
+               "alt_baro": 1e300, "bad key!": 1, "nested": {"deep": {"deeper": {"x": 1}}}, "list": list(range(100))}
+    ctx.update_tracks("adsb", 7, "S", {"aircraft": [hostile] + [{"hex": f"{i:06x}"} for i in range(context_module.MAX_TRACK_ITEMS + 50)]})
+    items = ctx.current_tracks("adsb")
+    assert len(items) <= context_module.MAX_TRACK_ITEMS
+    clean = next(i for i in items if i.get("hex") == "a00001")
+    assert "<" not in clean["flight"] and ">" not in clean["flight"]
+    assert clean["lon"] is None and clean["alt_baro"] is None and "bad key!" not in clean
+    assert clean["nested"] == {"deep": None}  # only two levels kept; readsb's own lists are one level down
+    assert len(clean["list"]) == 32
+
+
+def test_ship_names_keep_apostrophes(ctx):
+    ctx.update_tracks("ais", 7, "S", {"vessels": [{"mmsi": 1, "shipname": "O'BRIEN\x00 & SONS"}]})
+    assert ctx.current_tracks("ais")[0]["shipname"] == "O'BRIEN & SONS"
+
+
+def test_acars_floods_are_capped(ctx, monkeypatch):
+    from sentrysdr import context as context_module
+    monkeypatch.setattr(context_module, "ACARS_LIMIT_PER_MINUTE", 5)
+    stored = []
+    monkeypatch.setattr(ctx, "ingest_acars", lambda *args: stored.append(args))
+    for i in range(20):
+        ctx.update_tracks("acars", 7, "S", {"message": {"text": str(i)}})
+    assert len(stored) == 5
+
+
+def test_slave_times_are_checked(ctx):
+    from sentrysdr.web.routes_nodes import handle_agent_message, _epoch
+    handle_agent_message(ctx, 7, ["S"], {"t": "status", "sources": {"S": {"state": "x", "last_call_at": "nan", "call_started": "<b>"}}})
+    assert ctx.status[(7, "S")]["last_call_at"] is None and ctx.status[(7, "S")]["call_started"] is None
+    assert _epoch(1.7e9) == 1.7e9 and _epoch(float("inf")) is None and _epoch(-5) is None
+
+
+async def test_call_being_split_survives_a_shutdown(tmp_path, caplog):
+    """A split call was saved twice when a retune or shutdown landed mid-save, and lost."""
+    bins = tmp_path / "bin"
+    install_tool(bins, "rtl_fm", "#!/usr/bin/env python3\nimport sys,time\nwhile True:\n  sys.stdout.buffer.write(b'\\1\\0'*1600);sys.stdout.flush();time.sleep(0.05)\n")
+    calls = []
+    cfg = make_config(tmp_path, bin_dirs=[bins], max_call_seconds=1)
+    sup = supervisor(cfg, calls)
+    await sup.apply({"SER1": spec()})
+    assert await wait_for(lambda: len(calls) >= 2)
+    before = len(calls)
+    await sup.shutdown()
+    assert len(calls) == before + 1  # the call in progress was saved too
+    assert "encoding failed" not in caplog.text and "failed to save" not in caplog.text
+    assert list((cfg.recordings_dir / ".tmp").glob("*.raw")) == []
+
+
+def test_app_never_uses_asyncio_wait_for():
+    """On Python 3.11 (Raspberry Pi OS) it can lose a cancellation, so a stop or retune hangs. Use aio.wait_for."""
+    root = Path(__file__).resolve().parent.parent / "sentrysdr"
+    offenders = [str(p) for p in root.rglob("*.py") if p.name != "aio.py" and "asyncio.wait_for(" in p.read_text()]
+    assert offenders == []

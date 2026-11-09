@@ -2,12 +2,12 @@
 
 Self-hosted radio monitoring. SentrySDR tunes RTL-SDR receivers, records each transmission as a separate call, and gives approved users a PWA for live listening, recordings, schedules, and aircraft and ship maps.
 
-It supervises existing tools instead of reimplementing them: `rtl_fm`, `ffmpeg`, `readsb` and tar1090, `AIS-catcher`, and `dsd-fme`.
+It supervises existing tools instead of reimplementing them: `rtl_fm`, `ffmpeg`, `readsb` and tar1090, `AIS-catcher`, `dsd-fme` and `acarsdec`. It can also upload calls to Broadcastify Calls, RDIO Scanner and ClearCut, and share aircraft, ship and ACARS data with community services.
 
 ## How it fits together
 
 - **One application, two roles.** `node.role` in the configuration file selects `master` or `slave`.
-- **Master:** holds users and recordings, serves the web UI, runs schedules, and forwards calls to RDIO and ClearCut. By default it listens on loopback only, so publish it through a tunnel or reverse proxy. Direct access by local IP is opt-in.
+- **Master:** holds users, recordings and ACARS messages, serves the web UI, runs schedules, and uploads calls to Broadcastify Calls, RDIO Scanner and ClearCut. By default it listens on loopback only, so publish it through a tunnel or reverse proxy. Direct access by local IP is opt-in.
 - **Slave:** opens no listening ports. It dials out to the master, takes its configuration from the master's UI, and sends everything back. If the link drops, it keeps recording its last assignment and uploads the calls when the link returns.
 - **One target per SDR at a time.** A schedule takes over its source for the window, then the source returns to its assigned target.
 - **Locks.** An administrator can tick **Lock this assignment** on the Sources page. Other users then can't change that SDR's assignment or schedules, its target, or its squelch profiles, and can't measure it. There's no password. Locks set with a password in an older version stay locked, and their passwords are deleted on upgrade.
@@ -15,14 +15,40 @@ It supervises existing tools instead of reimplementing them: `rtl_fm`, `ffmpeg`,
 
 ## Install
 
+### Requirements
+
+- **System:** Debian 12 or newer, or Raspberry Pi OS (Bookworm or newer), with systemd. Other Linux systems work, but you install the packages yourself (see the top of `scripts/install.sh`). Python 3.11 or newer.
+- **Master:** any 64-bit machine that stays on. It holds the recordings, so give it disk space: about 0.25 MB per minute of recorded audio. It also needs Node.js and npm to build the web interface, which the script installs.
+- **Slave:** a Raspberry Pi 3B or newer works for one or two SDRs. Each SDR uses one USB port, and see [USB connections](#usb-connections).
+- **SDRs:** RTL-SDR sticks (RTL2832U), each with a unique serial number. Sticks often ship with the same serial; give each its own with `rtl_eeprom -s <serial>`, one stick plugged in at a time.
+
+### Master
+
 ```sh
-sudo ./scripts/install.sh master          # or: slave
-sudo ./scripts/install.sh master --with-decoders   # also builds readsb, tar1090, AIS-catcher, dsd-fme
+git clone <this repository> SentrySDR && cd SentrySDR
+sudo ./scripts/install.sh master --with-decoders   # leave out --with-decoders for voice calls only
 ```
 
-The script prints the remaining steps: choose SDR serials, edit `/etc/sentrysdr/sentrysdr.toml`, create the first admin, and start the service. There are no default credentials. Example configurations are in [config/](config/).
+The script installs packages, creates the `sentrysdr` user, copies the application to `/opt/sentrysdr`, installs the exact tested Python packages from `requirements.lock`, builds the web interface, and installs the systemd service. It doesn't start anything. `--with-decoders` also builds readsb, tar1090, AIS-catcher, dsd-fme and acarsdec into `/opt/sentrysdr/.vendor`; without them, ADS-B, AIS, digital voice and ACARS targets show a fault.
 
-To add a slave, go to **Admin > Nodes** on the master to create a one-time token, then put the token in the slave's configuration. The token is swapped for a key that you can revoke per node.
+1. **Find your SDRs:** `sudo -u sentrysdr /opt/sentrysdr/.venv/bin/python -m sentrysdr -c /etc/sentrysdr/sentrysdr.toml list-sdrs`. It prints a line to paste into the configuration.
+2. **Configure:** edit `/etc/sentrysdr/sentrysdr.toml`. At least set `sdr.serials`, `server.public_url` (the address people will use), `server.timezone`, and `[proxy]` to match how you publish it (see [Publishing the master](#publishing-the-master)). The [example](config/master.example.toml) explains each setting.
+3. **Create the first administrator:** `sudo -u sentrysdr /opt/sentrysdr/.venv/bin/python -m sentrysdr -c /etc/sentrysdr/sentrysdr.toml create-admin`. There are no default accounts or passwords. Running it again for the same email resets that password.
+4. **Start it:** `sudo systemctl enable --now sentrysdr`, then check `systemctl status sentrysdr`.
+5. **Publish it** with a tunnel or reverse proxy, then sign in.
+6. **In the web interface:** add each SDR under **Admin > SDR sources** (and **Detect from the stick**), add targets, and assign them on the Sources page. Turn off **Let people request accounts** under **Admin > Settings** if you don't want sign-up requests.
+
+The script also blacklists the kernel's DVB-T driver, which would otherwise claim the sticks. Reboot once after installing, or unplug and replug the sticks.
+
+### Slave
+
+1. On the master, go to **Admin > Nodes**, enter a name, and select **Create token**. The token is shown once and lasts 24 hours.
+2. On the slave: `sudo ./scripts/install.sh slave --with-decoders`, then `list-sdrs` as above.
+3. Edit `/etc/sentrysdr/sentrysdr.toml`: `master.url` (any address that reaches the master; see the [example](config/slave.example.toml)), `master.enrollment_token`, and `sdr.serials`.
+4. `sudo systemctl enable --now sentrysdr`. The slave swaps the token for its own key and appears as online under **Admin > Nodes**. You can then remove the token line.
+5. On the master, add the slave's SDRs under **Admin > SDR sources**.
+
+Run the same version on the master and every slave. To retire a slave, select **Revoke** under **Admin > Nodes**; it disconnects and needs a new token to come back.
 
 Before you rely on it, read [USB connections](#usb-connections), and [Storing recordings on another drive](#storing-recordings-on-another-drive) if recordings won't stay on the system disk.
 
@@ -97,15 +123,49 @@ local_access = true
 
 This can run alongside a proxy. Requests through the proxy still get Secure cookies, and those through the local address don't.
 
+## Users and permissions
+
+Anyone can request an account at the sign-in page, unless **Let people request accounts** is off under **Admin > Settings**. A request does nothing until an administrator approves it under **Admin > Users**. From there an administrator can also change a user's role, see their sessions and history, reset their password or two-factor login, disable them, and ban their email or address. Disabling a user or resetting their password signs them out. **Admin > Bans** takes addresses and ranges too. Everyone can turn on two-factor login and change their password under **My account**.
+
+| Permission | Listener | Operator | Admin |
+|---|---|---|---|
+| Listen live, play and download recordings, see maps and messages | Yes | Yes | Yes |
+| Assign SDRs, make schedules, measure noise, save squelch profiles | | Yes | Yes |
+| Add and edit targets | | Yes | Yes |
+| Protect recordings, request ClearCut transcripts | | Yes | Yes |
+| Lock assignments, delete recordings, manage SDRs, antennas, nodes, users and settings | | | Yes |
+
+Each permission except the admin-only ones can be allowed or denied per user, under **Admin > Users > Manage**. A protected recording is never deleted automatically, and has to be unprotected before an admin can delete it. **Admin > Audit log** records sign-ins, changes and refusals, with the user and address.
+
+## Admin settings
+
+| Section | Holds |
+|---|---|
+| Users, Bans, Audit log | Accounts and access, as above |
+| SDR sources | Each SDR's name, description, antenna, gain, frequency correction and capabilities |
+| Antennas | Antennas and their frequency ranges |
+| Nodes | Slaves: create a one-time enrolment token, or revoke a slave |
+| Settings | How long recordings, ACARS messages and audit logs are kept (0 keeps them forever); sign-ups; the map tile server |
+| Uploads and feeds | RDIO and ClearCut servers and keys; the Broadcastify upload address and systems; the airframes.io station ID and address |
+
+Upload API keys are never shown again once saved. Leave a key's box blank to keep it.
+
 ## Security model
 
 - **Access:** signing up only requests an account. Every data route needs a signed-in, approved user, and a test fails if a new route forgets this.
-- **Passwords:** Argon2id, with limits on sign-in attempts per account and per address, and optional TOTP 2FA. Session tokens, device keys and enrolment tokens are stored only as hashes.
+- **Passwords:** Argon2id, at least 12 characters. Sign-in attempts are limited per account (8 in 15 minutes) and per address (30), and so are password checks when changing your email or two-factor settings, so a stolen session can't be used to guess the password. A wrong password costs the same time whether or not the account exists, and pending or banned status is only revealed to someone who knew the password. After 8 failures, even the right password is refused for up to 15 minutes, so someone guessing can lock an account out for that long.
+- **Two-factor sign-in:** TOTP, optional per user. Each code works once. Turning it off needs the password and a current code.
+- **Sessions:** random tokens stored only as hashes, which expire after 14 days without use. Changing a password signs out your other sessions; an admin disabling an account or resetting its password signs it out everywhere. Expired sessions are deleted hourly.
+- **Least privilege:** what each role can do is in [Users and permissions](#users-and-permissions). Users who can't manage targets don't receive upload IDs or feed addresses, and only those who can assign SDRs see who assigned them.
 - **Secrets at rest:** TOTP seeds and upload API keys are encrypted with `secret.key` in the data folder. Back up that file with the database, and keep both private.
-- **Browser protections:** strict CSP, `HttpOnly` and `SameSite=Strict` cookies, and Host and Origin checks. tar1090 is the one exception: it needs inline scripts, so it gets a looser CSP on its own path.
-- **Radio tools:** run as argv lists, never through a shell, with all values validated first, including those arriving from the network. Decoders are started with no network options, so they open no ports.
+- **Browser protections:** strict CSP, `HttpOnly`, `Secure` and `SameSite=Strict` cookies (not `Secure` over a plain-http local address), Host and Origin checks, and a custom header on every change, so other sites can't make requests as you. tar1090 is the one exception: it needs inline scripts, so it gets a looser CSP on its own path. Aircraft data it shows is cleaned of anything but plain characters first, because it can come from a slave.
+- **Radio tools:** run as argv lists, never through a shell, with all values validated first, including those arriving from the network. Decoders open no ports, with one opt-in exception: the local data port below.
+- **Slaves:** each enrols with a one-time token that expires in 24 hours, then uses its own key, stored only as a hash on the master and revocable from **Admin > Nodes**. A slave can only report on its own SDRs. What it sends is checked: call details and times, and limits on aircraft and ship lists (3,000 each) and ACARS messages (600 a minute per SDR), so a compromised slave can't fill the master's memory or database. Recordings are limited to 256 MB and must be MP3.
+- **Outbound connections:** only the uploads and feeds you turn on. Aggregator addresses are fixed in the code, so a master can switch a slave's feeds on or off but can't point them anywhere else. The airframes.io feed sends only acarsdec's own message fields and your station ID.
+- **Local data port:** the optional port for fr24feed and piaware is bound to 127.0.0.1 on the node with the SDR. readsb opens no other ports.
 - **SDRs:** only serials in `sdr.serials` are ever opened. Other dongles stay free for other software. Duplicate serials are refused; fix them with `rtl_eeprom -s`.
-- **Service:** runs unprivileged under a systemd sandbox, with only its data and log folders writable. If you move `recordings_dir` or `log_dir`, see [Storing recordings on another drive](#storing-recordings-on-another-drive).
+- **Service:** runs as the unprivileged `sentrysdr` user under a strict systemd sandbox: no capabilities, the system read-only, only its data and log folders writable, and USB as the only device. The application folder is owned by root, so the service can't change its own code. The configuration file is readable only by root and the service, and the database and keys only by the service. If you move `recordings_dir` or `log_dir`, see [Storing recordings on another drive](#storing-recordings-on-another-drive).
+- **Dependencies:** Python packages are installed at the exact versions in `requirements.lock`, and the web interface's from `web/package-lock.json`, so an install never picks up an untested release. The decoders are built from their projects' current source.
 - **Encryption on the air:** encrypted digital traffic isn't decoded. Check the rules on recording and sharing radio traffic where you operate.
 
 ## Decoder status
@@ -115,6 +175,7 @@ This can run alongside a proxy. Requests through the proxy still get Secure cook
 | `rtl_fm` (NFM, AM, WFM) | Run on a real RTL-SDR, including recording and live audio |
 | `readsb`, tar1090 | Run on a real RTL-SDR with real aircraft |
 | `AIS-catcher` | Run on a real RTL-SDR, and its output checked with a known message; no live ship received yet |
+| `acarsdec` | Not yet run on a real stick: tested against a stand-in that follows acarsdec's documented options and JSON output |
 | `dsd-fme` | DMR tested on air: a real simplex transmission recorded and played back clearly, with correct speed and call splitting, and live audio in step. P25, NXDN, D-STAR and YSF use the same pipeline but haven't been tested on air |
 
 Squelch, calls and noise measurement have been tested on air with NFM on three tuners: R820T (NESDR Mini), R828D and FC0012. Noise readings and squelch numbers differ between them, so measure each stick.
@@ -140,15 +201,59 @@ journalctl -k | grep -i -E "cannot reset|not accepting address|descriptor read"
 
 Any of those lines means the connection needs attention, so fix it before you measure noise or trust a squelch setting. `USB disconnect` on its own is normal when you unplug something.
 
+A stick that was last closed uncleanly, for example when a tool was killed, can come up with USB errors and then send nothing. When an SDR shows USB errors as it starts, SentrySDR restarts it once so it opens cleanly, and the Sources page notes the time. If it happens again within a minute, it's left running with the note. Seeing this often points to the hub or cable.
+
 If a stick is unplugged, its source shows a fault, and recording resumes by itself when it's back. Other SDRs keep running, and a call in progress is saved. A stick that stays connected but stops working may not show a fault, because it looks the same as a closed squelch.
 
 ## Antennas
 
 Describe each antenna under **Admin > Antennas**: name, type, length and the frequency ranges it works on. Use **+ Add** for each band, so a dual-band antenna gets two ranges. Then choose the antenna on each SDR under **Admin > SDR sources**. One antenna can feed several SDRs, for example through a splitter.
 
-If a target is outside every range of an SDR's antenna, the target pickers mark it **outside antenna range**, and assigning or scheduling it shows a warning. It still works, because an antenna often hears more than its rated bands. An antenna with no ranges isn't checked. Removing an antenna leaves its SDRs with none set.
+If a target is outside every range of an SDR's antenna, the target pickers mark it **(may not suit)**, choosing it says why, and assigning or scheduling it shows a warning. It still works, because an antenna often hears more than its rated bands. An antenna with no ranges isn't checked. Removing an antenna leaves its SDRs with none set.
 
 An older database's antenna type and frequency range on each source are turned into antennas on first start. Sources with the same type and range share one.
+
+## Stick capabilities
+
+Under **Admin > SDR sources**, each SDR can record what it can do: its tuner, frequency range, gain steps and uses. **Detect from the stick** reads the tuner and gain steps from the stick itself, on the master or a slave, and fills in that tuner's usual range. It pauses the stick for a few seconds and saves nothing until you select **Save**. Every field can be edited by hand.
+
+- A target outside the stick's range, or of a kind the stick isn't ticked for, is marked **(may not suit)** in the target pickers and warns when assigned or scheduled. It still runs. Analog voice, digital voice, ADS-B, AIS and ACARS are checked; Broadcast FM also counts for WFM targets.
+- The sticks only support their own gain steps: anything in between is rounded to the nearest. Once a stick's steps are known, its gain boxes become a list of those steps plus AGC, and other values are refused. A gain saved before the steps were known stays until changed, shown with the step it really gets. Detect moves the gain to the nearest step.
+- Without steps, for example before Detect or when the stick is open in another program, the gain box takes any number.
+- Anything left blank isn't checked. The description shows on the Sources page under the SDR's name.
+
+## ACARS
+
+ACARS is the short text messages aircraft send on VHF. An ACARS target lists the channels to decode: **North America** and **Europe** fill in the usual ones, and **+ Add** adds others. One stick decodes all of a target's channels at once with `acarsdec`, so they must fit within 2 MHz. North America's fifth channel, 129.125 MHz, doesn't fit with the other four, so it needs its own target and stick. Gain matters: acarsdec's AGC usually sits at maximum, so set a fixed gain on the stick.
+
+Messages appear on the **Messages** page, newest first, and update by themselves. Search by flight, registration, label or text. Messages with no text, mostly link checks, are hidden unless you tick **Show messages with no text**. On the ADS-B map, an aircraft that sent messages in the last hour links to them, matched by registration through tar1090's aircraft database. Flight numbers aren't matched, because ACARS and ADS-B use different airline codes. If two sticks hear the same message, it's kept once.
+
+To feed [airframes.io](https://airframes.io), set a **Station ID** under **Admin > Uploads and feeds**, for example `KE-KSEA-ACARS`: your initials, the nearest airport's ICAO code, then ACARS. Then tick **Feed messages to airframes.io** on the target. No account is needed. Messages are kept for 30 days by default, set under **Admin > Settings**. Messages from a slave are lost while its link to the master is down.
+
+acarsdec needs cJSON to build: `libcjson-dev` on Debian and Raspberry Pi OS, which `install.sh --with-decoders` installs.
+
+## Sharing ADS-B and AIS
+
+Turn sharing on per target, on the Targets page.
+
+Sharing runs wherever the target runs, on the master or a slave, and stops when the SDR moves to another target. A slave whose link to the master drops keeps sharing for its last assignment.
+
+**ADS-B aggregators:** tick ADS-B Exchange, airplanes.live, adsb.lol or adsb.fi under **Aggregators** in the Sharing box of an ADS-B target. readsb connects out to each one, using the addresses from each service's own setup script; no account or sign-up is needed. Each SDR has its own random feeder ID, which the services use to tell feeders apart. Admins can see it by editing the SDR under **Admin > SDR sources**, for feeder stats pages that ask for it. Keep it private: anyone with it could feed data as that receiver. The Sources page shows whether each one is connected; it checks every 10 seconds. To confirm data is arriving, use the feeder check on each service's website, which finds your feed by your public IP address.
+
+**FlightRadar24 and FlightAware** need their own programs, `fr24feed` and `piaware`, installed on the machine with the ADS-B stick (the master or a slave). Tick **Offer data to fr24feed or piaware** on the ADS-B target, and choose a port (30005 is the usual one). SentrySDR then offers Beast data on `127.0.0.1` only. The Sources page shows how many programs are reading it.
+
+- **FlightAware:** install the `piaware` package with FlightAware's instructions, then run `sudo piaware-config receiver-type other`, `sudo piaware-config receiver-host 127.0.0.1` and `sudo piaware-config receiver-port 30005`, and restart piaware. Claim the feeder on FlightAware's site.
+- **FlightRadar24:** install `fr24feed` with FlightRadar24's instructions. In its sign-up, choose a Beast receiver over TCP (network), host `127.0.0.1`, port `30005`.
+- **Don't let either install its own decoder.** `dump1090-fa`, or a dump1090 that fr24feed sets up, would open an RTL-SDR itself and take a stick from SentrySDR. If one got installed, stop and disable it.
+- MLAT isn't set up by SentrySDR. Both programs do their own MLAT if you give them your antenna's location.
+- The programs keep running when the SDR moves to another target, and reconnect when it comes back. SentrySDR doesn't start or stop them.
+- Each ADS-B target on one machine needs its own port. If two running at once share one, the second can't open it and shows a fault on the Sources page.
+
+**AIS:** on an AIS target:
+
+- **aiscatcher.org:** tick **Share with the aiscatcher.org community feed**. It's sent without a station key, so it isn't linked to an aiscatcher.org account.
+- **MarineTraffic, AISHub and VesselFinder:** register a station with the service first. Each gives you a UDP host and port. Tick **Send to** for that service and enter both. Up to six destinations per target.
+- UDP can't confirm delivery, so the Sources page only lists where data is being sent. Check the service's station page to confirm it's arriving.
 
 ## Tuning call detection
 
@@ -172,7 +277,7 @@ With nothing else running, `sentrysdr measure --serial <serial> --mhz 444.85 --m
 
 ## Uploads
 
-Set server URLs and keys in **Admin > Settings**, then enable uploads per target. Failed uploads retry with increasing delays, up to 12 attempts.
+Set server URLs and keys in **Admin > Uploads and feeds**, then turn uploads on per target, in the Uploads box on the Targets page. Uploads go from the master, including calls recorded on slaves. Failed uploads retry with increasing delays, up to 12 attempts, and the result shows on each recording.
 
 A target's **Volume** setting applies to its recordings, uploads and live audio. It doesn't affect squelch. Any setting other than 0 dB also removes DC, which stops a tuning offset from clipping the start of a call.
 
@@ -183,12 +288,18 @@ Replaces trunk-recorder's `broadcastify_uploader` for conventional channels. Bro
 - **Keep the clock right.** Broadcastify requires accurate time, and it rejects or wrongly deduplicates calls with bad timestamps. Each call's time comes from the machine that recorded it, so check the master and every slave with `timedatectl`, which should say `System clock synchronized: yes`. A Pi usually has no battery-backed clock, so it needs network time.
 - **Credentials are separate per environment.** Production credentials only work on `https://api.broadcastify.com/call-upload`. Development credentials are issued separately and only work on `https://api.broadcastify.com/call-upload-dev`. Don't try one on the other.
 
-1. In **Admin > Settings > Broadcastify Calls systems**, add each node's name, system ID and API key, then select **Check credentials**. This sends no call.
+1. In **Admin > Uploads and feeds > Broadcastify Calls systems**, add each node's name, system ID and API key, then select **Check credentials**. This sends no call.
 2. On each target, turn on **Upload calls to Broadcastify Calls**, then choose the system and the frequency's slot. Slots are on Broadcastify's Manage Calls Systems page, under Node Frequencies.
 
 All uploads go from the master, including calls recorded on slaves. A call Broadcastify skips counts as finished, and a call it rejects, or refuses for a bad API key, is not retried. The reason shows on the recording, and other calls keep uploading. Broadcastify refuses calls that arrive late (64 seconds was too late in testing), so other failures retry every 10 seconds, and calls held during an outage will probably be rejected. They stay in SentrySDR.
 
 `No-Freq-Table-Entry-For-Upload` means Broadcastify can't match the call to a frequency on that node. Check the system, the target's slot and its frequency against **Node Frequencies** on the Manage Calls Systems page. Stop any other uploader on the same slot before you switch.
+
+### RDIO Scanner
+
+1. In your RDIO Scanner admin, create an API key, and note the system and talkgroup IDs the channel should appear under.
+2. In **Admin > Uploads and feeds**, enter the RDIO server's address, such as `https://rdio.example.com`, and the API key. SentrySDR posts calls to its `/api/call-upload`.
+3. On each target, turn on **Upload calls to RDIO** and enter the system and talkgroup.
 
 ### Duplicate channels
 
@@ -207,6 +318,49 @@ ClearCut makes the transcript itself after a call is uploaded, either automatica
 
 ClearCut has no published API docs. The upload format comes from the `clearcut_uploader` plugin in [galenguyer/trunk-recorder](https://github.com/galenguyer/trunk-recorder/tree/clearcut), and the read and transcribe calls from [ClearCut_Mobile](https://github.com/aidan-lemay/ClearCut_Mobile).
 
+## Upgrading
+
+On the master and each slave:
+
+```sh
+cd SentrySDR && git pull
+sudo ./scripts/install.sh master        # or slave; add --with-decoders to rebuild the decoders too
+sudo systemctl restart sentrysdr
+```
+
+Re-running the script keeps the configuration file, database, recordings and keys. It replaces `/opt/sentrysdr`, so don't keep anything of your own there. Database changes apply on the first start. The decoders only need rebuilding with `--with-decoders` if you want newer versions of them. Upgrade the master and slaves together: measuring and detecting SDRs on a slave need matching versions.
+
+## Backups
+
+Everything the master knows is in `data_dir` (`/var/lib/sentrysdr` by default):
+
+- `sentrysdr.db`: users, settings, SDRs, targets, schedules, recordings' details, ACARS messages. Back it up while the service is stopped, or with `sqlite3 sentrysdr.db ".backup /path/to/copy.db"` while it runs.
+- `secret.key`: decrypts the upload API keys and two-factor secrets in the database. Without it, those have to be entered again. Keep it as private as the database.
+- `recordings/`, unless you moved `recordings_dir`.
+
+Keep `/etc/sentrysdr/sentrysdr.toml` too. A slave only holds calls waiting to upload, and its key in `data_dir`; a lost slave can be revoked and enrolled again.
+
+## Ports and firewall
+
+| What | Port | Who needs to reach it |
+|---|---|---|
+| Master web interface | 8642, on 127.0.0.1 by default | Only the tunnel or proxy on the same machine. With `local_access`, devices on your own network |
+| Slave | None | Nothing: slaves only connect out to the master |
+| Local data port for fr24feed or piaware | The port you choose, on 127.0.0.1 only | Only programs on the same machine |
+
+Outbound, the master connects to the upload and feed services you turn on; slaves connect to the master and, if you turn them on, the ADS-B and AIS services. [nftables.example.conf](deploy/nftables.example.conf) is a default-deny firewall for the master.
+
+## Logs and troubleshooting
+
+- **Service log:** `journalctl -u sentrysdr -f`. A file copy is in `log_dir` (`/var/log/sentrysdr`), with `audit.log` holding sign-ins and changes.
+- **Won't start:** `journalctl -u sentrysdr -n 50` usually names the problem. A configuration error says which setting. `Permission denied` or `Read-only file system` means a moved folder; see [Storing recordings on another drive](#storing-recordings-on-another-drive).
+- **An SDR shows "SDR not connected":** check `list-sdrs`, that its serial is in `sdr.serials` on the right node, and that nothing else (GQRX, SDR++, `dump1090-fa`) has it open.
+- **"tool not installed":** that target needs a decoder. Re-run the install with `--with-decoders`.
+- **Records nothing, or only static:** see [Tuning call detection](#tuning-call-detection) and [USB connections](#usb-connections).
+- **Upload failures** show on each recording, with the service's reply.
+- **Slave offline:** on the slave, `journalctl -u sentrysdr` shows why it can't reach the master. Check `master.url` and the clock (`timedatectl`).
+- **Forgotten admin password:** run `create-admin` again with the same email.
+
 ## Development
 
 ```sh
@@ -218,4 +372,6 @@ npm --prefix web ci && npm --prefix web run build
 
 Create an admin with `sentrysdr -c <config> create-admin`. Run with `sentrysdr -c <config> run`.
 
-Tests use fake radio tools, so they need `ffmpeg` but no SDR.
+Tests use fake radio tools, so they need `ffmpeg` but no SDR. Run them on Python 3.11 as well as your own version: Raspberry Pi OS ships 3.11, and some asyncio behaviour differs. In app code, use `aio.wait_for`, never `asyncio.wait_for`, which can lose a cancellation on 3.11 (a test enforces this).
+
+To update a Python dependency: upgrade it in the dev venv, run the tests and `pip-audit`, then regenerate `requirements.lock` with only the runtime packages. Check the web interface's with `npm audit --omit=dev`.

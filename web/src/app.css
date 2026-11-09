@@ -92,6 +92,7 @@ main { padding: .6rem; max-width: 1100px; margin: 0 auto; }
 .warn { border: 2px solid var(--amber); }
 .notice { display: flex; justify-content: space-between; align-items: flex-start; gap: .6rem; width: 100%; min-height: 0; text-align: left; border-radius: 0; }
 .notice-x { color: var(--dim); font-size: 1.1rem; line-height: 1; }
+.copyable { user-select: all; overflow-wrap: anywhere; }
 .secret { font-family: Consolas, Menlo, monospace; overflow-wrap: anywhere; user-select: all; background: var(--page); border: 1px solid var(--rule); padding: .4rem; margin-top: .3rem; }
 
 /* --- status words --- */
@@ -133,6 +134,11 @@ legend { font-weight: bold; padding: 0 .3rem; }
 .days { display: grid; grid-template-columns: repeat(4, 1fr); }
 .pair { display: flex; gap: .4rem; }
 .pair select { width: auto; flex: none; }
+.pair button { flex: none; }
+.search { margin-bottom: .75rem; }
+.search summary { padding: .4rem 0; }
+.search .pair input { flex: 1; }
+@media (min-width: 760px) { .search { max-width: 37.75rem; } }
 .ranges { border-collapse: collapse; width: 100%; }
 .ranges th { text-align: left; font-size: .875rem; font-weight: normal; color: var(--dim); padding: 0 .4rem .15rem 0; }
 .ranges td { padding: 0 .4rem .4rem 0; }
@@ -150,12 +156,14 @@ legend { font-weight: bold; padding: 0 .3rem; }
 .table td[data-label] { display: grid; grid-template-columns: 6.5rem minmax(0, 1fr); gap: .5rem; }
 .table td[data-label]::before { content: attr(data-label); color: var(--dim); font-size: .875rem; }
 .table td.empty { color: var(--dim); }
+.table td.wide-only { display: none; }  /* an empty cell keeps desktop columns lined up */
 .table .title-cell { font-weight: bold; }
 
 /* --- calls --- */
 .call { padding: .6rem; border-bottom: 1px solid var(--rule); }
 .call:last-child { border-bottom: 0; }
 .call audio { display: block; width: 100%; margin-top: .4rem; }
+.message-text { white-space: pre-wrap; overflow-wrap: anywhere; margin: .3rem 0 0; padding: .3rem .4rem; background: var(--page); border: 1px solid var(--rule); }
 .transcript { border-left: 3px solid var(--rule); padding-left: .5rem; margin-top: .4rem; overflow-wrap: anywhere; }
 audio { width: 100%; }
 
@@ -186,6 +194,7 @@ audio { width: 100%; }
   .field > span:first-child { margin: 0; font-size: 1rem; text-align: right; }
   .field .hint { grid-column: 2; margin-top: -.5rem; }
   .form-buttons { padding-left: 13.75rem; }
+  .field.wide { grid-template-columns: 13rem minmax(0, 36rem); }
   .field.top { align-items: start; }
   .field.top > span:first-child { padding-top: 1.55rem; }
   .days { display: flex; gap: 1rem; }
@@ -199,6 +208,7 @@ audio { width: 100%; }
     display: table-cell; border: 1px solid var(--rule); padding: .3rem .5rem; vertical-align: top;
   }
   .table td[data-label]::before { content: none; }
+  .table td.wide-only { display: table-cell; }
   .table .title-cell { font-weight: normal; }
 
   .tabs { display: flex; flex-wrap: wrap; gap: 2px; margin-bottom: .75rem; }

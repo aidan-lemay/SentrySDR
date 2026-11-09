@@ -22,12 +22,18 @@
   function popup(item) {
     const node = document.createElement('div');
     const lines = kind === 'adsb'
-      ? [label(item), `Hex ${item.hex}`, item.alt_baro != null ? `Altitude ${item.alt_baro} ft` : null, item.gs != null ? `Speed ${Math.round(item.gs)} kt` : null]
+      ? [label(item), item.registration ? `Registration ${item.registration}` : null, `Hex ${item.hex}`, item.alt_baro != null ? `Altitude ${item.alt_baro} ft` : null, item.gs != null ? `Speed ${Math.round(item.gs)} kt` : null]
       : [label(item), `MMSI ${item.mmsi}`, item.speed != null ? `Speed ${item.speed} kt` : null, item.destination ? `To ${item.destination}` : null];
     for (const line of lines.filter(Boolean)) {
       const row = document.createElement('div');
       row.textContent = String(line);
       node.append(row);
+    }
+    if (kind === 'adsb' && item.acars_count) {
+      const link = document.createElement('a');
+      link.href = `#/messages?tail=${encodeURIComponent(item.acars_tail)}`;
+      link.textContent = `${item.acars_count} ACARS message${item.acars_count === 1 ? '' : 's'} in the last hour`;
+      node.append(link);
     }
     return node;
   }

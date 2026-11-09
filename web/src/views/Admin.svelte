@@ -1,10 +1,11 @@
 <script>
   import { onMount, tick } from 'svelte';
-  import { ANTENNA_UNITS, DEFAULT_GAIN_DB, api, formatRanges, formatTime } from '../lib.js';
+  import { ANTENNA_UNITS, DEFAULT_GAIN_DB, OTHER_USES, RECORDED_USES, api, formatRange, formatRanges, formatTime, nearestStep } from '../lib.js';
   import Notice from '../Notice.svelte';
   import { clearAfter, NOTICE_MS } from '../notice.svelte.js';
+  import GainField from '../GainField.svelte';
 
-  const TABS = [['users', 'Users'], ['sources', 'SDR sources'], ['antennas', 'Antennas'], ['nodes', 'Nodes'], ['bans', 'Bans'], ['audit', 'Audit log'], ['settings', 'Settings']];
+  const TABS = [['users', 'Users'], ['sources', 'SDR sources'], ['antennas', 'Antennas'], ['nodes', 'Nodes'], ['bans', 'Bans'], ['audit', 'Audit log'], ['settings', 'Settings'], ['uploads', 'Uploads and feeds']];
   const PERMISSIONS = [
     ['listen_live', 'Listen live'], ['listen_recordings', 'Play recordings'], ['download', 'Download'],
     ['assign', 'Assign and schedule'], ['manage_targets', 'Manage targets'], ['protect', 'Protect recordings'],
@@ -24,7 +25,12 @@
   let sources = $state([]);
   let available = $state([]);
   let nodes = $state([]);
-  const blankSource = () => ({ id: null, key: '', name: '', description: '', antenna_id: '', gain: DEFAULT_GAIN_DB, ppm: 0 });
+  const blankSource = () => ({
+    id: null, key: '', name: '', description: '', antenna_id: '', gain: DEFAULT_GAIN_DB, ppm: 0,
+    tuner: '', steps: '', capMin: '', capMax: '', uses: [],
+  });
+  const TUNERS = ['R820T', 'R820T2', 'R828D', 'FC0012', 'FC0013', 'FC2580', 'E4000'];
+  let detecting = $state(false);
   let sourceForm = $state(blankSource());
 
   let antennas = $state([]);
@@ -70,13 +76,15 @@
   }
 
   const loaders = {
-    users: async () => { users = await api('admin/users'); },
+    // Requests waiting for a decision come first.
+    users: async () => { users = (await api('admin/users')).sort((a, b) => (b.status === 'pending') - (a.status === 'pending')); },
     sources: async () => { [sources, available, antennas] = await Promise.all([api('sources'), api('sources/available'), api('antennas')]); },
     antennas: async () => { antennas = await api('antennas'); },
     nodes: async () => { nodes = await api('nodes'); },
     bans: async () => { bans = await api('admin/bans'); },
     audit: async () => { audit = await api(`admin/audit?limit=200${auditSearch ? `&search=${encodeURIComponent(auditSearch)}` : ''}`); },
     settings: async () => { settings = await api('admin/settings'); systems = await api('admin/broadcastify'); },
+    uploads: async () => { settings = await api('admin/settings'); systems = await api('admin/broadcastify'); },
   };
 
   function open(next) {
@@ -143,11 +151,19 @@
       node_id: Number(nodeId), serial: serial.join('|'), name: sourceForm.name, description: sourceForm.description,
       antenna_id: sourceForm.antenna_id === '' ? null : Number(sourceForm.antenna_id),
       gain_db: sourceForm.gain === '' || sourceForm.gain === null ? null : Number(sourceForm.gain), ppm: Number(sourceForm.ppm),
+      tuner: sourceForm.tuner.trim() || null, gain_steps: parseSteps(sourceForm.steps),
+      cap_min_hz: filled(sourceForm.capMin) ? toHz(sourceForm.capMin) : null,
+      cap_max_hz: filled(sourceForm.capMax) ? toHz(sourceForm.capMax) : null, uses: sourceForm.uses,
     };
+    if (body.gain_steps.some(Number.isNaN)) {
+      error = 'Gain steps must be numbers, separated by spaces or commas.';
+      return;
+    }
     const done = await run(() => (sourceForm.id
       ? api(`sources/${sourceForm.id}`, { method: 'PUT', body })
       : api('sources', { method: 'POST', body })), 'Source saved.');
     if (done) {
+      if (done.warning) message = `Source saved. ${done.warning}`;
       sourceForm = blankSource();
       await loaders.sources();
     }
@@ -156,9 +172,35 @@
   function editSource(source) {
     sourceForm = {
       id: source.id, key: `${source.node_id}|${source.serial}`, name: source.name, description: source.description,
-      antenna_id: source.antenna_id ?? '', gain: source.gain_db ?? '', ppm: source.ppm,
+      antenna_id: source.antenna_id ?? '', gain: source.gain_db ?? '', ppm: source.ppm, feederId: source.feeder_uuid ?? '',
+      tuner: source.tuner, steps: source.gain_steps.join(' '),
+      capMin: source.cap_min_hz == null ? '' : plain(source.cap_min_hz), capMax: source.cap_max_hz == null ? '' : plain(source.cap_max_hz),
+      uses: [...source.uses],
     };
     document.getElementById('source-form')?.scrollIntoView();
+  }
+
+  const parseSteps = (text) => text.split(/[\s,]+/).filter(Boolean).map(Number);
+  const formSteps = $derived(parseSteps(sourceForm.steps).filter((n) => !Number.isNaN(n)));
+  const formNearest = $derived(nearestStep(formSteps, sourceForm.gain));
+
+  // Reads the tuner from the stick itself. Fills the form; nothing is saved until Save.
+  async function detect() {
+    const [nodeId, ...serial] = sourceForm.key.split('|');
+    const existing = sources.find((s) => s.node_id === Number(nodeId) && s.serial === serial.join('|'));
+    if (existing?.active_target && !confirm(`Detect the tuner on ${existing.name}? It stops listening on ${existing.active_target.name} for a few seconds.`)) return;
+    detecting = true;
+    const found = await run(() => api('sources/detect', { method: 'POST', body: { node_id: Number(nodeId), serial: serial.join('|') } }));
+    detecting = false;
+    if (!found) return;
+    sourceForm.tuner = found.tuner;
+    sourceForm.steps = found.gain_steps.join(' ');
+    const snapped = nearestStep(found.gain_steps, sourceForm.gain);
+    const moved = snapped === null ? '' : ` Gain moved from ${sourceForm.gain} to ${snapped} dB, the nearest step.`;
+    if (snapped !== null) sourceForm.gain = snapped;
+    if (found.freq_min_hz != null) sourceForm.capMin = plain(found.freq_min_hz);
+    if (found.freq_max_hz != null) sourceForm.capMax = plain(found.freq_max_hz);
+    message = `Found ${found.tuner} with ${found.gain_steps.length} gain steps${found.freq_min_hz == null ? '. Its range isn\'t known, so enter it if you want it checked' : ''}. Save to keep it.${moved}`;
   }
 
   // --- antennas
@@ -282,6 +324,8 @@
       rdio_server: settings.rdio_server, clearcut_server: settings.clearcut_server,
       clearcut_page_url: settings.clearcut_page_url, map_tile_url: settings.map_tile_url,
       broadcastify_server: settings.broadcastify_server,
+      message_retention_days: Number(settings.message_retention_days),
+      airframes_station_id: settings.airframes_station_id.trim(), airframes_feed: settings.airframes_feed.trim(),
     };
     for (const name of ['rdio_api_key', 'clearcut_api_key']) {
       if (keys[name]) body[name] = keys[name];
@@ -472,15 +516,20 @@
 {#if tab === 'sources'}
   <div class="box">
     <table class="table">
-      <thead><tr><th>Name</th><th>Node</th><th>Serial</th><th>Antenna</th><th>Range</th><th>Gain</th><th>Actions</th></tr></thead>
+      <thead><tr><th>Name</th><th>Node</th><th>Serial</th><th>Stick</th><th>Antenna</th><th>Gain</th><th>Actions</th></tr></thead>
       {#each sources as source (source.id)}
         <tbody>
           <tr>
-            <td class="title-cell">{source.name}</td>
+            <td class="title-cell">{source.name}{#if source.description}<div class="small dim" style="font-weight:normal">{source.description}</div>{/if}</td>
             <td data-label="Node"><span>{source.node_name}</span></td>
             <td data-label="Serial"><span class="mono small">{source.serial}</span></td>
-            <td data-label="Antenna"><span>{source.antenna_name || 'Not set'}</span></td>
-            <td data-label="Range"><span class="mono small">{source.antenna_id ? formatRanges(source.antenna_ranges) : 'Not set'}</span></td>
+            <td data-label="Stick">
+              <span class="small">
+                {source.tuner || 'Tuner not set'}{#if source.cap_min_hz != null || source.cap_max_hz != null}, <span class="mono">{formatRange(source.cap_min_hz, source.cap_max_hz)}</span>{/if}
+                {#if source.uses.length}<br />{[...RECORDED_USES, ...OTHER_USES].filter(([id]) => source.uses.includes(id)).map(([, label]) => label).join(', ')}{/if}
+              </span>
+            </td>
+            <td data-label="Antenna"><span class="small">{source.antenna_name || 'Not set'}{#if source.antenna_id}<br /><span class="mono">{formatRanges(source.antenna_ranges)}</span>{/if}</span></td>
             <td data-label="Gain"><span class="small">{source.gain_db == null ? 'Auto (AGC)' : `${source.gain_db} dB`}</span></td>
             <td>
               <div class="buttons" style="margin:0">
@@ -512,6 +561,12 @@
         </select>
       </label>
       <label class="field"><span>Name</span><input bind:value={sourceForm.name} required maxlength="120" /></label>
+      {#if sourceForm.feederId}
+        <div class="field"><span>Feeder ID</span>
+          <span class="mono small copyable">{sourceForm.feederId}</span>
+          <span class="hint">Sent with ADS-B shared to aggregators, so they can tell this SDR's feed apart. Some feeder stats pages ask for it. Keep it private: anyone with it could feed data as this receiver.</span>
+        </div>
+      {/if}
       <label class="field"><span>Description</span><input bind:value={sourceForm.description} maxlength="500" /></label>
       <label class="field"><span>Antenna</span>
         <select bind:value={sourceForm.antenna_id}>
@@ -521,10 +576,45 @@
         <span class="hint">Add antennas under the Antennas section. One antenna can feed several SDRs.</span>
       </label>
       <label class="field"><span>Gain (dB)</span>
-        <input type="number" inputmode="decimal" step="0.1" min="0" max="60" placeholder="AGC" bind:value={sourceForm.gain} />
-        <span class="hint">Starts at {DEFAULT_GAIN_DB} dB. Leave empty for automatic gain (AGC). 0 means a real 0 dB, which may miss most calls.</span>
+        <GainField steps={formSteps} bind:value={sourceForm.gain} />
+        {#if formNearest !== null}<span class="hint st-warn">Not one of this stick's gain steps. It will use {formNearest} dB. Choose a step to save.</span>{/if}
+        {#if formSteps.length}
+          <span class="hint">Only this stick's own steps can be used. AGC is automatic gain.</span>
+        {:else}
+          <span class="hint">Starts at {DEFAULT_GAIN_DB} dB. Leave empty for automatic gain (AGC). 0 means a real 0 dB, which may miss most calls. Detect the stick below to choose from its own steps.</span>
+        {/if}
       </label>
       <label class="field"><span>Frequency correction (ppm)</span><input type="number" min="-500" max="500" bind:value={sourceForm.ppm} /></label>
+    </fieldset>
+    <fieldset>
+      <legend>What this stick can do</legend>
+      <p class="small dim form-buttons">The range and uses only warn: a target this stick doesn't suit can still be assigned. Gain steps limit the gain boxes to the stick's own steps. Leave anything blank to skip it.</p>
+      <div class="buttons form-buttons">
+        <button type="button" disabled={!sourceForm.key || detecting} onclick={detect}>{detecting ? 'Detecting...' : 'Detect from the stick'}</button>
+      </div>
+      <p class="small dim form-buttons">Reads the tuner and gain steps, and fills in that tuner's usual range. Pauses the stick for a few seconds. Works on slaves too.</p>
+      <label class="field"><span>Tuner</span>
+        <input bind:value={sourceForm.tuner} maxlength="40" list="tuner-names" placeholder="R820T" />
+        <datalist id="tuner-names">{#each TUNERS as name (name)}<option value={name}></option>{/each}</datalist>
+      </label>
+      <div class="field"><span>Frequency range (MHz)</span>
+        <div class="pair">
+          <input class="mono" type="number" inputmode="decimal" step="any" min="0" aria-label="Lowest frequency" placeholder="From" bind:value={sourceForm.capMin} />
+          <input class="mono" type="number" inputmode="decimal" step="any" min="0" aria-label="Highest frequency" placeholder="To" bind:value={sourceForm.capMax} />
+        </div>
+      </div>
+      <label class="field"><span>Gain steps (dB)</span>
+        <input class="mono" bind:value={sourceForm.steps} placeholder="0.0 0.9 1.4 ..." />
+        <span class="hint">Separated by spaces or commas. These become the only gains you can choose for this stick.</span>
+      </label>
+      <div class="field top"><span>Uses</span>
+        <div>
+          <div class="small dim">Checked against targets</div>
+          <div class="flags">{#each RECORDED_USES as [id, label] (id)}<label class="tick"><input type="checkbox" value={id} bind:group={sourceForm.uses} /> {label}</label>{/each}</div>
+          <div class="small dim" style="margin-top:.3rem">Labels only</div>
+          <div class="flags">{#each OTHER_USES as [id, label] (id)}<label class="tick"><input type="checkbox" value={id} bind:group={sourceForm.uses} /> {label}</label>{/each}</div>
+        </div>
+      </div>
       <div class="buttons form-buttons">
         <button class="main">Save</button>
         {#if sourceForm.id}<button type="button" onclick={() => (sourceForm = blankSource())}>Cancel</button>{/if}
@@ -703,8 +793,9 @@
   </div>
 {/if}
 
-{#if tab === 'settings' && settings}
+{#if (tab === 'settings' || tab === 'uploads') && settings}
   <form onsubmit={saveSettings}>
+    {#if tab === 'settings'}
     <fieldset>
       <legend>How long to keep things</legend>
       <label class="field"><span>Recordings (days)</span>
@@ -713,6 +804,10 @@
       </label>
       <label class="field"><span>Audit logs (days)</span>
         <input type="number" inputmode="numeric" min="0" bind:value={settings.audit_retention_days} />
+        <span class="hint">0 keeps them forever.</span>
+      </label>
+      <label class="field"><span>ACARS messages (days)</span>
+        <input type="number" inputmode="numeric" min="0" bind:value={settings.message_retention_days} />
         <span class="hint">0 keeps them forever.</span>
       </label>
       <p class="small wrap-any">Recordings are in <span class="mono">{settings.recordings_dir}</span> and logs in <span class="mono">{settings.log_dir}</span>. Change these in the configuration file.</p>
@@ -725,6 +820,7 @@
         Let people request accounts
       </label>
     </fieldset>
+    {:else}
     <fieldset>
       <legend>Uploads</legend>
       <p class="small">Saved keys are never shown again. Leave a key blank to keep the current one.</p>
@@ -739,11 +835,24 @@
       <label class="field"><span>Upload address</span><input class="mono" type="url" bind:value={settings.broadcastify_server} /></label>
     </fieldset>
     <fieldset>
+      <legend>airframes.io feed</legend>
+      <p class="small">ACARS targets with feeding turned on send each message here. No account is needed.</p>
+      <label class="field"><span>Station ID</span>
+        <input class="mono" bind:value={settings.airframes_station_id} maxlength="40" pattern="[A-Za-z0-9][A-Za-z0-9\-]*" placeholder="KE-KSEA-ACARS" />
+        <span class="hint">Your initials, the nearest airport's ICAO code, then ACARS. Leave empty to send nothing.</span>
+      </label>
+      <label class="field"><span>Feed address</span><input class="mono" bind:value={settings.airframes_feed} maxlength="260" placeholder="feed.acars.io:5550" /></label>
+    </fieldset>
+    {/if}
+    {#if tab === 'settings'}
+    <fieldset>
       <legend>Maps</legend>
       <label class="field"><span>Map tile URL</span><input class="mono" bind:value={settings.map_tile_url} /></label>
     </fieldset>
-    <div class="buttons"><button class="main">Save settings</button></div>
+    {/if}
+    <div class="buttons"><button class="main">{tab === 'uploads' ? 'Save uploads and feeds' : 'Save settings'}</button></div>
   </form>
+  {#if tab === 'uploads'}
   <form onsubmit={saveSystem}>
     <fieldset>
       <legend>Broadcastify Calls systems</legend>
@@ -760,11 +869,12 @@
         </div>
       {/each}
       <label class="field"><span>Name</span><input bind:value={systemForm.name} maxlength="120" required /></label>
-      <label class="field"><span>System ID (from Broadcastify, not RadioReference)</span><input type="number" inputmode="numeric" min="1" bind:value={systemForm.system_id} required /></label>
+      <label class="field"><span>Broadcastify system ID</span><input type="number" inputmode="numeric" min="1" bind:value={systemForm.system_id} required /><span class="hint">The node's ID from Broadcastify, not a RadioReference ID.</span></label>
       <label class="field"><span>API key{systemForm.id ? ' (leave blank to keep the saved key)' : ''}</span><input type="password" bind:value={systemForm.api_key} autocomplete="off" required={!systemForm.id} /></label>
       <div class="buttons form-buttons"><button>{systemForm.id ? 'Save system' : 'Add system'}</button>
         {#if systemForm.id}<button type="button" onclick={() => (systemForm = blankSystem())}>Cancel</button>{/if}
       </div>
     </fieldset>
   </form>
+  {/if}
 {/if}
