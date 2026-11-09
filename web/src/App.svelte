@@ -121,7 +121,7 @@
     {:else if view === 'maps'}
       <Maps {user} />
     {:else if view === 'alerts'}
-      <Alerts {route} onSeen={refreshAlerts} />
+      <Alerts {route} {user} onSeen={refreshAlerts} />
     {:else if view === 'scanner'}
       <Scanner />
     {:else if view === 'messages'}

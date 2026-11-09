@@ -7,8 +7,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, func, or_, select
 
-from .. import keywords
-from ..models import AcarsMessage, Recording, User, UserKeyword
+from .. import emergencies, keywords
+from ..models import AcarsMessage, Recording, TrackEmergency, User, UserKeyword
 from .deps import ctx_of, current_user, effective_permissions, get_db, ip_of, require
 
 router = APIRouter(prefix="/api")
@@ -128,6 +128,19 @@ def alerts(user: User = Depends(current_user), db=Depends(get_db)):
                 "title": " ".join(filter(None, (m.flight, m.tail))) or "ACARS message", "text": m.text,
                 "matches": keywords.matches(words, m.text), "important": bool(m.important), "important_by": m.important_by,
             })
+        codes, max_km = emergencies.wanted(user.emergency_codes), user.emergency_km
+        if codes:
+            for e in db.scalars(select(TrackEmergency).where(TrackEmergency.first_seen > since).order_by(TrackEmergency.first_seen.desc())):
+                if not emergencies.matches_user(e, codes, max_km):
+                    continue
+                count += 1
+                if len([i for i in items if i["kind"] == "emergency"]) < ALERT_LIST_LIMIT:
+                    items.append({
+                        "kind": "emergency", "id": e.id, "at": e.first_seen, "title": " ".join(filter(None, (e.name, e.callsign))) or e.ident.upper(),
+                        "text": emergencies.describe(e.codes or []), "what": e.kind, "ended_at": e.ended_at,
+                        "distance_km": e.distance_km, "source_name": e.source_name, "altitude": e.altitude,
+                        "matches": [], "important": False, "important_by": None,
+                    })
     items.sort(key=lambda i: i["at"], reverse=True)
     return {"count": count, "since": since, "items": items[:ALERT_LIST_LIMIT]}
 

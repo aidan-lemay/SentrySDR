@@ -21,11 +21,11 @@ import httpx
 from sqlalchemy import delete, func, or_, select
 
 from . import aio
-from . import BUILD_ID, __version__, acars, capabilities, coverage, health, notify, pipelines, schedule, uploaders
+from . import BUILD_ID, __version__, acars, capabilities, coverage, emergencies, health, notify, pipelines, schedule, uploaders
 from .config import Config
 from .engine import UNPLUGGED, MeasureError, Supervisor
 from .live import LiveHub
-from .models import AcarsMessage, AuditLog, BroadcastifySystem, Node, Recorder, Recording, SdrProfile, Setting, Source, Target, UploadJob, UserSession, make_session_factory
+from .models import AcarsMessage, AuditLog, TrackEmergency, BroadcastifySystem, Node, Recorder, Recording, SdrProfile, Setting, Source, Target, UploadJob, UserSession, make_session_factory
 from .sdr import enumerate_serials
 from .security import RateLimiter, SecretBox
 
@@ -149,6 +149,7 @@ class Context:
         self.loop: asyncio.AbstractEventLoop | None = None
         self.wake: asyncio.Event | None = None
         self.tasks: list[asyncio.Task] = []
+        self.emergencies = emergencies.Emergencies(self.db)
         self.email_error = ""  # the last alert email failure, until one succeeds
         self.email_retry_at = 0.0
         self.http_transport = None  # replaced in tests so nothing reaches a real server
@@ -240,6 +241,7 @@ class Context:
         if kind == "adsb":
             self.trails.add(data["aircraft"])
             self._widen_coverage(node_id, serial, data["aircraft"])
+        self.emergencies.check(kind, node_id, serial, data[field])
         self.tracks.setdefault(kind, {})[f"{node_id}:{serial}"] = {"at": time.time(), "data": data}
 
     def ingest_acars(self, node_id: int, serial: str, data: dict) -> None:
@@ -717,6 +719,8 @@ class Context:
             if message_days > 0:
                 result = session.execute(delete(AcarsMessage).where(AcarsMessage.received_at < now - message_days * 86400))
                 removed["messages"] = result.rowcount
+                result = session.execute(delete(TrackEmergency).where(TrackEmergency.first_seen < now - message_days * 86400))
+                removed["emergencies"] = result.rowcount
             if audit_days > 0:
                 result = session.execute(delete(AuditLog).where(AuditLog.ts < now - audit_days * 86400))
                 removed["audit"] = result.rowcount

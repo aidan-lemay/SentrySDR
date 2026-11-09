@@ -726,7 +726,7 @@ class Worker:
             reader.cancel()
 
 
-AIS_FIELDS = ("lat", "lon", "speed", "heading", "course", "shipname", "callsign", "destination", "shiptype")
+AIS_FIELDS = ("lat", "lon", "speed", "heading", "course", "shipname", "callsign", "destination", "shiptype", "status")
 
 
 def merge_ais_message(vessels: dict[str, dict], line: bytes) -> None:

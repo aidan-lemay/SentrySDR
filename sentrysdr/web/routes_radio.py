@@ -13,7 +13,7 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 
-from .. import aio, capabilities, coverage, feeds, pipelines, schedule
+from .. import emergencies, aio, capabilities, coverage, feeds, pipelines, schedule
 from ..config import SERIAL_RE
 from ..context import Context
 from ..engine import MeasureError
@@ -958,6 +958,10 @@ def map_tracks(kind: str, request: Request, _user: User = Depends(require("maps"
     items = ctx.current_tracks(kind)
     if kind == "adsb":
         items = [{**item, "trail": ctx.trails.get(item.get("hex"))} for item in annotate_aircraft(request, db, items)]
+    active = ctx.emergencies.active(kind)
+    if active:
+        items = [{**item, "emergency": active[ident]} if (ident := emergencies.ident_for(kind, item)) in active else item
+                 for item in items]
     winners = schedule.resolve(list(db.scalars(select(Recorder))), datetime.now(ctx.cfg.tz))
     receivers = []
     for source in db.scalars(select(Source).where(Source.lat.is_not(None), Source.lon.is_not(None)).order_by(Source.name)):

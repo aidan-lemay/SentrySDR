@@ -46,6 +46,10 @@ class User(Base):
     email_important: Mapped[bool | None] = mapped_column(nullable=True)  # also things marked important
     email_since: Mapped[float | None] = mapped_column(nullable=True)  # nothing older is emailed
     email_last_sent_at: Mapped[float | None] = mapped_column(nullable=True)
+    # Aircraft and ship emergencies: which codes (None = the defaults), how far away (None = anywhere), and email.
+    emergency_codes: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    emergency_km: Mapped[int | None] = mapped_column(nullable=True)
+    email_emergencies: Mapped[bool | None] = mapped_column(nullable=True)
 
 
 class UserSession(Base):
@@ -301,7 +305,7 @@ class AlertSent(Base):
     __table_args__ = (UniqueConstraint("user_id", "kind", "item_id"),)
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
-    kind: Mapped[str] = mapped_column(String(8))  # call|message
+    kind: Mapped[str] = mapped_column(String(9))  # call|message|emergency
     item_id: Mapped[str] = mapped_column(String(64))
     sent_at: Mapped[float] = mapped_column(default=now, index=True)
 
@@ -313,6 +317,27 @@ class EmailLog(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     kind: Mapped[str] = mapped_column(String(12))  # alert|confirm|test
     sent_at: Mapped[float] = mapped_column(default=now, index=True)
+
+
+class TrackEmergency(Base):
+    """One aircraft or ship emergency, from first seen until it stopped. Kept as long as ACARS messages."""
+    __tablename__ = "track_emergencies"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    kind: Mapped[str] = mapped_column(String(8))  # adsb|ais
+    ident: Mapped[str] = mapped_column(String(16), index=True)  # ICAO hex or MMSI
+    codes: Mapped[list] = mapped_column(JSON, default=list)
+    name: Mapped[str] = mapped_column(String(40), default="")  # flight or ship name
+    callsign: Mapped[str] = mapped_column(String(20), default="")  # registration or radio callsign
+    node_id: Mapped[int | None] = mapped_column(nullable=True)
+    serial: Mapped[str] = mapped_column(String(64), default="")
+    source_name: Mapped[str] = mapped_column(String(120), default="")
+    first_seen: Mapped[float] = mapped_column(default=now, index=True)
+    last_seen: Mapped[float] = mapped_column(default=now)
+    ended_at: Mapped[float | None] = mapped_column(nullable=True)
+    lat: Mapped[float | None] = mapped_column(nullable=True)
+    lon: Mapped[float | None] = mapped_column(nullable=True)
+    altitude: Mapped[float | None] = mapped_column(nullable=True)  # feet, aircraft only
+    distance_km: Mapped[float | None] = mapped_column(nullable=True)  # from the SDR that first heard it
 
 
 class WarningMute(Base):

@@ -20,8 +20,8 @@ from urllib.parse import urlencode
 
 from sqlalchemy import and_, delete, func, or_, select
 
-from . import keywords
-from .models import AcarsMessage, AlertSent, EmailLog, Recording, User, UserKeyword, UserWatch
+from . import emergencies, keywords
+from .models import AcarsMessage, AlertSent, EmailLog, Recording, TrackEmergency, User, UserKeyword, UserWatch
 
 log = logging.getLogger("sentrysdr.email")
 
@@ -216,14 +216,38 @@ def find_matches(ctx, session, user: User, perms: set[str], since: float) -> lis
                     "text": m.text or "", "link": f"{ctx.cfg.public_url.rstrip('/')}/#/messages?id={m.id}",
                 })
 
+    if "maps" in perms and user.email_emergencies:
+        codes, max_km = emergencies.wanted(user.emergency_codes), user.emergency_km
+        for e in session.scalars(select(TrackEmergency).where(TrackEmergency.first_seen > since).order_by(TrackEmergency.first_seen)):
+            if ("emergency", str(e.id)) in sent or not emergencies.matches_user(e, codes, max_km):
+                continue
+            where = [f"near {e.lat:.4f}, {e.lon:.4f}" if e.lat is not None and e.lon is not None else None,
+                     f"{e.altitude:.0f} ft" if e.altitude is not None else None,
+                     f"{e.distance_km:.0f} km from {e.source_name}" if e.distance_km is not None else f"heard by {e.source_name}"]
+            items.append({
+                "kind": "emergency", "id": str(e.id), "at": e.first_seen, "matched": [],
+                "why": ["an aircraft emergency" if e.kind == "adsb" else "a ship emergency"],
+                "title": "EMERGENCY: " + (" ".join(filter(None, (e.name, e.callsign))) or e.ident.upper()),
+                "detail": emergencies.describe(e.codes or []),
+                "text": ", ".join(filter(None, where)) + f"\n{'ICAO' if e.kind == 'adsb' else 'MMSI'} {e.ident.upper()}",
+                "link": f"{ctx.cfg.public_url.rstrip('/')}/#/alerts?tab=emergencies",
+            })
+
     items.sort(key=lambda i: i["at"])
     return items
 
 
 def compose(ctx, user: User, items: list[dict], last_today: bool) -> tuple[str, str]:
+    # Emergencies first, in the subject and the email.
+    items = sorted(items, key=lambda i: (i["kind"] != "emergency", i["at"]))
     shown = items[:ITEMS_PER_EMAIL]
-    if len(items) == 1:
-        subject = f"SentrySDR: {items[0]['title']}" + (f" ({', '.join(items[0]['matched'])})" if items[0]["matched"] else "")
+    first = items[0]
+    if first["kind"] == "emergency":
+        subject = f"SentrySDR {first['title']}: {first['detail']}"
+        if len(items) > 1:
+            subject += f", and {len(items) - 1} more alert{'s' if len(items) > 2 else ''}"
+    elif len(items) == 1:
+        subject = f"SentrySDR: {first['title']}" + (f" ({', '.join(first['matched'])})" if first["matched"] else "")
     else:
         subject = f"SentrySDR: {len(items)} new alerts"
     parts = []
@@ -280,7 +304,8 @@ def pending(ctx) -> list[tuple[int, str, str, dict, list[dict]]]:
             if not can_email(user):
                 continue
             window = (user.email_window if user.email_window in WINDOWS else DEFAULT_WINDOW) * 60
-            if now - (user.email_last_sent_at or 0) < window:
+            waiting = now - (user.email_last_sent_at or 0) < window  # only an emergency goes before the gap is up
+            if waiting and not user.email_emergencies:
                 continue
             count = sent_today(session, user.id)
             if count >= cap:
@@ -288,7 +313,7 @@ def pending(ctx) -> list[tuple[int, str, str, dict, list[dict]]]:
             since = max(user.email_since or now, now - LOOKBACK_SECONDS)
             try:
                 items = find_matches(ctx, session, user, effective_permissions(user), since)
-                if not items:
+                if not items or (waiting and not any(i["kind"] == "emergency" for i in items)):
                     continue
                 subject, body = compose(ctx, user, items, last_today=count + 1 >= cap)
             except Exception:

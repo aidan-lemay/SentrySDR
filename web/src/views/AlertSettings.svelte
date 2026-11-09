@@ -19,6 +19,8 @@
   let newChannel = $state('');
   let newAircraft = $state('');
   let saving = $state(false);
+  let emergency = $state(null);
+  const GROUPS = [['adsb', 'Aircraft (ADS-B)'], ['ais', 'Ships (AIS)']];
 
   const APPLIES = { both: 'calls and messages', calls: 'calls', messages: 'messages' };
   const channels = $derived(watches.filter((w) => w.kind === 'channel'));
@@ -42,6 +44,7 @@
     [email, keywordList, watches, targets] = await Promise.all([
       api('me/email-alerts'), api('me/keywords'), api('me/watches'), api('targets').catch(() => []),
     ]);
+    if (email.messages) emergency = await api('me/emergency-alerts');
   }
 
   // --- email
@@ -58,6 +61,20 @@
   async function resend() {
     const reply = await run(() => api('me/email-alerts/resend', { method: 'POST' }), (r) => `Sent again to ${r.address}.`);
     if (reply) email = reply;
+  }
+
+  // --- emergencies
+  async function saveEmergency(changes) {
+    const body = {
+      codes: emergency.codes.filter((c) => c.chosen).map((c) => c.code), km: emergency.km, email: emergency.email, ...changes,
+    };
+    const reply = await run(() => api('me/emergency-alerts', { method: 'PUT', body }), 'Saved.');
+    emergency = reply || await api('me/emergency-alerts').catch(() => emergency);
+  }
+
+  function toggleCode(code, on) {
+    const codes = emergency.codes.filter((c) => (c.code === code ? on : c.chosen)).map((c) => c.code);
+    saveEmergency({ codes });
   }
 
   // --- keywords
@@ -173,6 +190,30 @@
       <div class="buttons form-buttons"><button class="main" disabled={!newChannel}>Add channel</button></div>
     </fieldset>
   </form>
+{/if}
+
+{#if emergency}
+  <fieldset>
+    <legend>Aircraft and ship emergencies</legend>
+    <p class="small">Which ones show under New alerts{email?.server_enabled ? ', and are emailed if you tick that below' : ''}. Every one is still recorded under Emergencies. An aircraft squawk counts after 10 seconds, so a passing misreading doesn't alert you.</p>
+    {#each GROUPS as [group, heading] (group)}
+      <div class="small dim" style="margin-top:.4rem">{heading}</div>
+      {#each emergency.codes.filter((c) => c.kind === group) as c (c.code)}
+        <label class="tick"><input type="checkbox" checked={c.chosen} onchange={(event) => toggleCode(c.code, event.target.checked)} /> <span><strong>{c.label}</strong> <span class="small dim">{c.meaning}</span></span></label>
+      {/each}
+    {/each}
+    <label class="field"><span>How far away</span>
+      <select value={emergency.km ?? ''} onchange={(event) => saveEmergency({ km: event.target.value === '' ? null : Number(event.target.value) })}>
+        <option value="">Anywhere a receiver hears</option>
+        {#each emergency.distances as km (km)}<option value={km}>Within {km} km</option>{/each}
+      </select>
+      <span class="hint">From the SDR that heard it. One without a location set can't be measured, so what it hears always counts.</span>
+    </label>
+    {#if email?.server_enabled}
+      <label class="tick"><input type="checkbox" checked={emergency.email} onchange={(event) => saveEmergency({ email: event.target.checked })} /> Email me about these straight away</label>
+      <p class="small dim">Straight away even inside your gap between emails, with anything else waiting. Needs email alerts turned on above.</p>
+    {/if}
+  </fieldset>
 {/if}
 
 {#if email?.messages}

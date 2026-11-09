@@ -146,7 +146,7 @@ Each permission except the admin-only ones can be allowed or denied per user, un
 | SDR sources | Each SDR's name, description, antenna, gain, frequency correction and capabilities |
 | Antennas | Antennas and their frequency ranges |
 | Nodes | Slaves: create a one-time enrolment token, or revoke a slave |
-| Settings | How long recordings, ACARS messages and audit logs are kept (0 keeps them forever); a size limit for recordings; sign-ups; the map tile server; a backup download |
+| Settings | How long recordings, ACARS messages and emergencies, and audit logs are kept (0 keeps them forever); a size limit for recordings; sign-ups; the map tile server; a backup download |
 | Uploads and feeds | RDIO and ClearCut servers and keys; the Broadcastify upload address and systems; the airframes.io station ID and address |
 | Email | The mail server for alert emails, and the daily limit. See [Email alerts](#email-alerts) |
 | Warnings | Every current health warning, including muted and hidden ones |
@@ -238,6 +238,23 @@ The Maps page shows aircraft from every ADS-B receiver, and ships from every AIS
 
 Trails and coverage can each be turned off above the map.
 
+## Aircraft and ship emergencies
+
+SentrySDR watches the ADS-B and AIS data every receiver already reports, from slaves too, for emergencies. An aircraft or ship in one is drawn larger and in red on the map with its label always showing (everything else is blue), and listed in a banner above the map.
+
+| Kind | What's watched for |
+|---|---|
+| Aircraft | Squawk 7700 (general emergency), 7600 (radio failure) and 7500 (unlawful interference), and the separate emergency status newer transponders send: general, medical (lifeguard), minimum fuel, no radio, unlawful interference, downed |
+| Ships | AIS search-and-rescue transmitters (AIS-SART, MMSI 970...), man-overboard beacons (972...), EPIRBs (974...), and the aground and not-under-command navigation statuses |
+
+- **No false alarms from one bad decode:** an aircraft must show a squawk or status for 10 seconds, over at least 3 updates, before it counts. AIS messages carry a checksum and these values are set on purpose, so they count at once.
+- **One event per emergency:** however many receivers hear it, until it hasn't been seen for 5 minutes. If it starts again after that, it's a new event. A restart carries on the same event rather than alerting again.
+- **The record:** **Alerts > Emergencies** lists every one recorded, with the flight or ship name, registration or callsign, ICAO address or MMSI, when it started and ended, the last position and altitude, and how far it was from the SDR that heard it first. They're kept as long as ACARS messages. Anyone with the Maps permission can see it.
+- **Your alerts:** under **Alerts > Keywords and email**, choose which kinds you want listed under **New alerts**, and how far away you care about (within 25, 50, 100 or 200 km of the SDR that heard it, or anywhere). Distance needs that SDR's location set; one without a location always counts. By default everything is chosen except aground and not under command, which ships often leave set by mistake.
+- **Email:** tick **Email me about these straight away**, with email alerts turned on (see [Email alerts](#email-alerts)). An emergency is emailed at once, even inside your gap between emails, with anything else waiting; the subject starts with EMERGENCY. It still counts toward the daily limit.
+
+A 7500 squawk is very rarely a real hijacking: it's usually a mis-set transponder, corrected within a minute or two. AIS navigation statuses need slaves upgraded to this version; AIS beacons and all aircraft emergencies work with slaves as they are.
+
 ## Keyword alerts
 
 Under **Alerts > Keywords and email**, each user keeps their own words and phrases to watch for, in call transcripts, ACARS messages, or both. Matching ignores case and takes whole words: "fire" matches "Fire!" but not "firefighter", and a phrase matches across a line break. Only you see your keywords.
@@ -256,6 +273,7 @@ What can send you an email:
 - **Channels:** every call on a target you pick, with or without a transcript.
 - **Aircraft:** every ACARS message from a registration or flight, typed as the Messages page shows it (N123UA, UA0123).
 - **Marked important**, if you tick it: a call or message someone marks important by hand.
+- **Aircraft and ship emergencies**, if you tick it: see [Aircraft and ship emergencies](#aircraft-and-ship-emergencies). These go at once.
 
 You only get what your permissions let you see: calls need **Play recordings**, ACARS needs **Maps**. Losing a permission stops those emails. Nothing from before you turned emails on is sent.
 
