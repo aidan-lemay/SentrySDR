@@ -200,3 +200,18 @@ def test_readsb_saying_none_isnt_an_emergency_on_the_map(ctx, listener, monkeypa
     items = listener.get("/api/maps/adsb").json()["items"]
     assert len(items) == 2 and all("emergency" not in i for i in items)
     assert events(ctx) == []
+
+
+import pytest  # noqa: E402
+
+
+@pytest.mark.parametrize("squawk,meaning", [("7500", "unlawful interference"), ("7600", "radio failure"), ("7700", "general emergency")])
+def test_each_emergency_squawk_is_labelled_and_alerts(ctx, listener, monkeypatch, squawk, meaning):
+    clock = Clock(monkeypatch)
+    feed(ctx, clock, [aircraft(squawk=squawk)], times=6)
+    [item] = listener.get("/api/maps/adsb").json()["items"]
+    assert item["emergency"].startswith(f"Squawk {squawk} ({meaning}")
+    [alert] = listener.get("/api/alerts").json()["items"]
+    assert alert["kind"] == "emergency"
+    listener.put("/api/me/emergency-alerts", json={"codes": [c for c in ("squawk_7500", "squawk_7600", "squawk_7700") if c != f"squawk_{squawk}"]}).raise_for_status()
+    assert listener.get("/api/alerts").json()["items"] == []
