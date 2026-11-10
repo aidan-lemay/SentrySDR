@@ -206,6 +206,52 @@ async def test_ais_pipeline_publishes_vessels(tmp_path):
     assert tracks[0][0] == "ais" and tracks[0][2]["vessels"][0]["mmsi"] == "123"
 
 
+# What librtlsdr and AIS-catcher print when the host's usbfs memory limit is used up.
+USBFS_OUTPUT = ("Failed to submit transfer 3!\nPlease increase your allowed usbfs buffer size with the following command:\n"
+                "echo 0 > /sys/module/usbcore/parameters/usbfs_memory_mb\n<3>RTLSDR: lost device. Terminating.\n")
+
+
+async def test_ais_out_of_usb_memory_says_so(tmp_path):
+    bins = tmp_path / "bin"
+    install_tool(bins, "AIS-catcher", f"#!/usr/bin/env python3\nimport sys\nsys.stderr.write({USBFS_OUTPUT!r})\n")
+    sup = supervisor(make_config(tmp_path, bin_dirs=[bins]), [])
+    worker = sup.workers["SER1"]
+    try:
+        await sup.apply({"SER1": spec(kind="ais", modulation="ais", frequency_hz=162_000_000)})
+        assert await wait_for(lambda: worker.error)
+        assert "usbfs_memory_mb" in worker.error and "USB buffer memory" in worker.error and "lost device" not in worker.error
+    finally:
+        await sup.shutdown()
+
+
+def test_exit_message_keeps_the_last_lines():
+    tail = engine.ToolTail(["Found 1 device(s)", "Tuned to 162 MHz", "Tuned to 162 MHz", "<3>RTLSDR: lost device. Terminating."])
+    assert engine.exit_message("AIS-catcher", 0, tail) == \
+        "AIS-catcher exited (0) Found 1 device(s) / Tuned to 162 MHz / RTLSDR: lost device. Terminating."
+    long = engine.ToolTail(["x" * 200, "y" * 200, "the last line"])
+    message = engine.exit_message("readsb", 1, long)
+    assert len(message) <= engine.FAULT_LENGTH and message.endswith("the last line") and "xxx" not in message
+    assert engine.exit_message("acarsdec", 0, engine.ToolTail()) == "acarsdec exited (0)"
+
+
+async def test_a_last_line_without_a_newline_is_kept():
+    stream = asyncio.StreamReader()
+    stream.feed_data(b"first\nRTLSDR: lost device. Terminating.")
+    stream.feed_eof()
+    tail = engine.ToolTail()
+    await engine._log_stderr("S", stream, tail)
+    assert tail == ["first", "RTLSDR: lost device. Terminating."]
+
+
+async def test_usbfs_lines_are_remembered_after_they_scroll_away():
+    stream = asyncio.StreamReader()
+    stream.feed_data(b"Failed to submit transfer 0!\n" + b"".join(b"line %d\n" % i for i in range(10)))
+    stream.feed_eof()
+    tail = engine.ToolTail()
+    await engine._log_stderr("S", stream, tail)
+    assert tail.usbfs and len(tail) == engine.TAIL_LINES
+
+
 async def test_adsb_pipeline_reads_written_json(tmp_path):
     bins = tmp_path / "bin"
     install_tool(bins, "readsb", textwrap.dedent("""\

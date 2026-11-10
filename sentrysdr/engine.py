@@ -10,6 +10,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import sys
@@ -45,6 +46,14 @@ RTL_TCP_CHECK_SECONDS = 2.0  # how often an rtl_tcp worker looks for a connected
 USB_FAULT_MARKERS = ("failed with -7", "Resetting device", "Failed to set")
 # A tool prints these as it exits, and the errors that follow them are normal.
 EXIT_MARKERS = ("User cancel", "Signal caught")
+# librtlsdr prints these when the kernel won't give it USB buffer memory: every SDR on a host
+# shares the usbfs_memory_mb limit (16 MB by default), so the last tool to start fails with
+# "lost device" though nothing is wrong with the stick.
+USBFS_MARKERS = ("Failed to submit transfer", "usbfs_memory_mb")
+USBFS_FAULT = ("couldn't get USB buffer memory: this host's limit is used up by its other SDRs. "
+               "Raise usbfs_memory_mb (README, \"USB buffer memory\").")
+TAIL_LINES = 5
+FAULT_LENGTH = 300
 RESET_SETTLE_SECONDS = 3.0
 RESET_RESTART_GAP = 60.0  # at most one automatic restart a minute, so a stick that always resets can't loop
 # Changing any of these restarts the tool: they are read when it starts. Volume is read live, and names are only labels.
@@ -73,26 +82,59 @@ async def stop_process(proc: asyncio.subprocess.Process | None, timeout: float =
         await proc.wait()
 
 
+class ToolTail(list):
+    """A tool's last few lines of output, and whether it ran out of USB buffer memory."""
+    usbfs = False
+
+
+def exit_message(tool: str, returncode, tail: list[str]) -> str:
+    """Why a tool stopped: a known cause in words, otherwise its last lines, newest last."""
+    if getattr(tail, "usbfs", False):
+        return f"{tool} {USBFS_FAULT}"
+    lines: list[str] = []
+    for line in tail:
+        line = re.sub(r"^<\d>", "", line).strip()  # AIS-catcher's log-level prefix
+        if line and (not lines or lines[-1] != line):
+            lines.append(line)
+    message = f"{tool} exited ({returncode})"
+    while lines and len(message) + len(" / ".join(lines)) + 1 > FAULT_LENGTH:
+        lines.pop(0)  # the newest lines matter most
+    return f"{message} {' / '.join(lines)}".strip()
+
+
+async def _drained(*readers: asyncio.Task) -> None:
+    """Give a stopped tool's stderr readers a moment to read its last lines: the exit message needs them."""
+    if readers:
+        await asyncio.wait(readers, timeout=1.0)
+
+
 async def _log_stderr(serial: str, stream, tail: list[str], on_reset: Callable[[], None] | None = None,
                       on_line: Callable[[str], None] | None = None) -> None:
     # Reads chunks, not lines: readline fails on a very long line, and if this stops
     # draining the pipe fills and the tool hangs.
     pending = b""
     exiting = False
-    while chunk := await stream.read(4096):
+    while True:
+        chunk = await stream.read(4096)
         lines = (pending + chunk).split(b"\n")
         pending = lines.pop()[-4096:]
+        if not chunk and pending:
+            lines.append(pending)  # a last line with no newline after it, as the tool exits
         for line in lines:
             text = line.decode(errors="replace").strip()[:500]
             if text:
                 tail.append(text)
-                del tail[:-5]
+                del tail[:-TAIL_LINES]
+                if isinstance(tail, ToolTail) and any(marker in text for marker in USBFS_MARKERS):
+                    tail.usbfs = True
                 log.debug("[%s] %s", serial, text)
                 exiting = exiting or any(marker in text for marker in EXIT_MARKERS)
                 if on_reset and not exiting and any(marker in text for marker in USB_FAULT_MARKERS):
                     on_reset()
                 if on_line:
                     on_line(text)
+        if not chunk:
+            break
 
 
 class PcmFramer:
@@ -364,7 +406,7 @@ class Worker:
         return out.decode(errors="replace")
 
     async def _read_levels(self, args: list[str], rate: int) -> dict:
-        tail: list[str] = []
+        tail = ToolTail()
         for attempt in range(MEASURE_ATTEMPTS):
             if attempt:
                 await asyncio.sleep(1.0)  # the stick can take a moment to be released
@@ -389,6 +431,8 @@ class Worker:
             levels = await asyncio.to_thread(pipelines.signal_levels, bytes(pcm), rate)
             if levels:
                 return pipelines.measure_summary(levels)
+        if tail.usbfs:
+            raise MeasureError(f"The SDR {USBFS_FAULT}")
         raise MeasureError(f"No samples from the SDR. {tail[-1] if tail else ''}".strip()[:300])
 
     def _on_reset(self) -> None:
@@ -499,7 +543,7 @@ class Worker:
         framer = PcmFramer(pipelines.pcm_channels(spec))
         volume = VolumeControl()
         digital = spec["modulation"] in pipelines.DIGITAL
-        tail: list[str] = []
+        tail = ToolTail()
         procs: list[asyncio.subprocess.Process] = []
         tasks: list[asyncio.Task] = []
         writer: CallWriter | None = None
@@ -564,8 +608,8 @@ class Worker:
                     self._save(writer)  # stuck carriers and continuous mode
                     writer = None
             await asyncio.gather(*(p.wait() for p in procs), return_exceptions=True)
-            detail = tail[-1] if tail else ""
-            return f"radio process exited ({proc.returncode}) {detail}".strip()
+            await _drained(*tasks)
+            return exit_message("radio process", proc.returncode, tail)
         finally:
             for proc_ in procs:
                 await stop_process(proc_)
@@ -596,7 +640,7 @@ class Worker:
 
     async def _run_adsb(self, index: int, spec: dict) -> str:
         json_dir = tempfile.mkdtemp(prefix=f"adsb-{self.serial}-", dir=self.sup.tmp_dir)
-        tail: list[str] = []
+        tail = ToolTail()
         proc = await asyncio.create_subprocess_exec(
             *pipelines.readsb_args(self.cfg, index, spec, json_dir),
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE, env=self.cfg.tool_env(),
@@ -620,8 +664,8 @@ class Worker:
                 with contextlib.suppress(OSError, ValueError):
                     data = json.loads(await asyncio.to_thread(path.read_text))
                     self.sup.tracks("adsb", self.serial, {"aircraft": data.get("aircraft", [])})
-            detail = tail[-1] if tail else ""
-            return f"readsb exited ({proc.returncode}) {detail}".strip()
+            await _drained(reader)
+            return exit_message("readsb", proc.returncode, tail)
         finally:
             await stop_process(proc)
             reader.cancel()
@@ -629,7 +673,7 @@ class Worker:
 
     async def _run_rtltcp(self, index: int, spec: dict) -> str:
         """Hand the stick to rtl_tcp, so a program such as GQRX can use it over the network."""
-        tail: list[str] = []
+        tail = ToolTail()
         port = spec["rtl_tcp_port"]
         proc = await asyncio.create_subprocess_exec(
             *pipelines.rtltcp_args(self.cfg, index, spec),
@@ -651,14 +695,14 @@ class Worker:
                     if connected:
                         self.last_call_at = time.time()
                     self._publish()
-            detail = tail[-1] if tail else ""
-            return f"rtl_tcp exited ({proc.returncode}) {detail}".strip()
+            await _drained(reader)
+            return exit_message("rtl_tcp", proc.returncode, tail)
         finally:
             await stop_process(proc)
             reader.cancel()
 
     async def _run_acars(self, index: int, spec: dict) -> str:
-        tail: list[str] = []
+        tail = ToolTail()
         proc = await asyncio.create_subprocess_exec(
             *pipelines.acars_args(self.cfg, index, spec),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=self.cfg.tool_env(),
@@ -679,8 +723,8 @@ class Worker:
                     self.last_call_at = time.time()
                     self.sup.tracks("acars", self.serial, {"message": message, "target_id": spec["target_id"]})
             await proc.wait()
-            detail = tail[-1] if tail else ""
-            return f"acarsdec exited ({proc.returncode}) {detail}".strip()
+            await _drained(reader)
+            return exit_message("acarsdec", proc.returncode, tail)
         finally:
             await stop_process(proc)
             reader.cancel()
@@ -697,7 +741,7 @@ class Worker:
             self._publish()
 
     async def _run_ais(self, index: int, spec: dict) -> str:
-        tail: list[str] = []
+        tail = ToolTail()
         proc = await asyncio.create_subprocess_exec(
             *pipelines.ais_args(self.cfg, index, spec),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=self.cfg.tool_env(),
@@ -720,8 +764,8 @@ class Worker:
                         del vessels[mmsi]
                     self.sup.tracks("ais", self.serial, {"vessels": list(vessels.values())})
             await proc.wait()
-            detail = tail[-1] if tail else ""
-            return f"AIS-catcher exited ({proc.returncode}) {detail}".strip()
+            await _drained(reader)
+            return exit_message("AIS-catcher", proc.returncode, tail)
         finally:
             await stop_process(proc)
             reader.cancel()

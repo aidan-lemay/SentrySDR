@@ -19,7 +19,7 @@ It supervises existing tools instead of reimplementing them: `rtl_fm`, `ffmpeg`,
 
 - **System:** Debian 12 or newer, or Raspberry Pi OS (Bookworm or newer), with systemd. Other Linux systems work, but you install the packages yourself (see the top of `scripts/install.sh`). Python 3.11 or newer.
 - **Master:** any 64-bit machine that stays on. It holds the recordings, so give it disk space: about 0.25 MB per minute of recorded audio. It also needs Node.js and npm to build the web interface, which the script installs.
-- **Slave:** a Raspberry Pi 3B or newer works for one or two SDRs. Each SDR uses one USB port, and see [USB connections](#usb-connections).
+- **Slave:** a Raspberry Pi 3B or newer works for one or two SDRs. Each SDR uses one USB port, and see [USB connections](#usb-connections) and [USB buffer memory](#usb-buffer-memory).
 - **SDRs:** RTL-SDR sticks (RTL2832U), each with a unique serial number. Sticks often ship with the same serial; give each its own with `rtl_eeprom -s <serial>`, one stick plugged in at a time.
 
 ### Master
@@ -38,7 +38,7 @@ The script installs packages, creates the `sentrysdr` user, copies the applicati
 5. **Publish it** with a tunnel or reverse proxy, then sign in.
 6. **In the web interface:** add each SDR under **Admin > SDR sources** (and **Detect from the stick**), add targets, and assign them on the Sources page. Turn off **Let people request accounts** under **Admin > Settings** if you don't want sign-up requests.
 
-The script also blacklists the kernel's DVB-T driver, which would otherwise claim the sticks. Reboot once after installing, or unplug and replug the sticks.
+The script also blacklists the kernel's DVB-T driver, which would otherwise claim the sticks, and raises the kernel's [USB buffer memory](#usb-buffer-memory) limit. Reboot once after installing, or unplug and replug the sticks.
 
 ### Slave
 
@@ -219,6 +219,24 @@ If an SDR still seems stuck, administrators have two buttons:
 Both work on slaves, need the slave to be online and running this version, and are recorded in the audit log.
 
 A stick that stays connected but stops working may not show a fault, because it looks the same as a closed squelch. Try **Restart** first.
+
+### USB buffer memory
+
+Every SDR on a machine shares one kernel limit on USB buffer memory, `usbfs_memory_mb`. The default is 16 MB, and each running stick uses about 4 MB, so with four or more sticks the last tool to start can't get its buffers. It stops at once, and the stick and USB connection are fine. The kernel log shows nothing. SentrySDR recognises it, and the source's fault says it **couldn't get USB buffer memory**. Older versions showed `RTLSDR: lost device` from AIS-catcher, or a bare "exited" from other tools. Moving the target to another stick doesn't help, because the limit is for the whole machine.
+
+`scripts/install.sh` raises the limit to 256 MB, now and at every boot, with [`deploy/sentrysdr-usbfs.conf`](deploy/sentrysdr-usbfs.conf). On a machine installed before that, or a slave you set up by hand:
+
+```sh
+cat /sys/module/usbcore/parameters/usbfs_memory_mb          # 16 is the default
+sudo install -m 0644 deploy/sentrysdr-usbfs.conf /etc/tmpfiles.d/
+sudo systemd-tmpfiles --create /etc/tmpfiles.d/sentrysdr-usbfs.conf
+```
+
+Then press **Restart** on the SDR that was failing. The file sets the limit to exactly 256 MB, so if you'd set it higher, or to 0 for no limit, edit the file first.
+
+All the sticks on one USB 2.0 bus also share its 480 Mbit/s. A USB 3.0 port doesn't help, because USB 2.0 devices run on the computer's USB 2.0 bus wherever they're plugged in; `lsusb -t` shows which bus each stick is on. Around eight sticks at ADS-B and AIS sample rates is close to the practical limit of one bus. Past that, add a second USB controller.
+
+When a tool stops for any other reason, the fault shows its last few lines of output, newest last. The journal has the same lines in its "restarting" entry.
 
 ## Listening
 
@@ -504,6 +522,7 @@ Outbound, the master connects to the upload and feed services you turn on, and t
 - **Won't start:** `journalctl -u sentrysdr -n 50` usually names the problem. A configuration error says which setting. `Permission denied` or `Read-only file system` means a moved folder; see [Storing recordings on another drive](#storing-recordings-on-another-drive).
 - **An SDR shows "SDR not connected" or "SDR disconnected":** check it's plugged in, `list-sdrs`, that its serial is in `sdr.serials` on the right node, that no other stick has the same serial, and that nothing else (GQRX, SDR++, `dump1090-fa`) has it open. It starts again by itself once it can.
 - **An SDR seems stuck:** select **Restart** on it, or **Restart service** under **Admin > Nodes** (see [USB connections](#usb-connections)).
+- **"couldn't get USB buffer memory", or a tool that exits as soon as it starts, often on whichever SDR started last:** raise the machine's limit; see [USB buffer memory](#usb-buffer-memory).
 - **"tool not installed":** that target needs a decoder. Re-run the install with `--with-decoders`.
 - **Records nothing, or only static:** see [Tuning call detection](#tuning-call-detection) and [USB connections](#usb-connections).
 - **Upload failures** show on each recording, with the service's reply.

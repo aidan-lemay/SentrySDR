@@ -243,7 +243,7 @@
                 {#if source.in_call}<span class="st-air">ON AIR</span><br />{/if}
                 <span class={stateClass(source.state)}>{STATE_LABELS[source.state] ?? source.state}</span>
                 {#if source.locked}<br /><span class="st-warn">Locked</span>{/if}
-                {#if source.error}<br /><span class="st-bad small">{source.error}</span>{/if}
+                {#if source.error}<br /><span class="st-bad small wrap-any">{source.error}</span>{/if}
                 {#if source.note}<br /><span class="st-warn small">{source.note}</span>{/if}
                 {#if canAssign && source.feeds?.aggregators && Object.keys(source.feeds.aggregators).length}
                   <br /><span class="small">Feeding: {#each Object.entries(source.feeds.aggregators) as [key, up], i (key)}{i ? ', ' : ''}<span class={up ? 'st-ok' : 'st-warn'}>{feedLabel(key)} {up ? 'connected' : 'not connected'}</span>{/each}</span>
