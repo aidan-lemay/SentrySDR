@@ -68,6 +68,26 @@ def mute(body: MuteBody, request: Request, admin: User = Depends(admin_user), db
     return {"key": body.key, "muted_until": until}
 
 
+class AcknowledgeBody(BaseModel):
+    key: str = Field(min_length=1, max_length=120)
+
+
+@router.post("/warnings/acknowledge")
+def acknowledge(body: AcknowledgeBody, request: Request, user: User = Depends(current_user)):
+    """For everyone who sees warnings: something that happened and can't be fixed from here, noted. Only new ones warn again."""
+    if user.role not in ("admin", "operator"):
+        raise HTTPException(403, "Only admins and operators see warnings")
+    ctx = ctx_of(request)
+    warning = next((w for w in ctx.health_warnings() if w["key"] == body.key), None)
+    if warning is None:
+        raise HTTPException(404, "That warning has cleared")
+    if not warning["acknowledge"]:
+        raise HTTPException(409, "This warning clears itself once the problem is fixed. Mute it instead.")
+    ctx.acknowledge_warning(body.key, time.time())
+    ctx.audit("warning.acknowledged", user=user, ip=ip_of(request), target=body.key, details={"text": warning["text"]})
+    return {"detail": "Acknowledged"}
+
+
 class UnmuteBody(BaseModel):
     key: str = Field(min_length=1, max_length=120)
 

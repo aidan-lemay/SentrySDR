@@ -345,6 +345,12 @@
     dispatchEvent(new Event('warnings-changed'));
   }, 'Warning muted for you.');
 
+  const acknowledgeWarning = (warning) => run(async () => {
+    await api('warnings/acknowledge', { method: 'POST', body: { key: warning.key } });
+    await loaders.warnings();
+    dispatchEvent(new Event('warnings-changed'));
+  }, 'Acknowledged, for everyone. Only new failures will warn again.');
+
   const unmuteWarning = (key) => run(async () => {
     await api('admin/warnings/unmute', { method: 'POST', body: { key } });
     await loaders.warnings();
@@ -1052,6 +1058,10 @@
           <div class="small dim">{muteText(warning.muted_until)}.</div>
           <div class="buttons" style="margin:.3rem 0 0"><button onclick={() => unmuteWarning(warning.key)}>Unmute</button></div>
         {:else}
+          {#if warning.acknowledge}
+            <div class="buttons" style="margin:.3rem 0 0"><button onclick={() => acknowledgeWarning(warning)}>Acknowledge</button></div>
+            <p class="small dim">Clears it for everyone until something new fails. Muting would hide new failures too.</p>
+          {/if}
           <div class="pair" style="margin-top:.3rem">
             <select aria-label="Mute for how long" value={muteFor[warning.key] ?? '8'} onchange={(event) => (muteFor[warning.key] = event.target.value)}>
               {#each MUTE_CHOICES as [hours, label] (hours)}<option value={hours}>{label}</option>{/each}

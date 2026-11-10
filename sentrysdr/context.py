@@ -56,6 +56,7 @@ SETTING_DEFAULTS = {
 }
 SECRET_SETTINGS = {"rdio_api_key", "clearcut_api_key", "smtp_password"}
 EMAIL_SECONDS = 30
+ACKNOWLEDGEABLE = {"uploads.failed"}  # warnings about things that happened, rather than a state that clears itself
 EMAIL_RETRY_SECONDS = 300
 TRACK_EXPIRY_SECONDS = 60
 MAX_TRACK_ITEMS = 3000
@@ -171,6 +172,21 @@ class Context:
         with self.db() as session:
             row = session.get(Setting, key)
             return row.value if row else SETTING_DEFAULTS.get(key, "")
+
+    def warning_acknowledged(self, key: str) -> float:
+        try:
+            return float(json.loads(self.get_setting("warning_acks") or "{}").get(key) or 0)
+        except (ValueError, AttributeError):
+            return 0.0
+
+    def acknowledge_warning(self, key: str, at: float) -> None:
+        try:
+            acks = json.loads(self.get_setting("warning_acks") or "{}")
+        except ValueError:
+            acks = {}
+        acks = acks if isinstance(acks, dict) else {}
+        acks[key] = at
+        self.set_setting("warning_acks", json.dumps(acks))
 
     def set_setting(self, key: str, value: str) -> None:
         with self.db() as session:
@@ -599,7 +615,7 @@ class Context:
         job.attempts += 1
         job.last_error = reason[:400]
         if job.attempts >= UPLOAD_MAX_ATTEMPTS:
-            job.status = "failed"
+            job.status, job.failed_at = "failed", time.time()
         elif job.destination == "broadcastify":
             # Broadcastify refuses calls that arrive late: 64 seconds was already too long.
             job.next_attempt_at = time.time() + BROADCASTIFY_RETRY_SECONDS
@@ -611,7 +627,7 @@ class Context:
         audio = self.recording_path(recording) if recording else None
         target = session.get(Target, recording.target_id) if recording and recording.target_id else None
         if audio is None or target is None:
-            job.status, job.last_error = "failed", "recording or target no longer exists"
+            job.status, job.last_error, job.failed_at = "failed", "recording or target no longer exists", time.time()
             return
         note = ""
         try:
@@ -632,7 +648,7 @@ class Context:
                     await uploaders.send_clearcut(self.cfg, client, server, key, recording, target, audio)
         except uploaders.UploadRejected as exc:
             job.attempts += 1
-            job.status, job.last_error = "failed", str(exc)[:400]
+            job.status, job.last_error, job.failed_at = "failed", str(exc)[:400], time.time()
             log.warning("upload %s to %s rejected: %s", job.recording_id, job.destination, job.last_error)
         except (uploaders.UploadError, httpx.HTTPError, OSError) as exc:
             self._retry_later(job, str(exc) or type(exc).__name__)
@@ -810,7 +826,8 @@ class Context:
         now_ = time.time()
 
         def add(key: str, level: str, text: str, page: str, quiet: str | None = None) -> None:
-            warnings.append({"key": key, "level": level, "text": text, "page": page, "quiet": quiet})
+            warnings.append({"key": key, "level": level, "text": text, "page": page, "quiet": quiet,
+                             "acknowledge": key in ACKNOWLEDGEABLE})
 
         with self.db() as session:
             for node in session.scalars(select(Node).where(Node.status == "active")):
@@ -843,11 +860,20 @@ class Context:
                     quiet = "Set not to warn while its stick is unplugged, under SDR sources." \
                         if source.quiet_offline and error in UNPLUGGED else None
                     add(f"source.fault:{source.id}", "bad", f"{source.name}: {error}", "#/sources", quiet)
-            failed = session.scalar(select(func.count()).select_from(UploadJob).join(Recording).where(
-                UploadJob.status == "failed", Recording.started_at > now_ - 86400))
+            # Failed uploads can't be fixed from here, so they can be acknowledged: only later failures warn again.
+            acked = self.warning_acknowledged("uploads.failed")
+            failures = dict(session.execute(
+                select(UploadJob.destination, func.count()).join(Recording).where(
+                    UploadJob.status == "failed", Recording.started_at > now_ - 86400,
+                    func.coalesce(UploadJob.failed_at, Recording.ended_at) > acked)
+                .group_by(UploadJob.destination)).all())
+            failed = sum(failures.values())
             if failed:
-                add("uploads.failed", "warn", f"{failed} upload{'s' if failed != 1 else ''} failed in the last day. The reason shows on each recording.",
-                    "#/recordings")
+                names = {"broadcastify": "Broadcastify", "rdio": "RDIO", "clearcut": "ClearCut"}
+                where = ", ".join(f"{n} to {names.get(d, d)}" for d, n in sorted(failures.items()))
+                since = f"since it was acknowledged at {datetime.fromtimestamp(acked, self.cfg.tz):%H:%M}" if acked else "in the last day"
+                add("uploads.failed", "warn", f"{failed} upload{'s' if failed != 1 else ''} failed {since} ({where}). "
+                                              "The reason shows on each recording.", "#/recordings")
             if self.email_error and self.get_setting("email_alerts_enabled") == "true":
                 add("email.failing", "warn", f"Alert emails aren't being sent. {self.email_error}", "#/admin?tab=email")
             limit_gb = float(self.get_setting("recording_retention_gb") or 0)

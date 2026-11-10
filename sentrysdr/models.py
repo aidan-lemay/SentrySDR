@@ -361,6 +361,7 @@ class UploadJob(Base):
     attempts: Mapped[int] = mapped_column(default=0)
     next_attempt_at: Mapped[float] = mapped_column(default=now)
     last_error: Mapped[str] = mapped_column(String(500), default="")
+    failed_at: Mapped[float | None] = mapped_column(nullable=True)  # when it gave up, for acknowledging failures
 
 
 class Setting(Base):

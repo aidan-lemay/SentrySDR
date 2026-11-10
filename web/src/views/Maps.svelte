@@ -12,7 +12,9 @@
   let error = $state('');
   let host;
   let map;
-  let layer;
+  let receiverLayer;
+  let trailLayer;
+  let markerLayer;
   let fitted = false;
 
   const located = $derived(items.filter((item) => Number.isFinite(item.lat) && Number.isFinite(item.lon)));
@@ -43,13 +45,20 @@
     return node;
   }
 
-  function draw() {
-    if (!layer) return;
-    layer.clearLayers();
-    const hue = getComputedStyle(document.documentElement).getPropertyValue('--viz').trim() || '#2a78d6';
+  // Markers are kept and moved, not redrawn, so an info box someone has open stays open
+  // and shows the latest. Trails are redrawn each time; receivers only when they change.
+  const markers = new Map();
+  let receiversDrawn = '';
+  const keyOf = (item) => String(kind === 'adsb' ? item.hex : item.mmsi);
+
+  function drawReceivers(hue) {
+    const signature = JSON.stringify([receivers, showCoverage, hue]);
+    if (signature === receiversDrawn) return;
+    receiversDrawn = signature;
+    receiverLayer.clearLayers();
     for (const receiver of receivers) {
       if (showCoverage && receiver.coverage?.length) {
-        L.polygon(receiver.coverage, { color: hue, weight: 1, fillOpacity: 0.12, interactive: false }).addTo(layer);
+        L.polygon(receiver.coverage, { color: hue, weight: 1, fillOpacity: 0.12, interactive: false }).addTo(receiverLayer);
       }
       const node = document.createElement('div');
       for (const line of [receiver.name, receiver.farthest_km ? `Farthest aircraft: ${Math.round(receiver.farthest_km)} km` : null].filter(Boolean)) {
@@ -59,19 +68,59 @@
       }
       L.marker([receiver.lat, receiver.lon], {
         icon: L.divIcon({ className: 'receiver-mark', iconSize: [14, 14] }), keyboard: true, title: receiver.name,
-      }).bindPopup(node).addTo(layer);
+      }).bindPopup(node).addTo(receiverLayer);
     }
+  }
+
+  function place(item, hue) {
+    const key = keyOf(item);
+    let marker = markers.get(key);
+    if (!marker) {
+      marker = L.circleMarker([item.lat, item.lon]);
+      marker.bindPopup(() => popup(marker.item));
+      // The map pans to show an info box when it opens, but not again as the aircraft moves on.
+      marker.on('popupopen', (event) => { event.popup.options.autoPan = false; });
+      marker.on('popupclose', (event) => { event.popup.options.autoPan = true; });
+      marker.addTo(markerLayer);
+      markers.set(key, marker);
+    } else {
+      marker.setLatLng([item.lat, item.lon]);
+    }
+    marker.item = item;
+    // Red is kept for emergencies, which also keep their label showing.
+    const tip = item.emergency ? `${label(item)}: ${item.emergency.split(' (')[0]}` : String(label(item));
+    const look = `${item.emergency ? 'emergency' : hue}|${tip}`;
+    if (marker.look !== look) {
+      marker.look = look;
+      marker.setStyle(item.emergency
+        ? { color: '#c00000', weight: 4, fillColor: '#ff3030', fillOpacity: 0.8 }
+        : { color: hue, weight: 2, fillColor: hue, fillOpacity: 0.5 });
+      marker.setRadius(item.emergency ? 11 : 7);
+      marker.unbindTooltip();
+      marker.bindTooltip(tip, item.emergency ? { permanent: true, direction: 'top', className: 'emergency-label' } : {});
+    }
+    if (marker.isPopupOpen()) marker.getPopup().update();
+    if (item.emergency) marker.bringToFront();
+  }
+
+  function draw() {
+    if (!markerLayer) return;
+    const hue = getComputedStyle(document.documentElement).getPropertyValue('--viz').trim() || '#2a78d6';
+    drawReceivers(hue);
+    trailLayer.clearLayers();
+    const here = new Set();
     for (const item of located) {
       if (kind === 'adsb' && showTrails && item.trail?.length > 1) {
-        L.polyline(item.trail, { color: hue, weight: 2, opacity: 0.6, interactive: false }).addTo(layer);
+        L.polyline(item.trail, { color: hue, weight: 2, opacity: 0.6, interactive: false }).addTo(trailLayer);
       }
-      // Red is kept for emergencies, which also keep their label showing.
-      const marker = item.emergency
-        ? L.circleMarker([item.lat, item.lon], { radius: 11, color: '#c00000', weight: 4, fillColor: '#ff3030', fillOpacity: 0.8 })
-          .bindTooltip(`${label(item)}: ${item.emergency.split(' (')[0]}`, { permanent: true, direction: 'top', className: 'emergency-label' })
-        : L.circleMarker([item.lat, item.lon], { radius: 7, color: hue, weight: 2, fillOpacity: 0.5 }).bindTooltip(String(label(item)));
-      marker.bindPopup(() => popup(item)).addTo(layer);
-      if (item.emergency) marker.bringToFront();
+      here.add(keyOf(item));
+      place(item, hue);
+    }
+    for (const [key, marker] of markers) {
+      if (!here.has(key)) {
+        markerLayer.removeLayer(marker);
+        markers.delete(key);
+      }
     }
     if (located.length && !fitted) {
       map.fitBounds(L.latLngBounds(located.map((i) => [i.lat, i.lon])), { maxZoom: 10, padding: [30, 30] });
@@ -98,6 +147,8 @@
     kind = next;
     fitted = false;
     items = [];
+    markerLayer.clearLayers();
+    markers.clear();
     draw();
     refresh();
   }
@@ -109,7 +160,9 @@
       attribution: '&copy; OpenStreetMap contributors',
       referrerPolicy: 'strict-origin-when-cross-origin',
     }).addTo(map);
-    layer = L.layerGroup().addTo(map);
+    receiverLayer = L.layerGroup().addTo(map);
+    trailLayer = L.layerGroup().addTo(map);
+    markerLayer = L.layerGroup().addTo(map);
     refresh();
     const timer = setInterval(refresh, 3000);
     return () => {

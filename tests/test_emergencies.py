@@ -191,3 +191,27 @@ def test_emergency_email_needs_maps(ctx, admin, listener, outbox, monkeypatch): 
     admin.patch(f"/api/admin/users/{me['id']}", json={"perm_overrides": {"maps": False}}).raise_for_status()
     feed(ctx, clock, [aircraft()], times=6)
     assert ctx.send_alert_emails() == 0
+
+
+def test_readsb_saying_none_isnt_an_emergency_on_the_map(ctx, listener, monkeypatch):
+    clock = Clock(monkeypatch)
+    plain = {"hex": "ffffff", "flight": "N1", "lat": 43.0, "lon": -77.0, "emergency": "none"}
+    feed(ctx, clock, [plain, {**plain, "hex": "eeeeee", "squawk": "1200"}], times=6)
+    items = listener.get("/api/maps/adsb").json()["items"]
+    assert len(items) == 2 and all("emergency" not in i for i in items)
+    assert events(ctx) == []
+
+
+import pytest  # noqa: E402
+
+
+@pytest.mark.parametrize("squawk,meaning", [("7500", "unlawful interference"), ("7600", "radio failure"), ("7700", "general emergency")])
+def test_each_emergency_squawk_is_labelled_and_alerts(ctx, listener, monkeypatch, squawk, meaning):
+    clock = Clock(monkeypatch)
+    feed(ctx, clock, [aircraft(squawk=squawk)], times=6)
+    [item] = listener.get("/api/maps/adsb").json()["items"]
+    assert item["emergency"].startswith(f"Squawk {squawk} ({meaning}")
+    [alert] = listener.get("/api/alerts").json()["items"]
+    assert alert["kind"] == "emergency"
+    listener.put("/api/me/emergency-alerts", json={"codes": [c for c in ("squawk_7500", "squawk_7600", "squawk_7700") if c != f"squawk_{squawk}"]}).raise_for_status()
+    assert listener.get("/api/alerts").json()["items"] == []

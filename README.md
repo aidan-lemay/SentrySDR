@@ -467,6 +467,8 @@ Admins and operators see a banner at the top of every page when something needs 
 
 Each warning links to the page to look at. Health warnings only appear in SentrySDR; they aren't emailed.
 
+**Acknowledging.** Failed uploads have already happened, and usually can't be fixed from SentrySDR, so that warning has an **Acknowledge** button, in the banner and under **Admin > Warnings**. It clears the warning for everyone, admins and operators, until another upload fails after that; the new warning counts only the failures since. Each warning says which services failed, and acknowledging is in the audit log. Use this rather than a mute, which would hide new failures too.
+
 **Muting.** **Admin > Warnings** lists every current warning, including hidden ones, and says why each is hidden. An admin can mute any warning for 1 hour to 1 week, or until they unmute it. A mute is that admin's own: other admins and operators still see the warning. A mute follows what the warning is about (that slave being offline, that SDR's fault, failed uploads), so it still applies if the warning clears and comes back, until it runs out. Mutes for warnings that have cleared are listed there too, so they can be removed. The banner's **Mute** link opens that section.
 
 **Don't warn if offline.** For a slave or SDR that is offline on purpose at times, tick **Don't warn if offline** on the slave under **Admin > Nodes**, or **Don't warn if its stick is unplugged** on the SDR under **Admin > SDR sources**. This hides the warning for everyone, admins and operators alike. On an SDR it covers only an unplugged or missing stick: other faults still warn. Hidden warnings still show under **Admin > Warnings**.
