@@ -958,10 +958,11 @@ def map_tracks(kind: str, request: Request, _user: User = Depends(require("maps"
     items = ctx.current_tracks(kind)
     if kind == "adsb":
         items = [{**item, "trail": ctx.trails.get(item.get("hex"))} for item in annotate_aircraft(request, db, items)]
+    # "emergency" on the map means a confirmed one. readsb's own field of that name ("none" for most aircraft) is replaced.
     active = ctx.emergencies.active(kind)
-    if active:
-        items = [{**item, "emergency": active[ident]} if (ident := emergencies.ident_for(kind, item)) in active else item
-                 for item in items]
+    items = [{**{k: v for k, v in item.items() if k != "emergency"},
+              **({"emergency": active[ident]} if (ident := emergencies.ident_for(kind, item)) in active else {})}
+             for item in items]
     winners = schedule.resolve(list(db.scalars(select(Recorder))), datetime.now(ctx.cfg.tz))
     receivers = []
     for source in db.scalars(select(Source).where(Source.lat.is_not(None), Source.lon.is_not(None)).order_by(Source.name)):

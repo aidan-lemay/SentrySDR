@@ -191,3 +191,12 @@ def test_emergency_email_needs_maps(ctx, admin, listener, outbox, monkeypatch): 
     admin.patch(f"/api/admin/users/{me['id']}", json={"perm_overrides": {"maps": False}}).raise_for_status()
     feed(ctx, clock, [aircraft()], times=6)
     assert ctx.send_alert_emails() == 0
+
+
+def test_readsb_saying_none_isnt_an_emergency_on_the_map(ctx, listener, monkeypatch):
+    clock = Clock(monkeypatch)
+    plain = {"hex": "ffffff", "flight": "N1", "lat": 43.0, "lon": -77.0, "emergency": "none"}
+    feed(ctx, clock, [plain, {**plain, "hex": "eeeeee", "squawk": "1200"}], times=6)
+    items = listener.get("/api/maps/adsb").json()["items"]
+    assert len(items) == 2 and all("emergency" not in i for i in items)
+    assert events(ctx) == []
