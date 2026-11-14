@@ -55,6 +55,10 @@ USBFS_FAULT = ("couldn't get USB buffer memory: this host's limit is used up by 
 TAIL_LINES = 5
 FAULT_LENGTH = 300
 RESET_SETTLE_SECONDS = 3.0
+# Sticks opening at the same moment compete on the USB bus: on every hub tested, four opening
+# together took up to 4.8 s and hit USB timeouts and hub port resets, and one at a time never did.
+# So the SDRs on one machine start this far apart, each after the last has finished opening (about 1.2 s).
+START_GAP_SECONDS = 1.5
 RESET_RESTART_GAP = 60.0  # at most one automatic restart a minute, so a stick that always resets can't loop
 # Changing any of these restarts the tool: they are read when it starts. Volume is read live, and names are only labels.
 RADIO_KEYS = ("kind", "frequency_hz", "modulation", "squelch", "gain_db", "ppm", "channels", "feeds", "feeder_uuid", "rtl_tcp_port")
@@ -351,7 +355,8 @@ class Worker:
             await self.stop()  # saves a call in progress
             self.in_call, self.call_started = False, None
             self._publish(state, "")
-            devices = await asyncio.to_thread(self.sup.enumerate)
+            async with self.sup.starting():
+                devices = await asyncio.to_thread(self.sup.enumerate)
             index = sdr.index_for_serial(self.serial, devices)
             if index is None:
                 raise MeasureError("This SDR isn't connected, or its serial is duplicated.")
@@ -502,7 +507,11 @@ class Worker:
             try:
                 # The cheap sysfs check first: enumerating briefly opens every stick, busy ones too.
                 present = await asyncio.to_thread(self.sup.present)
-                devices = await asyncio.to_thread(self.sup.enumerate) if present is None or self.serial in present else []
+                if present is None or self.serial in present:
+                    async with self.sup.starting():  # the tool is started straight after, so it opens alone
+                        devices = await asyncio.to_thread(self.sup.enumerate)
+                else:
+                    devices = []
                 index = sdr.index_for_serial(self.serial, devices)
                 if index is None:
                     if sdr.has_duplicate(self.serial, devices):
@@ -808,6 +817,24 @@ class Supervisor:
             else:
                 leftover.unlink(missing_ok=True)
         self.workers = {serial: Worker(self, serial) for serial in cfg.serials}
+        self._start_lock = asyncio.Lock()
+        self._next_start = 0.0
+
+    @contextlib.asynccontextmanager
+    async def starting(self):
+        """One SDR at a time finds its stick and starts its tool, START_GAP_SECONDS apart.
+
+        Held while the stick list is read, which briefly opens every stick. The tool starts
+        straight after, and the next SDR waits until it has had time to open.
+        """
+        async with self._start_lock:
+            wait = self._next_start - time.monotonic()
+            if wait > 0:
+                await asyncio.sleep(wait)
+            try:
+                yield
+            finally:
+                self._next_start = time.monotonic() + START_GAP_SECONDS
 
     async def apply(self, assignments: dict[str, dict | None]) -> None:
         for serial, worker in self.workers.items():

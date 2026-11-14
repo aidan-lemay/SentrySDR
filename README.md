@@ -207,6 +207,8 @@ journalctl -k | grep -i -E "cannot reset|not accepting address|descriptor read"
 
 Any of those lines means the connection needs attention, so fix it before you measure noise or trust a squelch setting. `USB disconnect` on its own is normal when you unplug something.
 
+Sticks opening at the same moment compete on the USB bus. In testing, with four sticks opening together on each of three different hubs, opens took up to 4.8 seconds instead of 1.2, with USB timeouts and hub port resets; one at a time, they never did. So each machine starts its SDRs 1.5 seconds apart. That covers starting the service, a slave reconnecting, and a stick being plugged back in. A machine with 8 SDRs takes about 12 seconds to have them all running. Restarting one SDR only waits if another SDR on that machine started in the last 1.5 seconds.
+
 A stick that was last closed uncleanly, for example when a tool was killed, can come up with USB errors and then send nothing. When an SDR shows USB errors as it starts, SentrySDR restarts it once so it opens cleanly, and the Sources page notes the time. If it happens again within a minute, it's left running with the note. Seeing this often points to the hub or cable.
 
 If a stick is unplugged, its source shows **SDR disconnected** within a few seconds, and starts again by itself within a few seconds of being plugged back in. That works for every target type, including decoders that hang instead of quitting when their stick disappears: each running SDR checks every 3 seconds that its stick is still on the USB bus, using the kernel's device list, which opens nothing. Other SDRs keep running, and a call in progress is saved.

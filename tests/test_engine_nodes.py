@@ -206,6 +206,39 @@ async def test_ais_pipeline_publishes_vessels(tmp_path):
     assert tracks[0][0] == "ais" and tracks[0][2]["vessels"][0]["mmsi"] == "123"
 
 
+async def test_sdrs_on_one_machine_start_apart(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "START_GAP_SECONDS", 0.4)
+    bins, log = tmp_path / "bin", tmp_path / "starts"
+    install_tool(bins, "AIS-catcher", f"#!/usr/bin/env python3\nimport time\nopen({str(log)!r}, 'a').write(repr(time.time()) + chr(10))\ntime.sleep(60)\n")
+    serials = ["S1", "S2", "S3", "S4"]
+    sup = supervisor(make_config(tmp_path, bin_dirs=[bins], serials=serials), [], devices=serials)
+    try:
+        await sup.apply({s: spec(kind="ais", modulation="ais", frequency_hz=162_000_000) for s in serials})
+        assert await wait_for(lambda: log.exists() and len(log.read_text().split()) == 4, timeout=5)
+        times = sorted(float(t) for t in log.read_text().split())
+        gaps = [b - a for a, b in zip(times, times[1:])]
+        assert all(gap >= 0.35 for gap in gaps), gaps
+    finally:
+        await sup.shutdown()
+
+
+async def test_a_start_waiting_its_turn_can_be_stopped(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "START_GAP_SECONDS", 30)
+    bins = tmp_path / "bin"
+    install_tool(bins, "AIS-catcher", "#!/bin/sh\nsleep 60\n")
+    sup = supervisor(make_config(tmp_path, bin_dirs=[bins]), [])
+    try:
+        await sup.apply({"SER1": spec(kind="ais", modulation="ais", frequency_hz=162_000_000),
+                         "SER2": spec(kind="ais", modulation="ais", frequency_hz=162_000_000)})
+        await asyncio.sleep(0.3)
+        started = time.monotonic()
+        await sup.apply({"SER1": None, "SER2": None})  # SER2 is still waiting for the gap
+        assert time.monotonic() - started < 5
+        assert not sup._start_lock.locked()
+    finally:
+        await sup.shutdown()
+
+
 # What librtlsdr and AIS-catcher print when the host's usbfs memory limit is used up.
 USBFS_OUTPUT = ("Failed to submit transfer 3!\nPlease increase your allowed usbfs buffer size with the following command:\n"
                 "echo 0 > /sys/module/usbcore/parameters/usbfs_memory_mb\n<3>RTLSDR: lost device. Terminating.\n")
