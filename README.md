@@ -470,7 +470,11 @@ Replaces trunk-recorder's `broadcastify_uploader` for conventional channels. Bro
 1. In **Admin > Uploads and feeds > Broadcastify Calls systems**, add each node's name, system ID and API key, then select **Check credentials**. This sends no call.
 2. On each target, turn on **Upload calls to Broadcastify Calls**, then choose the system and the frequency's slot. Slots are on Broadcastify's Manage Calls Systems page, under Node Frequencies.
 
-All uploads go from the master, including calls recorded on slaves. A call Broadcastify skips counts as finished, and a call it rejects, or refuses for a bad API key, is not retried. The reason shows on the recording, and other calls keep uploading. Broadcastify refuses calls that arrive late (64 seconds was too late in testing), so other failures retry every 10 seconds, and calls held during an outage will probably be rejected. They stay in SentrySDR.
+All uploads go from the master, including calls recorded on slaves. A call Broadcastify skips counts as finished, and a call it rejects, or refuses for a bad API key, is not retried. The reason shows on the recording, and other calls keep uploading. Broadcastify refuses a call that arrives more than about a minute after it started (`REJECTED-CALL-SKEW-TOO-LONG`), so:
+
+- Each destination has its own upload queue. A slow or unreachable ClearCut or RDIO server can't hold up Broadcastify, which is what made every Broadcastify call late when ClearCut stopped answering.
+- Broadcastify's queue looks for new calls every second, sends the newest first, up to three at a time, and gives up on a reply after 15 seconds.
+- Other failures retry every 10 seconds. A call already more than 58 seconds past its start isn't sent at all; it's marked **Too late for Broadcastify** instead, so calls held during an outage or by an offline slave don't use up attempts. They stay in SentrySDR.
 
 `No-Freq-Table-Entry-For-Upload` means Broadcastify can't match the call to a frequency on that node. Check the system, the target's slot and its frequency against **Node Frequencies** on the Manage Calls Systems page. Stop any other uploader on the same slot before you switch.
 

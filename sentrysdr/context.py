@@ -92,6 +92,11 @@ def clean_track_items(items, strict: bool = True) -> list[dict]:
     return [clean_track_value(item, 0, strict) for item in items[:MAX_TRACK_ITEMS] if isinstance(item, dict)]
 UPLOAD_MAX_ATTEMPTS = 12
 BROADCASTIFY_RETRY_SECONDS = 10
+# Broadcastify refuses a call this long after it started ("REJECTED-CALL-SKEW-TOO-LONG"): 63 seconds
+# was refused in production. Past this, sending would only waste the attempt.
+BROADCASTIFY_LATE_SECONDS = 58
+BROADCASTIFY_AT_ONCE = 3  # calls sent together, so one slow reply doesn't make the next late
+UPLOAD_LANES = ("broadcastify", "clearcut", "rdio")
 DUPLICATE_UPLOAD_NOTE = "Skipped: another SDR on this channel already recorded this call."
 # ClearCut only lists recent calls, so there's no point looking for much longer.
 TRANSCRIPT_WINDOW_SECONDS = 86400
@@ -598,32 +603,55 @@ class Context:
             await link.send_desired(desired.get(node_id, {}))
 
     async def _upload_loop(self) -> None:
-        async with httpx.AsyncClient(timeout=uploaders.UPLOAD_TIMEOUT, follow_redirects=False) as client:
-            while True:
-                try:
-                    if not await self.process_uploads(client):
-                        await asyncio.sleep(5)
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    log.exception("upload pass failed")
-                    await asyncio.sleep(30)
+        """One lane per destination, so a slow or hung service holds up only its own uploads.
+        Broadcastify takes calls only within about a minute, so its lane looks every second and
+        gives up on a reply sooner."""
+        async def lane(destination: str) -> None:
+            timeout = uploaders.BROADCASTIFY_TIMEOUT if destination == "broadcastify" else uploaders.UPLOAD_TIMEOUT
+            idle = 1 if destination == "broadcastify" else 5
+            async with httpx.AsyncClient(transport=self.http_transport, timeout=timeout, follow_redirects=False) as client:
+                while True:
+                    try:
+                        if not await self.process_uploads(client, (destination,)):
+                            await asyncio.sleep(idle)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        log.exception("%s upload pass failed", destination)
+                        await asyncio.sleep(30)
+        await asyncio.gather(*(lane(destination) for destination in UPLOAD_LANES))
 
-    async def process_uploads(self, client: httpx.AsyncClient) -> int:
+    async def process_uploads(self, client: httpx.AsyncClient, destinations: tuple[str, ...] = UPLOAD_LANES) -> int:
+        """Send what's due. Broadcastify first and newest first, a few at once; the rest oldest first."""
+        now = time.time()
         with self.db() as session:
-            jobs = list(session.scalars(
-                select(UploadJob).where(UploadJob.status == "pending", UploadJob.next_attempt_at <= time.time()).limit(10)
-            ))
-            for job in jobs:
-                try:
-                    await self._attempt_upload(session, client, job)
-                except Exception as exc:
-                    # One bad call must never hold up the calls queued behind it.
-                    log.exception("upload %s to %s hit an unexpected error", job.recording_id, job.destination)
-                    session.rollback()
-                    self._retry_later(job, f"Unexpected error: {type(exc).__name__}")
-                session.commit()
-            return len(jobs)
+            due = select(UploadJob.id, UploadJob.destination).join(Recording, Recording.id == UploadJob.recording_id, isouter=True).where(
+                UploadJob.status == "pending", UploadJob.next_attempt_at <= now, UploadJob.destination.in_(destinations))
+            fast = [] if "broadcastify" not in destinations else [row.id for row in session.execute(
+                due.where(UploadJob.destination == "broadcastify").order_by(Recording.ended_at.desc()).limit(10))]
+            rest = [row.id for row in session.execute(
+                due.where(UploadJob.destination != "broadcastify").order_by(UploadJob.id).limit(10))]
+        for start in range(0, len(fast), BROADCASTIFY_AT_ONCE):
+            await asyncio.gather(*(self._upload_one(client, job_id) for job_id in fast[start:start + BROADCASTIFY_AT_ONCE]))
+        for job_id in rest:
+            await self._upload_one(client, job_id)
+        return len(fast) + len(rest)
+
+    async def _upload_one(self, client: httpx.AsyncClient, job_id: int) -> None:
+        """One upload in its own session, so several can run at once."""
+        with self.db() as session:
+            job = session.get(UploadJob, job_id)
+            if job is None or job.status != "pending":
+                return  # another pass got to it first
+            try:
+                await self._attempt_upload(session, client, job)
+            except Exception as exc:
+                # One bad call must never hold up the calls queued behind it.
+                log.exception("upload %s to %s hit an unexpected error", job.recording_id, job.destination)
+                session.rollback()
+                job = session.get(UploadJob, job_id)
+                self._retry_later(job, f"Unexpected error: {type(exc).__name__}")
+            session.commit()
 
     def _retry_later(self, job: UploadJob, reason: str) -> None:
         job.attempts += 1
@@ -647,6 +675,10 @@ class Context:
         try:
             server = self.get_setting(f"{job.destination}_server")
             if job.destination == "broadcastify":
+                late = time.time() - (recording.ended_at - recording.duration)
+                if late > BROADCASTIFY_LATE_SECONDS:
+                    raise uploaders.UploadRejected(
+                        f"Too late for Broadcastify: {late:.0f} seconds after the call started, and it only takes calls within about a minute. Not sent.")
                 system = session.get(BroadcastifySystem, target.broadcastify_system_ref)
                 key = self.secrets.open(system.api_key_sealed) if system else ""
                 if not server or not key:

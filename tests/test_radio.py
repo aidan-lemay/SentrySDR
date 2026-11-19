@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import sqlite3
 import subprocess
@@ -1375,9 +1376,10 @@ async def test_a_bad_reply_never_holds_up_the_next_call(admin, ctx, tmp_path, ba
     first = bcfy_recording(ctx, target, tmp_path, started=1_800_000_000.0)
     second = bcfy_recording(ctx, target, tmp_path, started=1_800_000_100.0)
     await run_replies(ctx, [bad, f"0 {SIGNED}"])
-    assert bcfy_job(ctx, second).status == "done"
-    job = bcfy_job(ctx, first)
-    assert job.status in ("failed", "pending") and job.last_error and job.attempts == 1
+    # Both are sent together, newest first, so either may get the bad reply: the other still goes.
+    jobs = sorted((bcfy_job(ctx, first), bcfy_job(ctx, second)), key=lambda j: j.status != "done")
+    assert jobs[0].status == "done"
+    assert jobs[1].status in ("failed", "pending") and jobs[1].last_error and jobs[1].attempts == 1
 
 
 async def test_unexpected_errors_stop_retrying_after_the_limit(admin, ctx, tmp_path, monkeypatch):
@@ -1698,6 +1700,84 @@ async def test_broadcastify_retries_inside_its_time_window(admin, ctx, tmp_path)
         await run_bcfy(ctx, [], post_status=500)
         job = bcfy_job(ctx, call)
         assert job.attempts == attempt and job.next_attempt_at - time.time() <= BROADCASTIFY_RETRY_SECONDS
+
+
+async def test_a_call_too_late_for_broadcastify_isnt_sent(admin, ctx, tmp_path):
+    _, target = bcfy_target(admin)
+    call = bcfy_recording(ctx, target, tmp_path, started=time.time() - 75, duration=5)
+    seen = []
+    await run_bcfy(ctx, seen)
+    job = bcfy_job(ctx, call)
+    assert seen == [] and job.status == "failed" and "Too late for Broadcastify" in job.last_error
+
+
+async def test_broadcastify_sends_the_newest_call_first(admin, ctx, tmp_path):
+    _, target = bcfy_target(admin)
+    now = time.time()
+    older = bcfy_recording(ctx, target, tmp_path, started=now - 30, duration=2)
+    newer = bcfy_recording(ctx, target, tmp_path, started=now - 10, duration=2)
+    seen = []
+    await run_bcfy(ctx, seen)
+    stamps = [form_fields(r)["ts"]["body"] for r in seen if r.method == "POST"]
+    assert stamps == [str(int(now - 10)), str(int(now - 30))]
+    assert bcfy_job(ctx, older).status == bcfy_job(ctx, newer).status == "done"
+
+
+async def test_the_broadcastify_lane_leaves_other_destinations_alone(admin, ctx, tmp_path):
+    admin.patch("/api/admin/settings", json={"clearcut_server": "https://cc.example.com", "clearcut_api_key": "k"})
+    _, target = bcfy_target(admin, clearcut_enabled=True, clearcut_system="sys", clearcut_id=5)
+    call = bcfy_recording(ctx, target, tmp_path, started=time.time() - 5, duration=2)
+    seen = []
+    async with httpx.AsyncClient(transport=bcfy_transport(seen)) as client:
+        assert await ctx.process_uploads(client, ("broadcastify",)) == 1
+    assert seen and all(r.url.host != "cc.example.com" for r in seen)
+    with ctx.db() as session:
+        clearcut = session.scalar(select(UploadJob).where(UploadJob.recording_id == call, UploadJob.destination == "clearcut"))
+    assert clearcut.status == "pending" and clearcut.attempts == 0
+    assert bcfy_job(ctx, call).status == "done"
+
+
+async def test_a_hung_clearcut_no_longer_makes_broadcastify_late(admin, ctx, tmp_path):
+    """What happened in production: ClearCut timed out on every call, and Broadcastify, queued behind it, refused them all as late."""
+    admin.patch("/api/admin/settings", json={"clearcut_server": "https://cc.example.com", "clearcut_api_key": "k"})
+    _, target = bcfy_target(admin, clearcut_enabled=True, clearcut_system="sys", clearcut_id=5)
+    call = bcfy_recording(ctx, target, tmp_path, started=time.time() - 3, duration=2)
+
+    async def handler(request):
+        await request.aread()
+        if request.url.host == "cc.example.com":
+            await asyncio.sleep(30)  # hangs, as ClearCut did
+        if request.method == "POST":
+            return httpx.Response(200, text=f"0 {SIGNED}")
+        return httpx.Response(200)
+    ctx.http_transport = httpx.MockTransport(handler)
+    loop = asyncio.create_task(ctx._upload_loop())
+    try:
+        for _ in range(40):
+            if bcfy_job(ctx, call).status == "done":
+                break
+            await asyncio.sleep(0.1)
+    finally:
+        loop.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await loop
+    assert bcfy_job(ctx, call).status == "done"
+
+
+def test_broadcastify_gives_up_on_a_reply_sooner():
+    assert uploaders.BROADCASTIFY_TIMEOUT.read <= 15 < uploaders.UPLOAD_TIMEOUT.read
+
+
+async def test_each_destination_has_its_own_lane(ctx, monkeypatch):
+    seen = []
+
+    async def fake(client, destinations):
+        seen.append((destinations, client.timeout.read))
+        raise asyncio.CancelledError
+    monkeypatch.setattr(ctx, "process_uploads", fake)
+    with pytest.raises(asyncio.CancelledError):
+        await ctx._upload_loop()
+    assert sorted(seen) == sorted([(("broadcastify",), 15.0), (("clearcut",), 60.0), (("rdio",), 60.0)])
 
 
 async def test_other_uploads_still_back_off_slowly(admin, ctx, tmp_path):

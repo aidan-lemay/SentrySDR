@@ -27,6 +27,8 @@ from . import pipelines
 log = logging.getLogger("sentrysdr.uploaders")
 
 UPLOAD_TIMEOUT = httpx.Timeout(60.0, connect=15.0)
+# Broadcastify takes calls only within about a minute, so a slow answer is as bad as none.
+BROADCASTIFY_TIMEOUT = httpx.Timeout(15.0, connect=5.0)
 TRANSCRIBE_TIMEOUT = httpx.Timeout(180.0, connect=15.0)
 MAX_RESPONSE_BYTES = 5 * 1024 * 1024
 MAX_TRANSCRIPT_CHARS = 20000
