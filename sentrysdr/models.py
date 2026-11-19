@@ -85,7 +85,7 @@ class AuditLog(Base):
 
 
 class Node(Base):
-    """A SentrySDR instance. The master has one local node; slaves enrol."""
+    """A SentrySDR instance. The master has one local node; slaves enroll."""
     __tablename__ = "nodes"
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(120))
@@ -297,6 +297,31 @@ class UserWatch(Base):
     target_id: Mapped[int | None] = mapped_column(ForeignKey("targets.id", ondelete="CASCADE"), nullable=True)
     value: Mapped[str] = mapped_column(String(16), default="")  # a registration or flight, for aircraft
     created_at: Mapped[float] = mapped_column(default=now)
+
+
+class UserBookmark(Base):
+    """A frequency one user saved in the web tuner. Kept on the master, so it's the same on every SDR."""
+    __tablename__ = "user_bookmarks"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(120))
+    frequency_hz: Mapped[int] = mapped_column()
+    mode: Mapped[str] = mapped_column(String(12), default="nfm")
+    bandwidth_hz: Mapped[int | None] = mapped_column(nullable=True)
+    folder: Mapped[str] = mapped_column(String(60), default="")  # the first of folders, from before there could be several
+    folders: Mapped[list | None] = mapped_column(JSON, nullable=True)  # names, like GQRX's tags
+    notes: Mapped[str] = mapped_column(String(500), default="")
+    created_at: Mapped[float] = mapped_column(default=now)
+
+
+class BookmarkFolder(Base):
+    """A bookmark folder's color, one user's own. Folders themselves are the names bookmarks carry."""
+    __tablename__ = "bookmark_folders"
+    __table_args__ = (UniqueConstraint("user_id", "name"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(60))
+    color: Mapped[str] = mapped_column(String(7))
 
 
 class AlertSent(Base):

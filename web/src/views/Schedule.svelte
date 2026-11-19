@@ -1,6 +1,6 @@
 <script>
   import { onMount } from 'svelte';
-  import { api, DAYS, formatMHz, formatSchedule, problemNote, stickProblems, zonedInputValue } from '../lib.js';
+  import { api, DAYS, formatMHz, formatSchedule, antennaUsable, problemNote, stickProblems, zonedInputValue } from '../lib.js';
   import Notice from '../Notice.svelte';
   import { clearAfter } from '../notice.svelte.js';
 
@@ -157,6 +157,8 @@
         </select>
         {#if form.target_id !== '' && stickProblems(chosenSource, targets.find((t) => t.id === Number(form.target_id))).length}
           <span class="hint st-warn">{chosenSource.name} may not suit that target: {stickProblems(chosenSource, targets.find((t) => t.id === Number(form.target_id))).join(', ')}. You can still schedule it.</span>
+        {:else if form.target_id !== '' && antennaUsable(chosenSource, targets.find((t) => t.id === Number(form.target_id)))}
+          <span class="hint">{chosenSource.name}'s antenna is usable at that frequency, but not ideal.</span>
         {/if}
       </label>
       <div class="field"><span>Repeats</span>

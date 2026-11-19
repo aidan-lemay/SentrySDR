@@ -1,6 +1,6 @@
 <script>
   import { onMount } from 'svelte';
-  import { api, DEFAULT_GAIN_DB, feedLabel, formatMHz, formatTime, formatDuration, nearestStep, problemNote, STATE_LABELS, stickProblems } from '../lib.js';
+  import { api, DEFAULT_GAIN_DB, feedLabel, formatMHz, formatTime, formatDuration, nearestStep, antennaUsable, problemNote, STATE_LABELS, stickProblems } from '../lib.js';
   import Notice from '../Notice.svelte';
   import { NOTICE_MS } from '../notice.svelte.js';
   import GainField from '../GainField.svelte';
@@ -30,7 +30,7 @@
   const can = (permission) => user.permissions.includes(permission);
   const isAdmin = user.role === 'admin';
   const canAssign = isAdmin || user.permissions.includes('assign');
-  const MODE_LABELS = { adsb: 'ADS-B', rtltcp: 'rtl_tcp' };
+  const MODE_LABELS = { adsb: 'ADS-B', rtltcp: 'rtl_tcp', tuner: 'Tuner' };
   // What to paste into GQRX's Device string. The buffer settings help over a network.
   const gqrxString = (address) => `rtl_tcp=${address},buffers=16,psize=16384`;
   const wildcard = (address) => /^(0\.0\.0\.0|::|\[::\]):/.test(address);
@@ -243,7 +243,7 @@
                 {#if source.in_call}<span class="st-air">ON AIR</span><br />{/if}
                 <span class={stateClass(source.state)}>{STATE_LABELS[source.state] ?? source.state}</span>
                 {#if source.locked}<br /><span class="st-warn">Locked</span>{/if}
-                {#if source.error}<br /><span class="st-bad small">{source.error}</span>{/if}
+                {#if source.error}<br /><span class="st-bad small wrap-any">{source.error}</span>{/if}
                 {#if source.note}<br /><span class="st-warn small">{source.note}</span>{/if}
                 {#if canAssign && source.feeds?.aggregators && Object.keys(source.feeds.aggregators).length}
                   <br /><span class="small">Feeding: {#each Object.entries(source.feeds.aggregators) as [key, up], i (key)}{i ? ', ' : ''}<span class={up ? 'st-ok' : 'st-warn'}>{feedLabel(key)} {up ? 'connected' : 'not connected'}</span>{/each}</span>
@@ -271,6 +271,9 @@
                 {/if}
                 {#if can('maps') && source.active_target?.kind === 'acars'}
                   <a class="button" href="#/messages">Messages</a>
+                {/if}
+                {#if can('tuner') && source.active_target?.kind === 'tuner'}
+                  <a class="button" href={`#/tuner?source=${source.id}`} target="_blank" rel="noopener">Open tuner</a>
                 {/if}
               </div>
             </td>
@@ -309,6 +312,8 @@
                     </select>
                     {#if draft.target !== '' && stickProblems(source, targets.find((t) => t.id === Number(draft.target))).length}
                       <span class="hint st-warn">This SDR may not suit that target: {stickProblems(source, targets.find((t) => t.id === Number(draft.target))).join(', ')}. You can still assign it.</span>
+                    {:else if draft.target !== '' && antennaUsable(source, targets.find((t) => t.id === Number(draft.target)))}
+                      <span class="hint">Its antenna is usable at that frequency, but not ideal.</span>
                     {/if}
                   </label>
                   <div class="buttons form-buttons"><button class="main" disabled={source.locked && !isAdmin} onclick={() => assign(source)}>Assign</button></div>

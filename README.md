@@ -19,7 +19,7 @@ It supervises existing tools instead of reimplementing them: `rtl_fm`, `ffmpeg`,
 
 - **System:** Debian 12 or newer, or Raspberry Pi OS (Bookworm or newer), with systemd. Other Linux systems work, but you install the packages yourself (see the top of `scripts/install.sh`). Python 3.11 or newer.
 - **Master:** any 64-bit machine that stays on. It holds the recordings, so give it disk space: about 0.25 MB per minute of recorded audio. It also needs Node.js and npm to build the web interface, which the script installs.
-- **Slave:** a Raspberry Pi 3B or newer works for one or two SDRs. Each SDR uses one USB port, and see [USB connections](#usb-connections).
+- **Slave:** a Raspberry Pi 3B or newer works for one or two SDRs. Each SDR uses one USB port, and see [USB connections](#usb-connections) and [USB buffer memory](#usb-buffer-memory).
 - **SDRs:** RTL-SDR sticks (RTL2832U), each with a unique serial number. Sticks often ship with the same serial; give each its own with `rtl_eeprom -s <serial>`, one stick plugged in at a time.
 
 ### Master
@@ -38,7 +38,7 @@ The script installs packages, creates the `sentrysdr` user, copies the applicati
 5. **Publish it** with a tunnel or reverse proxy, then sign in.
 6. **In the web interface:** add each SDR under **Admin > SDR sources** (and **Detect from the stick**), add targets, and assign them on the Sources page. Turn off **Let people request accounts** under **Admin > Settings** if you don't want sign-up requests.
 
-The script also blacklists the kernel's DVB-T driver, which would otherwise claim the sticks. Reboot once after installing, or unplug and replug the sticks.
+The script also blacklists the kernel's DVB-T driver, which would otherwise claim the sticks, and raises the kernel's [USB buffer memory](#usb-buffer-memory) limit. Reboot once after installing, or unplug and replug the sticks.
 
 ### Slave
 
@@ -118,7 +118,7 @@ local_access = true
 - **Who can connect:** only private, link-local, loopback and Tailscale addresses, plus anything in `trusted_proxies`. Other addresses get a 403. Everyone still has to sign in.
 - **Which addresses work:** any private or Tailscale IP of the machine, with no further setup. To use a name such as `minipc.lan`, add `http://minipc.lan:8642` to `extra_origins`.
 - **What you give up:** plain http isn't encrypted, so anyone on your network who can see the traffic can read passwords and session cookies. Don't use it on a shared network, and never forward the port from the internet. Browsers also won't install the PWA without HTTPS; the site itself still works.
-- **Slaves:** a slave can use `http://<ip>:8642` as `master.url`. Its enrolment token and device key travel unencrypted too, unless the address is on Tailscale or another VPN.
+- **Slaves:** a slave can use `http://<ip>:8642` as `master.url`. Its enrollment token and device key travel unencrypted too, unless the address is on Tailscale or another VPN.
 - **`allow_public_bind`:** setting this turns off the address restriction, so leave it off.
 
 This can run alongside a proxy. Requests through the proxy still get Secure cookies, and those through the local address don't.
@@ -145,7 +145,7 @@ Each permission except the admin-only ones can be allowed or denied per user, un
 | Users, Bans, Audit log | Accounts and access, as above |
 | SDR sources | Each SDR's name, description, antenna, gain, frequency correction and capabilities |
 | Antennas | Antennas and their frequency ranges |
-| Nodes | Slaves: create a one-time enrolment token, or revoke a slave |
+| Nodes | Slaves: create a one-time enrollment token, or revoke a slave |
 | Settings | How long recordings, ACARS messages and emergencies, and audit logs are kept (0 keeps them forever); a size limit for recordings; sign-ups; the map tile server; a backup download |
 | Uploads and feeds | RDIO and ClearCut servers and keys; the Broadcastify upload address and systems; the airframes.io station ID and address |
 | Email | The mail server for alert emails, and the daily limit. See [Email alerts](#email-alerts) |
@@ -163,7 +163,7 @@ Upload API keys and the mail server password are never shown again once saved. L
 - **Secrets at rest:** TOTP seeds, upload API keys and the mail server password are encrypted with `secret.key` in the data folder. Back up that file with the database, and keep both private.
 - **Browser protections:** strict CSP, `HttpOnly`, `Secure` and `SameSite=Strict` cookies (not `Secure` over a plain-http local address), Host and Origin checks, and a custom header on every change, so other sites can't make requests as you. tar1090 is the one exception: it needs inline scripts, so it gets a looser CSP on its own path. Aircraft data it shows is cleaned of anything but plain characters first, because it can come from a slave.
 - **Radio tools:** run as argv lists, never through a shell, with all values validated first, including those arriving from the network. Decoders open no ports, with one opt-in exception: the local data port below.
-- **Slaves:** each enrols with a one-time token that expires in 24 hours, then uses its own key, stored only as a hash on the master and revocable from **Admin > Nodes**. A slave can only report on its own SDRs. What it sends is checked: call details and times, and limits on aircraft and ship lists (3,000 each) and ACARS messages (600 a minute per SDR), so a compromised slave can't fill the master's memory or database. Recordings are limited to 256 MB and must be MP3.
+- **Slaves:** each enrolls with a one-time token that expires in 24 hours, then uses its own key, stored only as a hash on the master and revocable from **Admin > Nodes**. A slave can only report on its own SDRs. What it sends is checked: call details and times, and limits on aircraft and ship lists (3,000 each) and ACARS messages (600 a minute per SDR), so a compromised slave can't fill the master's memory or database. Recordings are limited to 256 MB and must be MP3.
 - **Email:** alerts go only to an address its owner confirmed with a link sent to it, so nobody can sign up with someone else's address and have mail sent there. Confirmation and turn-off links carry a random or keyed token, checked in constant time, and are rate limited per address. Names in a subject can't add mail headers. Each user is limited to 3 confirmations an hour and the daily cap of alerts.
 - **Outbound connections:** only the uploads, feeds and mail server you turn on. Aggregator addresses are fixed in the code, so a master can switch a slave's feeds on or off but can't point them anywhere else. The airframes.io feed sends only acarsdec's own message fields and your station ID.
 - **Local data port:** the optional port for fr24feed and piaware is bound to 127.0.0.1 on the node with the SDR. readsb opens no other ports.
@@ -207,6 +207,8 @@ journalctl -k | grep -i -E "cannot reset|not accepting address|descriptor read"
 
 Any of those lines means the connection needs attention, so fix it before you measure noise or trust a squelch setting. `USB disconnect` on its own is normal when you unplug something.
 
+Sticks opening at the same moment compete on the USB bus. In testing, with four sticks opening together on each of three different hubs, opens took up to 4.8 seconds instead of 1.2, with USB timeouts and hub port resets; one at a time, they never did. So each machine starts its SDRs 1.5 seconds apart. That covers starting the service, a slave reconnecting, and a stick being plugged back in. A machine with 8 SDRs takes about 12 seconds to have them all running. Restarting one SDR only waits if another SDR on that machine started in the last 1.5 seconds.
+
 A stick that was last closed uncleanly, for example when a tool was killed, can come up with USB errors and then send nothing. When an SDR shows USB errors as it starts, SentrySDR restarts it once so it opens cleanly, and the Sources page notes the time. If it happens again within a minute, it's left running with the note. Seeing this often points to the hub or cable.
 
 If a stick is unplugged, its source shows **SDR disconnected** within a few seconds, and starts again by itself within a few seconds of being plugged back in. That works for every target type, including decoders that hang instead of quitting when their stick disappears: each running SDR checks every 3 seconds that its stick is still on the USB bus, using the kernel's device list, which opens nothing. Other SDRs keep running, and a call in progress is saved.
@@ -219,6 +221,24 @@ If an SDR still seems stuck, administrators have two buttons:
 Both work on slaves, need the slave to be online and running this version, and are recorded in the audit log.
 
 A stick that stays connected but stops working may not show a fault, because it looks the same as a closed squelch. Try **Restart** first.
+
+### USB buffer memory
+
+Every SDR on a machine shares one kernel limit on USB buffer memory, `usbfs_memory_mb`. The default is 16 MB, and each running stick uses about 4 MB, so with four or more sticks the last tool to start can't get its buffers. It stops at once, and the stick and USB connection are fine. The kernel log shows nothing. SentrySDR recognizes it, and the source's fault says it **couldn't get USB buffer memory**. Older versions showed `RTLSDR: lost device` from AIS-catcher, or a bare "exited" from other tools. Moving the target to another stick doesn't help, because the limit is for the whole machine.
+
+`scripts/install.sh` raises the limit to 256 MB, now and at every boot, with [`deploy/sentrysdr-usbfs.conf`](deploy/sentrysdr-usbfs.conf). On a machine installed before that, or a slave you set up by hand:
+
+```sh
+cat /sys/module/usbcore/parameters/usbfs_memory_mb          # 16 is the default
+sudo install -m 0644 deploy/sentrysdr-usbfs.conf /etc/tmpfiles.d/
+sudo systemd-tmpfiles --create /etc/tmpfiles.d/sentrysdr-usbfs.conf
+```
+
+Then press **Restart** on the SDR that was failing. The file sets the limit to exactly 256 MB, so if you'd set it higher, or to 0 for no limit, edit the file first.
+
+All the sticks on one USB 2.0 bus also share its 480 Mbit/s. A USB 3.0 port doesn't help, because USB 2.0 devices run on the computer's USB 2.0 bus wherever they're plugged in; `lsusb -t` shows which bus each stick is on. Around eight sticks at ADS-B and AIS sample rates is close to the practical limit of one bus. Past that, add a second USB controller.
+
+When a tool stops for any other reason, the fault shows its last few lines of output, newest last. The journal has the same lines in its "restarting" entry.
 
 ## Listening
 
@@ -316,7 +336,15 @@ Keeping only happens when the time runs out, not when someone turns the schedule
 
 Describe each antenna under **Admin > Antennas**: name, type, length and the frequency ranges it works on. Use **+ Add** for each band, so a dual-band antenna gets two ranges. Then choose the antenna on each SDR under **Admin > SDR sources**. One antenna can feed several SDRs, for example through a splitter.
 
-If a target is outside every range of an SDR's antenna, the target pickers mark it **(may not suit)**, choosing it says why, and assigning or scheduling it shows a warning. It still works, because an antenna often hears more than its rated bands. An antenna with no ranges isn't checked. Removing an antenna leaves its SDRs with none set.
+Rate each range **Ideal**, **Usable** or **Deaf**. Ranges can overlap, and the best rating covering a frequency counts. With 100 to 200 MHz Ideal and 80 to 220 MHz Usable, 110 MHz is Ideal and 205 MHz is Usable. So a Deaf range only matters where no Ideal or Usable range also covers it. Ranges saved before ratings existed count as Ideal.
+
+How a target's frequency rates on an SDR's antenna:
+
+- **Ideal:** nothing is said.
+- **Usable:** the target pickers mark it **(antenna usable)**, and assigning or scheduling it adds a note.
+- **Deaf, or outside every range:** the pickers mark it **(may not suit)**, choosing it says why, and assigning or scheduling it shows a warning.
+
+Any of them can still be assigned, because an antenna often hears more than its rated bands. An antenna with no ranges isn't checked. Removing an antenna leaves its SDRs with none set.
 
 An older database's antenna type and frequency range on each source are turned into antennas on first start. Sources with the same type and range share one.
 
@@ -333,7 +361,7 @@ Under **Admin > SDR sources**, each SDR can record what it can do: its tuner, fr
 
 ACARS is the short text messages aircraft send on VHF. An ACARS target lists the channels to decode: **North America** and **Europe** fill in the usual ones, and **+ Add** adds others. One stick decodes all of a target's channels at once with `acarsdec`, so they must fit within 2 MHz. North America's fifth channel, 129.125 MHz, doesn't fit with the other four, so it needs its own target and stick. Gain matters: acarsdec's AGC usually sits at maximum, so set a fixed gain on the stick.
 
-Messages appear on the **Messages** page, newest first, and update by themselves. Search by flight, registration, label or text. Messages with no text, mostly link checks, are hidden unless you tick **Show messages with no text**. On the ADS-B map, an aircraft that sent messages in the last hour links to them, matched by registration through tar1090's aircraft database. Flight numbers aren't matched, because ACARS and ADS-B use different airline codes. If two sticks hear the same message, it's kept once.
+Messages appear on the **Messages** page, newest first, and update by themselves. Search by flight, registration, label or text, choose **Oldest first**, or narrow it to a date range. **Clear** goes back to the full list, newest first, including from a link to one aircraft's messages. Recordings has the same order and Clear, and both pages, like Emergencies, have Newer and Older above the list as well as below. New messages and calls only appear by themselves on the first page, newest first. Messages with no text, mostly link checks, are hidden unless you tick **Show messages with no text**. On the ADS-B map, an aircraft that sent messages in the last hour links to them, matched by registration through tar1090's aircraft database. Flight numbers aren't matched, because ACARS and ADS-B use different airline codes. If two sticks hear the same message, it's kept once.
 
 To feed [airframes.io](https://airframes.io), set a **Station ID** under **Admin > Uploads and feeds**, for example `KE-KSEA-ACARS`: your initials, the nearest airport's ICAO code, then ACARS. Then tick **Feed messages to airframes.io** on the target. No account is needed. Messages are kept for 30 days by default, set under **Admin > Settings**. Messages from a slave are lost while its link to the master is down.
 
@@ -361,6 +389,33 @@ Sharing runs wherever the target runs, on the master or a slave, and stops when 
 - **aiscatcher.org:** tick **Share with the aiscatcher.org community feed**. It's sent without a station key, so it isn't linked to an aiscatcher.org account.
 - **MarineTraffic, AISHub and VesselFinder:** register a station with the service first. Each gives you a UDP host and port. Tick **Send to** for that service and enter both. Up to six destinations per target.
 - UDP can't confirm delivery, so the Sources page only lists where data is being sent. Check the service's station page to confirm it's arriving.
+
+## Web tuner
+
+Tune around with an SDR from the browser, like GQRX: a spectrum and waterfall, any center frequency the stick can reach, and your own channel with its own mode. It works the same for an SDR on a slave, through the master.
+
+1. Under **Targets**, add a target of type **Tuner**. Its frequency is only where the SDR starts.
+2. Assign it to an SDR on the **Sources** page. Nothing is recorded while an SDR is a tuner.
+3. Open it from **Tuner** in the menu, or **Open tuner** next to that SDR on Sources. Each tuner opens in its own tab.
+
+A tuner opens in a window of its own, laid out like GQRX for a desktop screen: your channel's frequency across the top, the spectrum and waterfall filling the left, and tabs on the right. It isn't made for a phone held upright.
+
+- **The frequency readout:** hover over a digit and use the mouse wheel or the up and down keys to step it, or click a digit's top or bottom half. Typing a number over a digit replaces it. **Go to MHz** and **Go** take a frequency typed in full. For the owner the readout is what they hear, and tuning past the edge of the span moves the SDR to follow; for anyone else it's their own channel, which never moves the SDR.
+- **Spectrum and waterfall:** click to tune there, in the step you choose. Drag the shaded channel to move it, or drag its edge to change the filter; the mouse wheel steps up and down. Hovering shows the frequency and level under the pointer.
+- **Receiver:** mode (NFM, AM, WFM mono, WFM stereo, USB, LSB, CW), filter width, step, squelch, volume and the signal meter. WFM stereo also shows the station's RDS name and text. Press **Start audio** first: browsers don't play sound until you've pressed something.
+- **SDR**, only for the tuner's owner, and marked as changing the SDR for everyone: center frequency, sample rate (the width of the span, 0.25 to 2.4 MHz), gain, and handing the tuner over. Type any frequency the stick can tune; there are no bands to set up first. Moving the center moves your channel with it, as in GQRX.
+- **FFT:** the waterfall's range, how much of the height the spectrum takes, and how much the spectrum line is averaged. These change only what you see. Until you set the range, it's chosen from the first second of signal.
+- **Bookmarks:** yours, kept with your account on the master, so they're the same on every SDR, on every machine. As in GQRX, a bookmark can be in several folders, each folder has a color, and you tick the folders to show; bookmarks in them also appear as labels across the top of the spectrum, and clicking one tunes there. Right-click a bookmark or folder, or use its **…** button, to edit, rename or remove it. **Add a bookmark** starts with your channel's frequency and mode. Choosing a bookmark outside the span moves the span there, if you own the tuner. **Import and export** read and write SentrySDR's own JSON, GQRX's `bookmarks.csv` (tags and their colors included) and SDR++'s frequency manager lists. GQRX and SDR++ keep less, so a round trip through them can lose notes, or turn a mode into its nearest equivalent.
+
+**One owner at a time:** up to 8 people can be on a tuner at once, and one of them owns it: its center frequency, sample rate and gain. Nobody owns a tuner until someone with the **Web tuner** permission presses **Take the tuner**. The owner keeps it until they press **Release**, hand it over under **SDR** to someone else on it who has that permission, or close the window; it isn't passed on by itself. An admin can **Take it over** from anyone. Everyone else sees no SDR controls: they pick their own frequency, mode and filter inside the span, and hear only their own channel.
+
+**Who can use it:** listening on a tuner needs **Listen live**. Owning one needs **Web tuner**, which admins and operators have and an admin can give anyone under **Admin > Users**. Opening a tuner is recorded in the audit log. An open tuner checks every 15 seconds that its user is still signed in and allowed, and that the SDR is still a tuner.
+
+**What it costs:** the SDR's own machine does the work and sends the browser only waterfall rows and compressed audio: about 0.1 Mbit/s of waterfall, plus 0.1 to 0.5 Mbit/s of audio depending on the mode. On a desktop computer, a tuner takes about 5% of one core, each extra listener well under 1%, and WFM stereo about 5% more. A Raspberry Pi 4 is roughly 5 to 8 times slower per core, so allow a quarter to a third of a core per tuner, more with stereo. While nobody has it open, a tuner reads the stick and does nothing else.
+
+**numpy:** the tuner needs numpy, which `install.sh` installs from a prebuilt package. There's none for 32-bit Raspberry Pi OS, so on that the install carries on without it, and a tuner target there shows a fault saying so. Everything else works. Use 64-bit Raspberry Pi OS for a slave that should run a tuner.
+
+**How it's kept private:** the tuner runs rtl_tcp bound to 127.0.0.1 on a private port, with SentrySDR as its only client, so unlike an [rtl_tcp target](#rtl_tcp-using-an-sdr-from-gqrx-or-sdr) nothing on the network can connect to the stick. Browsers reach it only through the master, over a websocket signed in like the rest of the site. The websocket only opens for a page on this site's own address, so another site can't open one using your sign-in.
 
 ## rtl_tcp: using an SDR from GQRX or SDR++
 
@@ -504,6 +559,8 @@ Outbound, the master connects to the upload and feed services you turn on, and t
 - **Won't start:** `journalctl -u sentrysdr -n 50` usually names the problem. A configuration error says which setting. `Permission denied` or `Read-only file system` means a moved folder; see [Storing recordings on another drive](#storing-recordings-on-another-drive).
 - **An SDR shows "SDR not connected" or "SDR disconnected":** check it's plugged in, `list-sdrs`, that its serial is in `sdr.serials` on the right node, that no other stick has the same serial, and that nothing else (GQRX, SDR++, `dump1090-fa`) has it open. It starts again by itself once it can.
 - **An SDR seems stuck:** select **Restart** on it, or **Restart service** under **Admin > Nodes** (see [USB connections](#usb-connections)).
+- **"couldn't get USB buffer memory", or a tool that exits as soon as it starts, often on whichever SDR started last:** raise the machine's limit; see [USB buffer memory](#usb-buffer-memory).
+- **A tuner shows "the web tuner needs numpy":** install it with `sudo /opt/sentrysdr/.venv/bin/pip install --only-binary=:all: -r /opt/sentrysdr/requirements-tuner.lock`, then restart the service. On 32-bit Raspberry Pi OS there's no package for it; see [Web tuner](#web-tuner).
 - **"tool not installed":** that target needs a decoder. Re-run the install with `--with-decoders`.
 - **Records nothing, or only static:** see [Tuning call detection](#tuning-call-detection) and [USB connections](#usb-connections).
 - **Upload failures** show on each recording, with the service's reply.
@@ -521,6 +578,6 @@ npm --prefix web ci && npm --prefix web run build
 
 Create an admin with `sentrysdr -c <config> create-admin`. Run with `sentrysdr -c <config> run`.
 
-Tests use fake radio tools, so they need `ffmpeg` but no SDR. Run them on Python 3.11 as well as your own version: Raspberry Pi OS ships 3.11, and some asyncio behaviour differs. In app code, use `aio.wait_for`, never `asyncio.wait_for`, which can lose a cancellation on 3.11 (a test enforces this).
+Tests use fake radio tools, so they need `ffmpeg` but no SDR. Run them on Python 3.11 as well as your own version: Raspberry Pi OS ships 3.11, and some asyncio behavior differs. In app code, use `aio.wait_for`, never `asyncio.wait_for`, which can lose a cancellation on 3.11 (a test enforces this).
 
 To update a Python dependency: upgrade it in the dev venv, run the tests and `pip-audit`, then regenerate `requirements.lock` with only the runtime packages. Check the web interface's with `npm audit --omit=dev`.

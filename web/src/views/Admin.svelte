@@ -1,6 +1,6 @@
 <script>
   import { onMount, tick } from 'svelte';
-  import { ANTENNA_UNITS, DEFAULT_GAIN_DB, formatSize, OTHER_USES, RECORDED_USES, api, formatRange, formatRanges, formatTime, nearestStep } from '../lib.js';
+  import { ANTENNA_UNITS, RATINGS, DEFAULT_GAIN_DB, formatSize, OTHER_USES, RECORDED_USES, api, formatRange, formatRanges, formatTime, nearestStep } from '../lib.js';
   import Notice from '../Notice.svelte';
   import { clearAfter, NOTICE_MS } from '../notice.svelte.js';
   import GainField from '../GainField.svelte';
@@ -10,7 +10,7 @@
   const PERMISSIONS = [
     ['listen_live', 'Listen live'], ['listen_recordings', 'Play recordings'], ['download', 'Download'],
     ['assign', 'Assign and schedule'], ['manage_targets', 'Manage targets'], ['protect', 'Protect recordings'],
-    ['transcribe', 'Request transcripts'], ['maps', 'Maps'],
+    ['transcribe', 'Request transcripts'], ['maps', 'Maps'], ['tuner', 'Web tuner'],
   ];
 
   let tab = $state('users');
@@ -36,12 +36,12 @@
 
   let antennas = $state([]);
   const ANTENNA_TYPES = ['Discone', 'Dipole', 'Ground plane', 'Collinear', 'J-pole', 'Slim Jim', 'Yagi', 'Log periodic', 'Whip', 'Telescopic', 'Loop', 'Magnetic mount'];
-  const blankAntenna = () => ({ id: null, name: '', kind: '', length: '', length_unit: 'in', notes: '', ranges: [], newLow: '', newHigh: '' });
+  const blankAntenna = () => ({ id: null, name: '', kind: '', length: '', length_unit: 'in', notes: '', ranges: [], newLow: '', newHigh: '', newRating: 'ideal' });
   let antennaForm = $state(blankAntenna());
   let rangeProblem = $state('');
 
   let nodeName = $state('');
-  let enrolment = $state(null);
+  let enrollment = $state(null);
 
   let bans = $state([]);
   let ban = $state({ kind: 'ip', value: '', reason: '' });
@@ -98,7 +98,7 @@
     message = '';
     selected = null;
     oneTimeSecret = null;
-    enrolment = null;
+    enrollment = null;
     if (location.hash !== `#/admin?tab=${next}`) history.replaceState(null, '', `#/admin?tab=${next}`);
     run(loaders[next]);
   }
@@ -240,9 +240,10 @@
   function addRange() {
     rangeProblem = badRange(antennaForm.newLow, antennaForm.newHigh);
     if (rangeProblem) return false;
-    antennaForm.ranges.push({ low: antennaForm.newLow, high: antennaForm.newHigh });
+    antennaForm.ranges.push({ low: antennaForm.newLow, high: antennaForm.newHigh, rating: antennaForm.newRating });
     antennaForm.newLow = '';
     antennaForm.newHigh = '';
+    antennaForm.newRating = 'ideal';
     document.getElementById('new-range-low')?.focus();
     return true;
   }
@@ -266,7 +267,7 @@
     const body = {
       name: antennaForm.name, kind: antennaForm.kind, notes: antennaForm.notes,
       length: filled(antennaForm.length) ? Number(antennaForm.length) : null, length_unit: antennaForm.length_unit,
-      ranges: antennaForm.ranges.map((r) => ({ low_hz: toHz(r.low), high_hz: toHz(r.high) })),
+      ranges: antennaForm.ranges.map((r) => ({ low_hz: toHz(r.low), high_hz: toHz(r.high), rating: r.rating })),
     };
     const done = await run(() => (antennaForm.id
       ? api(`antennas/${antennaForm.id}`, { method: 'PUT', body })
@@ -281,7 +282,7 @@
     antennaForm = {
       ...blankAntenna(), id: antenna.id, name: antenna.name, kind: antenna.kind, notes: antenna.notes,
       length: antenna.length ?? '', length_unit: antenna.length_unit,
-      ranges: antenna.ranges.map(([low, high]) => ({ low: plain(low), high: plain(high) })),
+      ranges: antenna.ranges.map(([low, high, rating]) => ({ low: plain(low), high: plain(high), rating: rating ?? 'ideal' })),
     };
     rangeProblem = '';
     document.getElementById('antenna-form')?.scrollIntoView();
@@ -310,7 +311,7 @@
     event.preventDefault();
     const reply = await run(() => api('nodes', { method: 'POST', body: { name: nodeName } }));
     if (reply) {
-      enrolment = reply;
+      enrollment = reply;
       nodeName = '';
       await loaders.nodes();
     }
@@ -814,17 +815,31 @@
                 <td><input class="mono" type="number" inputmode="decimal" step="any" min="0" aria-label={`Range ${index + 1} to`} bind:value={range.high} required /></td>
                 <td><button type="button" aria-label={`Remove range ${index + 1}`} onclick={() => antennaForm.ranges.splice(index, 1)}>Remove</button></td>
               </tr>
+              <tr class="rating-row">
+                <td colspan="3">
+                  <div class="ratings" role="radiogroup" aria-label={`Range ${index + 1} rating`}>
+                    {#each RATINGS as [id, label] (id)}<label class="tick small"><input type="radio" name={`rating-${index}`} value={id} bind:group={range.rating} /> {label}</label>{/each}
+                  </div>
+                </td>
+              </tr>
             {/each}
             <tr class:adding={antennaForm.ranges.length > 0}>
               <td><input id="new-range-low" class="mono" type="number" inputmode="decimal" step="any" min="0" aria-label="New range from" placeholder="144" bind:value={antennaForm.newLow} onkeydown={addOnEnter} /></td>
               <td><input class="mono" type="number" inputmode="decimal" step="any" min="0" aria-label="New range to" placeholder="148" bind:value={antennaForm.newHigh} onkeydown={addOnEnter} /></td>
               <td><button type="button" onclick={addRange}>+ Add</button></td>
             </tr>
+            <tr class="rating-row">
+              <td colspan="3">
+                <div class="ratings" role="radiogroup" aria-label="New range rating">
+                  {#each RATINGS as [id, label] (id)}<label class="tick small"><input type="radio" name="rating-new" value={id} bind:group={antennaForm.newRating} /> {label}</label>{/each}
+                </div>
+              </td>
+            </tr>
           </tbody>
         </table>
       </div>
       {#if rangeProblem}<p class="small st-bad form-buttons" role="alert">{rangeProblem}</p>{/if}
-      <p class="small dim form-buttons">Add one range per band the antenna works on. A target outside all of them gets a warning, but can still be assigned. With no ranges, nothing is checked.</p>
+      <p class="small dim form-buttons">Add one range per band, and rate how well the antenna works there. Where ranges overlap, the best rating counts: with 100 to 200 Ideal and 80 to 220 Usable, 110 MHz is Ideal and 205 MHz is Usable. A target in a Usable range gets a note; one in a Deaf range, or outside every range, gets a warning. Either can still be assigned. With no ranges, nothing is checked.</p>
       <label class="field"><span>Notes</span><input bind:value={antennaForm.notes} maxlength="500" placeholder="Mounting, feed line, splitter..." /></label>
       <div class="buttons form-buttons">
         <button class="main">{antennaForm.id ? 'Save antenna' : 'Add antenna'}</button>
@@ -836,10 +851,10 @@
 {/if}
 
 {#if tab === 'nodes'}
-  {#if enrolment}
+  {#if enrollment}
     <div class="warn">
-      Token for <strong>{enrolment.name}</strong>, shown once and good for 24 hours. Put this in that slave's configuration file:
-      <div class="secret">[master]<br />enrollment_token = "{enrolment.enrollment_token}"</div>
+      Token for <strong>{enrollment.name}</strong>, shown once and good for 24 hours. Put this in that slave's configuration file:
+      <div class="secret">[master]<br />enrollment_token = "{enrollment.enrollment_token}"</div>
     </div>
   {/if}
   <div class="box">
@@ -923,7 +938,10 @@
     <fieldset>
       <legend>Search</legend>
       <label class="field"><span>Action, email, address or subject</span><input type="search" bind:value={auditSearch} /></label>
-      <div class="buttons form-buttons"><button class="main">Search</button></div>
+      <div class="buttons form-buttons">
+        <button class="main">Search</button>
+        {#if auditSearch}<button type="button" onclick={() => { auditSearch = ''; run(loaders.audit); }}>Clear</button>{/if}
+      </div>
     </fieldset>
   </form>
   <div class="box">

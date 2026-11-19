@@ -14,6 +14,14 @@ PASSWORD = "correct-horse-battery"
 HEADERS = {"X-SentrySDR": "1"}
 
 
+@pytest.fixture(autouse=True)
+def quick_starts(monkeypatch):
+    """SDRs start a short gap apart, not 1.5 s, so tests that restart tools stay quick.
+    test_sdrs_on_one_machine_start_apart checks the real spacing."""
+    from sentrysdr import engine
+    monkeypatch.setattr(engine, "START_GAP_SECONDS", 0.05)
+
+
 def make_config(tmp_path, **overrides) -> Config:
     values = dict(
         data_dir=tmp_path / "data", recordings_dir=tmp_path / "rec", log_dir=tmp_path / "logs",

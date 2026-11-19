@@ -1,6 +1,6 @@
 """Decide which recorder owns each source at a given moment.
 
-Pure functions, so the override and revert behaviour can be tested directly.
+Pure functions, so the override and revert behavior can be tested directly.
 An active scheduled recorder overrides the source's base assignment; when its
 window ends the base assignment applies again automatically. A schedule repeats
 weekly, or runs once between two moments (once_start and once_end).

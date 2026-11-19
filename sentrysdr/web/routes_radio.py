@@ -32,9 +32,14 @@ _live_counts: dict[int, int] = {}
 
 
 # --- antennas --------------------------------------------------------------
+# How well an antenna works over a range, best first. Where ranges overlap, the best rating wins.
+RATINGS = ("ideal", "usable", "deaf")
+
+
 class RangeBody(BaseModel):
     low_hz: int = Field(ge=0, le=10_000_000_000)
     high_hz: int = Field(ge=0, le=10_000_000_000)
+    rating: str = Field(default="ideal", pattern="^(ideal|usable|deaf)$")
 
 
 class AntennaBody(BaseModel):
@@ -52,25 +57,36 @@ class AntennaBody(BaseModel):
             raise ValueError(f"unit must be one of {', '.join(ANTENNA_UNITS)}")
         return value
 
-    def clean_ranges(self) -> list[list[int]]:
+    def clean_ranges(self) -> list[list]:
         for item in self.ranges:
             if item.low_hz > item.high_hz:
                 raise HTTPException(422, "A range starts above where it ends")
-        return [list(pair) for pair in sorted({(r.low_hz, r.high_hz) for r in self.ranges})]
+        best: dict[tuple[int, int], str] = {}
+        for r in self.ranges:  # the same range twice keeps its better rating
+            key = (r.low_hz, r.high_hz)
+            if key not in best or RATINGS.index(r.rating) < RATINGS.index(best[key]):
+                best[key] = r.rating
+        return [[low, high, best[(low, high)]] for low, high in sorted(best)]
 
 
-def antenna_covers(antenna: Antenna | None, frequency_hz: int) -> bool:
-    """An antenna with no ranges entered isn't judged."""
+def rated_ranges(ranges) -> list[list]:
+    """Ranges as [low_hz, high_hz, rating]. Ranges saved before ratings existed count as ideal."""
+    return [[r[0], r[1], r[2] if len(r) > 2 and r[2] in RATINGS else "ideal"] for r in ranges or []]
+
+
+def antenna_rating(antenna: Antenna | None, frequency_hz: int) -> str | None:
+    """ideal, usable or deaf; outside when no range covers it; None when the antenna has no ranges to judge by."""
     if antenna is None or not antenna.ranges:
-        return True
-    return any(low <= frequency_hz <= high for low, high in antenna.ranges)
+        return None
+    found = [rating for low, high, rating in rated_ranges(antenna.ranges) if low <= frequency_hz <= high]
+    return min(found, key=RATINGS.index) if found else "outside"
 
 
 def _antenna_view(db, antenna: Antenna) -> dict:
     users = db.scalars(select(Source.name).where(Source.antenna_id == antenna.id).order_by(Source.name)).all()
     return {
         "id": antenna.id, "name": antenna.name, "kind": antenna.kind, "length": antenna.length,
-        "length_unit": antenna.length_unit, "notes": antenna.notes, "ranges": antenna.ranges or [],
+        "length_unit": antenna.length_unit, "notes": antenna.notes, "ranges": rated_ranges(antenna.ranges),
         "sources": list(users),
     }
 
@@ -179,7 +195,7 @@ def _source_view(ctx: Context, db, source: Source, winners: dict, recorders: lis
         "id": source.id, "node_id": source.node_id, "node_name": node.name if node else "",
         "node_online": online, "serial": source.serial, "name": source.name,
         "description": source.description, "antenna_id": antenna.id if antenna else None,
-        "antenna_name": antenna.name if antenna else "", "antenna_ranges": antenna.ranges if antenna else [],
+        "antenna_name": antenna.name if antenna else "", "antenna_ranges": rated_ranges(antenna.ranges) if antenna else [],
         "gain_db": source.gain_db, "ppm": source.ppm,
         "tuner": source.tuner or "", "gain_steps": source.gain_steps or [],
         "cap_min_hz": source.cap_min_hz, "cap_max_hz": source.cap_max_hz, "uses": source.uses or [],
@@ -375,7 +391,7 @@ class TargetBody(BaseModel):
 
 def _validate_target(body: TargetBody, db, target_id: int | None = None) -> None:
     allowed = {"audio": pipelines.ANALOG | set(pipelines.DIGITAL), "adsb": {"adsb"}, "ais": {"ais"}, "acars": {"acars"},
-               "rtltcp": {"rtltcp"}}
+               "rtltcp": {"rtltcp"}, "tuner": {"tuner"}}
     if body.modulation not in allowed.get(body.kind, set()):
         raise HTTPException(422, f"Modulation {body.modulation} doesn't fit a {body.kind} target")
     if body.kind == "acars":
@@ -538,9 +554,14 @@ def _base_for(db, source_id: int) -> Recorder | None:
 
 def _range_warning(db, source: Source, target: Target) -> str | None:
     antenna = db.get(Antenna, source.antenna_id) if source.antenna_id else None
-    if antenna_covers(antenna, target.frequency_hz):
-        return None
-    return f"{target.name} is outside every range of {antenna.name}, the antenna on {source.name}, so reception may be poor."
+    rating = antenna_rating(antenna, target.frequency_hz)
+    if rating == "usable":
+        return f"{target.name} is in a usable range of {antenna.name}, the antenna on {source.name}, not an ideal one, so reception may be weaker."
+    if rating == "deaf":
+        return f"{target.name} is in a range {antenna.name}, the antenna on {source.name}, is deaf to, so it will likely hear little."
+    if rating == "outside":
+        return f"{target.name} is outside every range of {antenna.name}, the antenna on {source.name}, so reception may be poor."
+    return None
 
 
 def _other_sdr_warning(db, source: Source, target: Target) -> str | None:
@@ -858,7 +879,7 @@ def _save_recorder(ctx, request, user, db, body: RecorderBody, recorder: Recorde
     if source is None or target is None:
         raise HTTPException(404, "Source or target not found")
     _refuse_rtl_tcp(user, target, db.get(Target, recorder.target_id) if recorder else None)
-    # A schedule overrides the base assignment, so it must honour that lock too.
+    # A schedule overrides the base assignment, so it must honor that lock too.
     _check_lock(ctx, request, user, _base_for(db, body.source_id))
     if recorder is None:
         recorder = Recorder(name=body.name, source_id=source.id, target_id=target.id)

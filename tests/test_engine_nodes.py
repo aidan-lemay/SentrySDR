@@ -206,6 +206,85 @@ async def test_ais_pipeline_publishes_vessels(tmp_path):
     assert tracks[0][0] == "ais" and tracks[0][2]["vessels"][0]["mmsi"] == "123"
 
 
+async def test_sdrs_on_one_machine_start_apart(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "START_GAP_SECONDS", 0.4)
+    bins, log = tmp_path / "bin", tmp_path / "starts"
+    install_tool(bins, "AIS-catcher", f"#!/usr/bin/env python3\nimport time\nopen({str(log)!r}, 'a').write(repr(time.time()) + chr(10))\ntime.sleep(60)\n")
+    serials = ["S1", "S2", "S3", "S4"]
+    sup = supervisor(make_config(tmp_path, bin_dirs=[bins], serials=serials), [], devices=serials)
+    try:
+        await sup.apply({s: spec(kind="ais", modulation="ais", frequency_hz=162_000_000) for s in serials})
+        assert await wait_for(lambda: log.exists() and len(log.read_text().split()) == 4, timeout=5)
+        times = sorted(float(t) for t in log.read_text().split())
+        gaps = [b - a for a, b in zip(times, times[1:])]
+        assert all(gap >= 0.35 for gap in gaps), gaps
+    finally:
+        await sup.shutdown()
+
+
+async def test_a_start_waiting_its_turn_can_be_stopped(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "START_GAP_SECONDS", 30)
+    bins = tmp_path / "bin"
+    install_tool(bins, "AIS-catcher", "#!/bin/sh\nexec sleep 60\n")  # exec: no child left holding the pipes
+    sup = supervisor(make_config(tmp_path, bin_dirs=[bins]), [])
+    try:
+        await sup.apply({"SER1": spec(kind="ais", modulation="ais", frequency_hz=162_000_000),
+                         "SER2": spec(kind="ais", modulation="ais", frequency_hz=162_000_000)})
+        await asyncio.sleep(0.3)
+        started = time.monotonic()
+        await sup.apply({"SER1": None, "SER2": None})  # SER2 is still waiting for the gap
+        assert time.monotonic() - started < 5
+        assert not sup._start_lock.locked()
+    finally:
+        await sup.shutdown()
+
+
+# What librtlsdr and AIS-catcher print when the host's usbfs memory limit is used up.
+USBFS_OUTPUT = ("Failed to submit transfer 3!\nPlease increase your allowed usbfs buffer size with the following command:\n"
+                "echo 0 > /sys/module/usbcore/parameters/usbfs_memory_mb\n<3>RTLSDR: lost device. Terminating.\n")
+
+
+async def test_ais_out_of_usb_memory_says_so(tmp_path):
+    bins = tmp_path / "bin"
+    install_tool(bins, "AIS-catcher", f"#!/usr/bin/env python3\nimport sys\nsys.stderr.write({USBFS_OUTPUT!r})\n")
+    sup = supervisor(make_config(tmp_path, bin_dirs=[bins]), [])
+    worker = sup.workers["SER1"]
+    try:
+        await sup.apply({"SER1": spec(kind="ais", modulation="ais", frequency_hz=162_000_000)})
+        assert await wait_for(lambda: worker.error)
+        assert "usbfs_memory_mb" in worker.error and "USB buffer memory" in worker.error and "lost device" not in worker.error
+    finally:
+        await sup.shutdown()
+
+
+def test_exit_message_keeps_the_last_lines():
+    tail = engine.ToolTail(["Found 1 device(s)", "Tuned to 162 MHz", "Tuned to 162 MHz", "<3>RTLSDR: lost device. Terminating."])
+    assert engine.exit_message("AIS-catcher", 0, tail) == \
+        "AIS-catcher exited (0) Found 1 device(s) / Tuned to 162 MHz / RTLSDR: lost device. Terminating."
+    long = engine.ToolTail(["x" * 200, "y" * 200, "the last line"])
+    message = engine.exit_message("readsb", 1, long)
+    assert len(message) <= engine.FAULT_LENGTH and message.endswith("the last line") and "xxx" not in message
+    assert engine.exit_message("acarsdec", 0, engine.ToolTail()) == "acarsdec exited (0)"
+
+
+async def test_a_last_line_without_a_newline_is_kept():
+    stream = asyncio.StreamReader()
+    stream.feed_data(b"first\nRTLSDR: lost device. Terminating.")
+    stream.feed_eof()
+    tail = engine.ToolTail()
+    await engine._log_stderr("S", stream, tail)
+    assert tail == ["first", "RTLSDR: lost device. Terminating."]
+
+
+async def test_usbfs_lines_are_remembered_after_they_scroll_away():
+    stream = asyncio.StreamReader()
+    stream.feed_data(b"Failed to submit transfer 0!\n" + b"".join(b"line %d\n" % i for i in range(10)))
+    stream.feed_eof()
+    tail = engine.ToolTail()
+    await engine._log_stderr("S", stream, tail)
+    assert tail.usbfs and len(tail) == engine.TAIL_LINES
+
+
 async def test_adsb_pipeline_reads_written_json(tmp_path):
     bins = tmp_path / "bin"
     install_tool(bins, "readsb", textwrap.dedent("""\
@@ -392,7 +471,7 @@ async def test_slave_enrols_records_and_uploads_to_master(tmp_path, free_port):
         with ctx.db() as session:
             assert session.get(Node, node_id).serials == ["FIELD1"]
 
-        # The enrolment token can't be used a second time.
+        # The enrollment token can't be used a second time.
         again = await asyncio.to_thread(admin.post, "/api/nodes/agent/enroll", json={"token": token})
         assert again.status_code == 403
 

@@ -1,0 +1,4 @@
+# The web tuner's signal processing. Kept apart from requirements.lock because numpy has
+# no prebuilt wheel for 32-bit Raspberry Pi OS: install.sh tries it, and SentrySDR works
+# without it, except that a tuner target shows a fault. Tested version, as in requirements.lock.
+numpy==2.4.6

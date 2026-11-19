@@ -1,4 +1,4 @@
-"""Slave nodes: admin enrolment, plus the agent endpoints that slaves dial into.
+"""Slave nodes: admin enrollment, plus the agent endpoints that slaves dial into.
 
 Agent routes authenticate with a per-node bearer key, never a browser cookie.
 """
@@ -65,7 +65,7 @@ class NodeBody(BaseModel):
 
 @router.post("", status_code=201)
 def create_enrollment(body: NodeBody, request: Request, admin: User = Depends(admin_user), db=Depends(get_db)):
-    """Create a slave entry and a one-time enrolment token, shown only here."""
+    """Create a slave entry and a one-time enrollment token, shown only here."""
     ctx = ctx_of(request)
     token = security.new_token()
     node = Node(
@@ -149,7 +149,7 @@ def enroll(body: EnrollBody, request: Request, db=Depends(get_db)):
     if node is None or node.status != "pending" or (node.enroll_expires_at or 0) < time.time():
         ctx.limiter.hit(key, ENROLL_WINDOW)
         ctx.audit("node.enroll_failed", ip=ip)
-        raise HTTPException(403, "Invalid or expired enrolment token")
+        raise HTTPException(403, "Invalid or expired enrollment token")
     device_key = security.new_token()
     node.key_hash = security.hash_token(device_key)
     node.enroll_token_hash, node.enroll_expires_at = None, None  # single use
@@ -270,6 +270,24 @@ class NodeLink:
             await self.ws.send_text(await self.outbox.get())
 
 
+MAX_TUNER_FRAME = 512 * 1024
+
+
+def decode_tuner_frame(frame: bytes) -> tuple[str, bytes] | None:
+    """A web tuner frame from a slave: a 0 byte, the serial's length, the serial, then the frame."""
+    if len(frame) < 4 or frame[0] != 0 or not 0 < frame[1] <= MAX_FRAME_SERIAL or len(frame) > MAX_TUNER_FRAME:
+        return None
+    if len(frame) < 3 + frame[1]:  # the serial and at least one byte of frame
+        return None
+    try:
+        serial = frame[2:2 + frame[1]].decode()
+    except UnicodeDecodeError:
+        return None
+    if not SERIAL_RE.match(serial):
+        return None
+    return serial, frame[2 + frame[1]:]
+
+
 def decode_live_frame(frame: bytes) -> tuple[str, int, bytes] | None:
     """Frame layout: 1 byte serial length, serial, 4 byte big-endian rate, PCM."""
     if len(frame) < 6 or frame[0] == 0 or frame[0] > MAX_FRAME_SERIAL or len(frame) < 5 + frame[0]:
@@ -351,6 +369,9 @@ def handle_agent_message(ctx: Context, node_id: int, allowed: list[str], message
         ctx.finish_measure(node_id, message)
     elif kind == "health":
         ctx.node_health[node_id] = clean_health(message)
+    elif kind == "tuner_out":
+        if message.get("serial") in allowed and isinstance(message.get("data"), dict):
+            ctx.tuners.from_node(node_id, message["serial"], "json", message["data"])
     elif kind == "tracks":
         serial, track_kind = message.get("serial"), message.get("kind")
         if serial in allowed and track_kind in ("adsb", "ais", "acars") and isinstance(message.get("data"), dict):
@@ -400,7 +421,11 @@ async def agent_socket(websocket: WebSocket):
             packet = await websocket.receive()
             if packet["type"] == "websocket.disconnect":
                 break
-            if packet.get("bytes") is not None:
+            if packet.get("bytes") is not None and packet["bytes"][:1] == b"\x00":
+                tuned = decode_tuner_frame(packet["bytes"])
+                if tuned and tuned[0] in allowed:
+                    ctx.tuners.from_node(node_id, tuned[0], "frame", tuned[1])
+            elif packet.get("bytes") is not None:
                 decoded = decode_live_frame(packet["bytes"])
                 if decoded and decoded[0] in allowed:
                     ctx.live.feed(ctx.live_key(node_id, decoded[0]), decoded[2], decoded[1])
@@ -421,6 +446,7 @@ async def agent_socket(websocket: WebSocket):
             writer.cancel()
         if ctx.node_links.get(node_id) is link:
             del ctx.node_links[node_id]
+            ctx.tuners.node_gone(node_id)
             for serial in allowed:
                 ctx.status.pop((node_id, serial), None)
             ctx.audit("node.disconnected", ip=ip, target=node_name)

@@ -1,4 +1,4 @@
-# SentrySDR master. The same application as a slave; node.role selects the behaviour.
+# SentrySDR master. The same application as a slave; node.role selects the behavior.
 
 [node]
 role = "master"

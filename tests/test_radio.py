@@ -241,7 +241,7 @@ def test_old_lock_passwords_become_plain_locks_and_are_deleted(tmp_path):
 
 
 def make_antenna(admin, name="Dual band", ranges=((144_000_000, 148_000_000), (420_000_000, 450_000_000)), **extra):
-    body = {"name": name, "ranges": [{"low_hz": lo, "high_hz": hi} for lo, hi in ranges], **extra}
+    body = {"name": name, "ranges": [{"low_hz": r[0], "high_hz": r[1], **({"rating": r[2]} if len(r) > 2 else {})} for r in ranges], **extra}
     response = admin.post("/api/antennas", json=body)
     assert response.status_code == 201, response.text
     return response.json()
@@ -249,7 +249,7 @@ def make_antenna(admin, name="Dual band", ranges=((144_000_000, 148_000_000), (4
 
 def test_antenna_with_several_ranges_warns_outside_all_of_them(admin):
     antenna = make_antenna(admin, kind="Ground plane", length=19.25, length_unit="in")
-    assert antenna["ranges"] == [[144_000_000, 148_000_000], [420_000_000, 450_000_000]]
+    assert antenna["ranges"] == [[144_000_000, 148_000_000, "ideal"], [420_000_000, 450_000_000, "ideal"]]
     source = make_source(admin, antenna_id=antenna["id"])
     uhf, vhf = make_target(admin, "UHF", 444_850_000), make_target(admin, "VHF", 146_520_000)
     air = make_target(admin, "Air", 120_000_000, modulation="am")
@@ -259,6 +259,37 @@ def test_antenna_with_several_ranges_warns_outside_all_of_them(admin):
     assert reply.status_code == 200 and "outside every range of Dual band" in reply.json()["warning"]
     listed = next(s for s in admin.get("/api/sources").json() if s["id"] == source)
     assert listed["antenna_name"] == "Dual band" and listed["antenna_ranges"] == antenna["ranges"]
+
+
+def test_overlapping_ratings_take_the_best(admin):
+    antenna = make_antenna(admin, ranges=((100_000_000, 200_000_000, "ideal"), (80_000_000, 220_000_000, "usable"),
+                                          (300_000_000, 400_000_000, "deaf"), (350_000_000, 360_000_000, "usable")))
+    source = make_source(admin, antenna_id=antenna["id"])
+    def warning(mhz):
+        target = make_target(admin, f"T{mhz}", int(mhz * 1e6))
+        return admin.post(f"/api/sources/{source}/assign", json={"target_id": target}).json()["warning"] or ""
+    assert warning(110) == ""
+    assert "usable range" in warning(205) and "not an ideal one" in warning(205)
+    assert "deaf to" in warning(320)
+    assert "usable range" in warning(355)  # usable beats deaf
+    assert "outside every range" in warning(250)
+
+
+def test_ratings_are_checked_and_old_ranges_count_as_ideal(admin, ctx):
+    assert admin.post("/api/antennas", json={"name": "X", "ranges": [{"low_hz": 1, "high_hz": 2, "rating": "great"}]}).status_code == 422
+    same = make_antenna(admin, ranges=((1, 2, "deaf"), (1, 2, "usable")))
+    assert same["ranges"] == [[1, 2, "usable"]]
+    from sentrysdr.models import Antenna
+    with ctx.db() as session:
+        old = Antenna(name="Old", ranges=[[144_000_000, 148_000_000]])
+        session.add(old)
+        session.commit()
+        old_id = old.id
+    listed = next(a for a in admin.get("/api/antennas").json() if a["id"] == old_id)
+    assert listed["ranges"] == [[144_000_000, 148_000_000, "ideal"]]
+    source = make_source(admin, antenna_id=old_id)
+    target = make_target(admin, "VHF", 146_520_000)
+    assert admin.post(f"/api/sources/{source}/assign", json={"target_id": target}).json()["warning"] is None
 
 
 def test_antenna_without_ranges_never_warns(admin):
@@ -1824,6 +1855,35 @@ def test_messages_feed_filters(ctx, admin, listener):
     assert [m["tail"] for m in listener.get("/api/messages?search=fuel").json()["items"]] == ["N3"]
     assert [m["tail"] for m in listener.get("/api/messages?search=DL22").json()["items"]] == ["N3"]
     assert listener.get("/api/messages?tail=.N-1").json()["total"] == 1
+
+
+def test_messages_order_and_date_range(ctx, listener):
+    base = 1_800_000_000
+    for i, tail in enumerate(("N1", "N2", "N3")):
+        add_message(ctx, tail=tail, received_at=base + i * 3600)
+    tails = lambda q: [m["tail"] for m in listener.get(f"/api/messages?{q}").json()["items"]]
+    assert tails("") == ["N3", "N2", "N1"] and tails("order=asc") == ["N1", "N2", "N3"]
+    assert tails(f"start={base + 1800}") == ["N3", "N2"] and tails(f"end={base + 1800}") == ["N1"]
+    assert tails(f"start={base + 1800}&end={base + 5400}&order=asc") == ["N2"]
+    assert tails("order=asc&limit=1&offset=1") == ["N2"]
+    assert listener.get("/api/messages?order=sideways").status_code == 422
+
+
+def test_recordings_and_emergencies_order(ctx, admin):
+    from sentrysdr.models import Recording, TrackEmergency
+    with ctx.db() as session:
+        for i in range(3):
+            session.add(Recording(id=f"00000000-0000-0000-0000-00000000000{i}", started_at=1_800_000_000 + i, ended_at=1_800_000_009 + i,
+                                  duration=9, rel_path=f"{i}.mp3", target_name=f"T{i}", frequency_hz=1))
+            session.add(TrackEmergency(kind="adsb", ident=f"a{i}", codes=["squawk_7700"], name=f"E{i}", callsign="", node_id=1,
+                                       serial="S", source_name="S", first_seen=1_800_000_000 + i, last_seen=1_800_000_000 + i))
+        session.commit()
+    names = lambda path, key: [x[key] for x in admin.get(path).json()["items"]]
+    assert names("/api/recordings", "target_name") == ["T2", "T1", "T0"]
+    assert names("/api/recordings?order=asc", "target_name") == ["T0", "T1", "T2"]
+    assert names("/api/emergencies", "name") == ["E2", "E1", "E0"]
+    assert names("/api/emergencies?order=asc", "name") == ["E0", "E1", "E2"]
+    assert admin.get("/api/recordings?order=x").status_code == 422 and admin.get("/api/emergencies?order=x").status_code == 422
 
 
 def test_messages_need_the_maps_permission(ctx, listener, admin):

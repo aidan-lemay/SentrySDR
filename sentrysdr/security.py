@@ -147,7 +147,7 @@ class RateLimiter:
 def client_ip(cfg: Config, peer: str | None, headers) -> str:
     """Resolve the real client address.
 
-    A forwarding header is honoured only when the direct peer is a configured
+    A forwarding header is honored only when the direct peer is a configured
     trusted proxy. cloudflared and reverse proxies connect from loopback, so a
     loopback peer is never treated as proof that the client is local.
     """

@@ -44,6 +44,10 @@ python3 -m venv "$APP/.venv"
 # Exact, tested versions from requirements.lock; then the app itself without re-resolving them.
 "$APP/.venv/bin/pip" install --quiet -r "$APP/requirements.lock"
 "$APP/.venv/bin/pip" install --quiet --no-deps -e "$APP"
+# The web tuner needs numpy. Only a prebuilt wheel is taken (building it on a Pi takes hours);
+# without one, everything but the tuner still works.
+"$APP/.venv/bin/pip" install --quiet --only-binary=:all: -r "$APP/requirements-tuner.lock" \
+  || echo "numpy isn't available for this system, so the web tuner won't run here. Everything else will."
 
 if [[ "$ROLE" == "master" ]]; then
   npm --prefix "$APP/web" ci --no-audit --no-fund
@@ -61,6 +65,9 @@ fi
 
 install -m 0644 "$APP/deploy/60-sentrysdr-rtlsdr.rules" /etc/udev/rules.d/
 install -m 0644 "$APP/deploy/blacklist-rtlsdr.conf" /etc/modprobe.d/
+# Every stick shares the kernel's USB buffer memory: raise the limit now and at every boot.
+install -m 0644 "$APP/deploy/sentrysdr-usbfs.conf" /etc/tmpfiles.d/
+systemd-tmpfiles --create /etc/tmpfiles.d/sentrysdr-usbfs.conf || echo "Couldn't raise usbfs_memory_mb now; it will be raised at the next boot."
 udevadm control --reload-rules && udevadm trigger
 install -m 0644 "$APP/deploy/sentrysdr.service" /etc/systemd/system/
 systemctl daemon-reload
@@ -76,6 +83,6 @@ if [[ "$ROLE" == "master" ]]; then
   echo "  4. sudo systemctl enable --now sentrysdr"
   echo "  5. Publish it with an example from $APP/deploy/"
 else
-  echo "  3. Create an enrolment token on the master (Admin > Nodes) and add it to $CONF"
+  echo "  3. Create an enrollment token on the master (Admin > Nodes) and add it to $CONF"
   echo "  4. sudo systemctl enable --now sentrysdr"
 fi

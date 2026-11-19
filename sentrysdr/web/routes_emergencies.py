@@ -25,12 +25,14 @@ def emergency_view(event: TrackEmergency) -> dict:
 
 @router.get("/emergencies")
 def list_emergencies(kind: str = Query(default="", pattern=r"^(adsb|ais)?$"),
+                     order: str = Query(default="desc", pattern="^(asc|desc)$"),
                      limit: int = Query(default=50, ge=1, le=200), offset: int = Query(default=0, ge=0),
                      _user: User = Depends(require("maps")), db=Depends(get_db)):
     """Every one recorded, newest first: the record isn't filtered by anyone's choices."""
     conditions = [TrackEmergency.kind == kind] if kind else []
     total = db.scalar(select(func.count()).select_from(TrackEmergency).where(*conditions))
-    rows = db.scalars(select(TrackEmergency).where(*conditions).order_by(TrackEmergency.first_seen.desc())
+    rows = db.scalars(select(TrackEmergency).where(*conditions).order_by(*((TrackEmergency.first_seen.asc(), TrackEmergency.id.asc()) if order == "asc"
+                                    else (TrackEmergency.first_seen.desc(), TrackEmergency.id.desc())))
                       .limit(limit).offset(offset))
     return {"items": [emergency_view(e) for e in rows], "total": total}
 

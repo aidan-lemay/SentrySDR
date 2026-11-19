@@ -76,7 +76,7 @@ def nearest_step(steps: list[float] | None, gain: float | None) -> float | None:
 
 def use_for(kind: str, modulation: str) -> set[str]:
     """Which ticked uses would cover a target. Empty means nothing to check."""
-    if kind == "rtltcp":
+    if kind in ("rtltcp", "tuner"):
         return set()  # raw samples: any stick can serve them
     if kind in ("adsb", "ais", "acars"):
         return {kind}

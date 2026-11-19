@@ -68,6 +68,7 @@ class Slave:
         self.measure_tasks: set[asyncio.Task] = set()
         self.supervisor = Supervisor(
             cfg, self._spool_call, self._on_pcm, self._on_tracks, self._on_status, enumerate_fn,
+            tuner_out=self._on_tuner,
         )
 
     # --- engine callbacks -------------------------------------------------
@@ -102,6 +103,14 @@ class Slave:
 
     def _on_tracks(self, kind: str, serial: str, data: dict) -> None:
         self._send(json.dumps({"t": "tracks", "kind": kind, "serial": serial, "data": data}))
+
+    def _on_tuner(self, serial: str, kind: str, data) -> None:
+        """A web tuner's output, for the master to pass on to whoever's watching."""
+        if kind == "frame":
+            raw = serial.encode()
+            self._send(b"\x00" + bytes([len(raw)]) + raw + data)
+        else:
+            self._send(json.dumps({"t": "tuner_out", "serial": serial, "data": data}))
 
     def _on_status(self, serial: str, status: dict) -> None:
         self.status[serial] = status
@@ -140,9 +149,9 @@ class Slave:
                         self._save_key(response.json()["key"])
                         log.info("enrolled with master")
                         continue
-                    log.error("enrolment refused: HTTP %s", response.status_code)
+                    log.error("enrollment refused: HTTP %s", response.status_code)
                 except httpx.HTTPError as exc:
-                    log.warning("cannot reach master to enrol: %s", exc)
+                    log.warning("cannot reach master to enroll: %s", exc)
             await asyncio.sleep(delay)
             delay = min(delay * 2, RECONNECT_MAX)
 
@@ -268,6 +277,10 @@ class Slave:
             serial = message.get("serial")
             if serial in self.cfg.serials:
                 (self.live_on.add if message.get("on") else self.live_on.discard)(serial)
+        elif kind == "tuner":
+            serial, command = message.get("serial"), message.get("command")
+            if serial in self.cfg.serials and isinstance(command, dict):
+                self.supervisor.tuner_command(serial, command)
         elif kind == "measure":
             # In its own task, so the link keeps working during the reading.
             task = asyncio.create_task(self._measure(message))

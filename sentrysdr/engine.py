@@ -10,6 +10,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import sys
@@ -45,7 +46,19 @@ RTL_TCP_CHECK_SECONDS = 2.0  # how often an rtl_tcp worker looks for a connected
 USB_FAULT_MARKERS = ("failed with -7", "Resetting device", "Failed to set")
 # A tool prints these as it exits, and the errors that follow them are normal.
 EXIT_MARKERS = ("User cancel", "Signal caught")
+# librtlsdr prints these when the kernel won't give it USB buffer memory: every SDR on a host
+# shares the usbfs_memory_mb limit (16 MB by default), so the last tool to start fails with
+# "lost device" though nothing is wrong with the stick.
+USBFS_MARKERS = ("Failed to submit transfer", "usbfs_memory_mb")
+USBFS_FAULT = ("couldn't get USB buffer memory: this host's limit is used up by its other SDRs. "
+               "Raise usbfs_memory_mb (README, \"USB buffer memory\").")
+TAIL_LINES = 5
+FAULT_LENGTH = 300
 RESET_SETTLE_SECONDS = 3.0
+# Sticks opening at the same moment compete on the USB bus: on every hub tested, four opening
+# together took up to 4.8 s and hit USB timeouts and hub port resets, and one at a time never did.
+# So the SDRs on one machine start this far apart, each after the last has finished opening (about 1.2 s).
+START_GAP_SECONDS = 1.5
 RESET_RESTART_GAP = 60.0  # at most one automatic restart a minute, so a stick that always resets can't loop
 # Changing any of these restarts the tool: they are read when it starts. Volume is read live, and names are only labels.
 RADIO_KEYS = ("kind", "frequency_hz", "modulation", "squelch", "gain_db", "ppm", "channels", "feeds", "feeder_uuid", "rtl_tcp_port")
@@ -73,26 +86,59 @@ async def stop_process(proc: asyncio.subprocess.Process | None, timeout: float =
         await proc.wait()
 
 
+class ToolTail(list):
+    """A tool's last few lines of output, and whether it ran out of USB buffer memory."""
+    usbfs = False
+
+
+def exit_message(tool: str, returncode, tail: list[str]) -> str:
+    """Why a tool stopped: a known cause in words, otherwise its last lines, newest last."""
+    if getattr(tail, "usbfs", False):
+        return f"{tool} {USBFS_FAULT}"
+    lines: list[str] = []
+    for line in tail:
+        line = re.sub(r"^<\d>", "", line).strip()  # AIS-catcher's log-level prefix
+        if line and (not lines or lines[-1] != line):
+            lines.append(line)
+    message = f"{tool} exited ({returncode})"
+    while lines and len(message) + len(" / ".join(lines)) + 1 > FAULT_LENGTH:
+        lines.pop(0)  # the newest lines matter most
+    return f"{message} {' / '.join(lines)}".strip()
+
+
+async def _drained(*readers: asyncio.Task) -> None:
+    """Give a stopped tool's stderr readers a moment to read its last lines: the exit message needs them."""
+    if readers:
+        await asyncio.wait(readers, timeout=1.0)
+
+
 async def _log_stderr(serial: str, stream, tail: list[str], on_reset: Callable[[], None] | None = None,
                       on_line: Callable[[str], None] | None = None) -> None:
     # Reads chunks, not lines: readline fails on a very long line, and if this stops
     # draining the pipe fills and the tool hangs.
     pending = b""
     exiting = False
-    while chunk := await stream.read(4096):
+    while True:
+        chunk = await stream.read(4096)
         lines = (pending + chunk).split(b"\n")
         pending = lines.pop()[-4096:]
+        if not chunk and pending:
+            lines.append(pending)  # a last line with no newline after it, as the tool exits
         for line in lines:
             text = line.decode(errors="replace").strip()[:500]
             if text:
                 tail.append(text)
-                del tail[:-5]
+                del tail[:-TAIL_LINES]
+                if isinstance(tail, ToolTail) and any(marker in text for marker in USBFS_MARKERS):
+                    tail.usbfs = True
                 log.debug("[%s] %s", serial, text)
                 exiting = exiting or any(marker in text for marker in EXIT_MARKERS)
                 if on_reset and not exiting and any(marker in text for marker in USB_FAULT_MARKERS):
                     on_reset()
                 if on_line:
                     on_line(text)
+        if not chunk:
+            break
 
 
 class PcmFramer:
@@ -223,6 +269,8 @@ class Worker:
         self.serial = serial
         self.spec: dict | None = None
         self.task: asyncio.Task | None = None
+        self.tuner = None  # a TunerSession while this SDR is a web tuner
+        self.tuner_saved: dict = {}
         self.state = "idle"
         self.error = ""
         self.in_call = False
@@ -309,7 +357,8 @@ class Worker:
             await self.stop()  # saves a call in progress
             self.in_call, self.call_started = False, None
             self._publish(state, "")
-            devices = await asyncio.to_thread(self.sup.enumerate)
+            async with self.sup.starting():
+                devices = await asyncio.to_thread(self.sup.enumerate)
             index = sdr.index_for_serial(self.serial, devices)
             if index is None:
                 raise MeasureError("This SDR isn't connected, or its serial is duplicated.")
@@ -364,7 +413,7 @@ class Worker:
         return out.decode(errors="replace")
 
     async def _read_levels(self, args: list[str], rate: int) -> dict:
-        tail: list[str] = []
+        tail = ToolTail()
         for attempt in range(MEASURE_ATTEMPTS):
             if attempt:
                 await asyncio.sleep(1.0)  # the stick can take a moment to be released
@@ -389,6 +438,8 @@ class Worker:
             levels = await asyncio.to_thread(pipelines.signal_levels, bytes(pcm), rate)
             if levels:
                 return pipelines.measure_summary(levels)
+        if tail.usbfs:
+            raise MeasureError(f"The SDR {USBFS_FAULT}")
         raise MeasureError(f"No samples from the SDR. {tail[-1] if tail else ''}".strip()[:300])
 
     def _on_reset(self) -> None:
@@ -448,7 +499,7 @@ class Worker:
     async def _run(self, spec: dict) -> None:
         delay = RESTART_MIN
         pipeline = {"adsb": self._run_adsb, "ais": self._run_ais, "acars": self._run_acars,
-                    "rtltcp": self._run_rtltcp}.get(spec["kind"], self._run_audio)
+                    "rtltcp": self._run_rtltcp, "tuner": self._run_tuner}.get(spec["kind"], self._run_audio)
         self._set_note("")  # a new assignment starts with a clean slate
         self.feed_status = {}
         self.rtl_tcp = {}
@@ -458,7 +509,11 @@ class Worker:
             try:
                 # The cheap sysfs check first: enumerating briefly opens every stick, busy ones too.
                 present = await asyncio.to_thread(self.sup.present)
-                devices = await asyncio.to_thread(self.sup.enumerate) if present is None or self.serial in present else []
+                if present is None or self.serial in present:
+                    async with self.sup.starting():  # the tool is started straight after, so it opens alone
+                        devices = await asyncio.to_thread(self.sup.enumerate)
+                else:
+                    devices = []
                 index = sdr.index_for_serial(self.serial, devices)
                 if index is None:
                     if sdr.has_duplicate(self.serial, devices):
@@ -499,7 +554,7 @@ class Worker:
         framer = PcmFramer(pipelines.pcm_channels(spec))
         volume = VolumeControl()
         digital = spec["modulation"] in pipelines.DIGITAL
-        tail: list[str] = []
+        tail = ToolTail()
         procs: list[asyncio.subprocess.Process] = []
         tasks: list[asyncio.Task] = []
         writer: CallWriter | None = None
@@ -564,8 +619,8 @@ class Worker:
                     self._save(writer)  # stuck carriers and continuous mode
                     writer = None
             await asyncio.gather(*(p.wait() for p in procs), return_exceptions=True)
-            detail = tail[-1] if tail else ""
-            return f"radio process exited ({proc.returncode}) {detail}".strip()
+            await _drained(*tasks)
+            return exit_message("radio process", proc.returncode, tail)
         finally:
             for proc_ in procs:
                 await stop_process(proc_)
@@ -596,7 +651,7 @@ class Worker:
 
     async def _run_adsb(self, index: int, spec: dict) -> str:
         json_dir = tempfile.mkdtemp(prefix=f"adsb-{self.serial}-", dir=self.sup.tmp_dir)
-        tail: list[str] = []
+        tail = ToolTail()
         proc = await asyncio.create_subprocess_exec(
             *pipelines.readsb_args(self.cfg, index, spec, json_dir),
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE, env=self.cfg.tool_env(),
@@ -620,8 +675,8 @@ class Worker:
                 with contextlib.suppress(OSError, ValueError):
                     data = json.loads(await asyncio.to_thread(path.read_text))
                     self.sup.tracks("adsb", self.serial, {"aircraft": data.get("aircraft", [])})
-            detail = tail[-1] if tail else ""
-            return f"readsb exited ({proc.returncode}) {detail}".strip()
+            await _drained(reader)
+            return exit_message("readsb", proc.returncode, tail)
         finally:
             await stop_process(proc)
             reader.cancel()
@@ -629,7 +684,7 @@ class Worker:
 
     async def _run_rtltcp(self, index: int, spec: dict) -> str:
         """Hand the stick to rtl_tcp, so a program such as GQRX can use it over the network."""
-        tail: list[str] = []
+        tail = ToolTail()
         port = spec["rtl_tcp_port"]
         proc = await asyncio.create_subprocess_exec(
             *pipelines.rtltcp_args(self.cfg, index, spec),
@@ -651,14 +706,56 @@ class Worker:
                     if connected:
                         self.last_call_at = time.time()
                     self._publish()
-            detail = tail[-1] if tail else ""
-            return f"rtl_tcp exited ({proc.returncode}) {detail}".strip()
+            await _drained(reader)
+            return exit_message("rtl_tcp", proc.returncode, tail)
         finally:
             await stop_process(proc)
             reader.cancel()
 
+    async def _run_tuner(self, index: int, spec: dict) -> str:
+        """The web tuner: rtl_tcp on loopback, read by a TunerSession that steers it live."""
+        try:
+            from . import tuner, tuner_session
+        except ImportError:
+            return "the web tuner needs numpy: install it into SentrySDR's venv (README, \"Web tuner\")"
+        # Where the last session left the stick, so a restart doesn't throw away someone's tuning.
+        saved = self.tuner_saved if self.tuner_saved.get("target_id") == spec["target_id"] else {}
+        center = saved.get("center_hz", spec["frequency_hz"])
+        rate = saved.get("rate", tuner.DEFAULT_RATE)
+        gain = saved.get("gain_db", spec.get("gain_db"))
+        port = tuner_session.free_port()
+        tail = ToolTail()
+        proc = await asyncio.create_subprocess_exec(
+            *pipelines.tuner_args(self.cfg, index, spec, port, rate, center),
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE, env=self.cfg.tool_env(),
+        )
+        reader = asyncio.create_task(_log_stderr(self.serial, proc.stderr, tail, self._on_reset))
+        session = tuner_session.TunerSession(port, center, rate, gain, lambda kind, data: self.sup.tuner_out(self.serial, kind, data),
+                                             asyncio.get_running_loop())
+        session.start()
+        self.tuner = session
+        self._publish("listening", "")
+        try:
+            while proc.returncode is None and session.alive():
+                try:
+                    await aio.wait_for(proc.wait(), 1.0)
+                except asyncio.TimeoutError:
+                    pass
+                self.tuner_saved = {"target_id": spec["target_id"], "center_hz": session.center_hz,
+                                    "rate": session.rate, "gain_db": session.gain_db}
+            if proc.returncode is None:
+                return session.error or "the tuner stopped"
+            await _drained(reader)
+            return exit_message("rtl_tcp", proc.returncode, tail)
+        finally:
+            self.tuner = None
+            await session.stop()
+            self.sup.tuner_out(self.serial, "json", {"t": "state", "running": False})
+            await stop_process(proc)
+            reader.cancel()
+
     async def _run_acars(self, index: int, spec: dict) -> str:
-        tail: list[str] = []
+        tail = ToolTail()
         proc = await asyncio.create_subprocess_exec(
             *pipelines.acars_args(self.cfg, index, spec),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=self.cfg.tool_env(),
@@ -679,8 +776,8 @@ class Worker:
                     self.last_call_at = time.time()
                     self.sup.tracks("acars", self.serial, {"message": message, "target_id": spec["target_id"]})
             await proc.wait()
-            detail = tail[-1] if tail else ""
-            return f"acarsdec exited ({proc.returncode}) {detail}".strip()
+            await _drained(reader)
+            return exit_message("acarsdec", proc.returncode, tail)
         finally:
             await stop_process(proc)
             reader.cancel()
@@ -697,7 +794,7 @@ class Worker:
             self._publish()
 
     async def _run_ais(self, index: int, spec: dict) -> str:
-        tail: list[str] = []
+        tail = ToolTail()
         proc = await asyncio.create_subprocess_exec(
             *pipelines.ais_args(self.cfg, index, spec),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=self.cfg.tool_env(),
@@ -720,8 +817,8 @@ class Worker:
                         del vessels[mmsi]
                     self.sup.tracks("ais", self.serial, {"vessels": list(vessels.values())})
             await proc.wait()
-            detail = tail[-1] if tail else ""
-            return f"AIS-catcher exited ({proc.returncode}) {detail}".strip()
+            await _drained(reader)
+            return exit_message("AIS-catcher", proc.returncode, tail)
         finally:
             await stop_process(proc)
             reader.cancel()
@@ -749,8 +846,11 @@ class Supervisor:
 
     def __init__(self, cfg: Config, call_sink: CallSink, pcm: PcmSink, tracks: TrackSink, status: Status,
                  enumerate_fn: Callable[[], list[str]] = sdr.enumerate_serials,
-                 present_fn: Callable[[], set[str] | None] | None = None):
+                 present_fn: Callable[[], set[str] | None] | None = None,
+                 tuner_out: Callable[[str, str, object], None] | None = None):
         self.cfg, self.call_sink, self.pcm, self.tracks, self.status = cfg, call_sink, pcm, tracks, status
+        # A web tuner's output: (serial, "frame", bytes) or (serial, "json", dict).
+        self.tuner_out = tuner_out or (lambda *_: None)
         self.enumerate = enumerate_fn
         # Real sticks are checked in sysfs, which opens nothing. A stand-in list answers for itself.
         if present_fn is None:
@@ -764,6 +864,24 @@ class Supervisor:
             else:
                 leftover.unlink(missing_ok=True)
         self.workers = {serial: Worker(self, serial) for serial in cfg.serials}
+        self._start_lock = asyncio.Lock()
+        self._next_start = 0.0
+
+    @contextlib.asynccontextmanager
+    async def starting(self):
+        """One SDR at a time finds its stick and starts its tool, START_GAP_SECONDS apart.
+
+        Held while the stick list is read, which briefly opens every stick. The tool starts
+        straight after, and the next SDR waits until it has had time to open.
+        """
+        async with self._start_lock:
+            wait = self._next_start - time.monotonic()
+            if wait > 0:
+                await asyncio.sleep(wait)
+            try:
+                yield
+            finally:
+                self._next_start = time.monotonic() + START_GAP_SECONDS
 
     async def apply(self, assignments: dict[str, dict | None]) -> None:
         for serial, worker in self.workers.items():
@@ -776,6 +894,14 @@ class Supervisor:
         if request.get("op") == "detect":
             return await worker.detect()
         return await worker.measure(**request)
+
+    def tuner_command(self, serial: str, message: dict) -> bool:
+        """Steer a running web tuner. False when that SDR isn't running one."""
+        worker = self.workers.get(serial)
+        if worker is None or worker.tuner is None:
+            return False
+        worker.tuner.command(message)
+        return True
 
     async def restart(self, serial: str) -> None:
         worker = self.workers.get(serial)

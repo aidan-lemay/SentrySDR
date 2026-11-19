@@ -14,6 +14,7 @@
   import EmailLink from './EmailLink.svelte';
   import Account from './views/Account.svelte';
   import Admin from './views/Admin.svelte';
+  import Tuner from './views/Tuner.svelte';
 
   let user = $state(null);
   let loading = $state(true);
@@ -30,6 +31,7 @@
     { id: 'targets', label: 'Targets', show: can('manage_targets') },
     { id: 'maps', label: 'Maps', show: can('maps') },
     { id: 'messages', label: 'Messages', show: can('maps') },
+    { id: 'tuner', label: 'Tuner', show: can('tuner') || can('listen_live') },
     { id: 'alerts', label: 'Alerts', show: can('listen_recordings') || can('maps'), count: alertCount },
     { id: 'admin', label: 'Admin', show: user?.role === 'admin' },
     { id: 'account', label: 'My account' },
@@ -85,6 +87,9 @@
   <p class="pad">Loading...</p>
 {:else if !user}
   <Auth onSignedIn={refreshUser} />
+{:else if view === 'tuner' && route.includes('source=') && !user.must_change_password}
+  <!-- An open tuner has the whole window, like GQRX. -->
+  {#key route}<Tuner {route} {user} />{/key}
 {:else}
   <header class="site">
     <div class="site-top">
@@ -126,6 +131,8 @@
       <Scanner />
     {:else if view === 'messages'}
       <Messages {route} {user} />
+    {:else if view === 'tuner'}
+      {#key route}<Tuner {route} {user} />{/key}
     {:else if view === 'account'}
       <Account {user} onChange={refreshUser} />
     {:else if view === 'admin'}

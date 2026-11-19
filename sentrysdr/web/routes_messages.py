@@ -29,6 +29,7 @@ def list_messages(
     user: User = Depends(require("maps")), db=Depends(get_db),
     search: str = Query(default="", max_length=200), tail: str = Query(default="", max_length=16),
     show_empty: bool = False, important: bool = False, id: int | None = None,  # one message, from an alert email
+    start: float | None = None, end: float | None = None, order: str = Query(default="desc", pattern="^(asc|desc)$"),
     limit: int = Query(default=50, ge=1, le=200), offset: int = Query(default=0, ge=0),
 ):
     words = user_words(db, user, "messages")
@@ -41,6 +42,10 @@ def list_messages(
         conditions.append(AcarsMessage.has_text.is_(True))
     if tail:
         conditions.append(AcarsMessage.tail == normalize_tail(tail))
+    if start is not None:
+        conditions.append(AcarsMessage.received_at >= start)
+    if end is not None:
+        conditions.append(AcarsMessage.received_at <= end)
     if search:
         # Typed % and _ are literal, as in the recordings search.
         def pattern(text: str) -> str:
@@ -53,7 +58,9 @@ def list_messages(
         ))
     total = db.scalar(select(func.count()).select_from(AcarsMessage).where(*conditions))
     rows = db.scalars(select(AcarsMessage).where(*conditions)
-                      .order_by(AcarsMessage.received_at.desc(), AcarsMessage.id.desc()).limit(limit).offset(offset))
+                      .order_by(*((AcarsMessage.received_at.asc(), AcarsMessage.id.asc()) if order == "asc"
+                                  else (AcarsMessage.received_at.desc(), AcarsMessage.id.desc())))
+                      .limit(limit).offset(offset))
     return {"items": [_view(m, words) for m in rows], "total": total}
 
 

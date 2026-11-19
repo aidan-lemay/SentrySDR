@@ -51,6 +51,7 @@ def list_recordings(
     ended_after: float | None = None,  # for players: calls finished since then, oldest first
     important: bool = False,  # marked important, or matching this user's keywords
     call: str | None = Query(default=None, max_length=36, pattern=r"^[0-9a-f-]{36}$"),  # one call, as linked from an alert email
+    order: str = Query(default="desc", pattern="^(asc|desc)$"),
     limit: int = Query(default=50, ge=1, le=200), offset: int = Query(default=0, ge=0),
     user: User = Depends(require("listen_recordings")), db=Depends(get_db),
 ):
@@ -80,9 +81,14 @@ def list_recordings(
         conditions.append(Recording.target_id.in_([int(t) for t in targets.split(",")]))
     if ended_after is not None:
         conditions.append(Recording.ended_at > ended_after)
-    order = (Recording.ended_at.asc(),) if ended_after is not None else (Recording.started_at.desc(),)
+    if ended_after is not None:
+        ordering = (Recording.ended_at.asc(),)  # players take calls in the order they finished
+    elif order == "asc":
+        ordering = (Recording.started_at.asc(), Recording.id.asc())
+    else:
+        ordering = (Recording.started_at.desc(), Recording.id.desc())
     total = db.scalar(select(func.count()).select_from(Recording).where(*conditions))
-    rows = list(db.scalars(select(Recording).where(*conditions).order_by(*order).limit(limit).offset(offset)))
+    rows = list(db.scalars(select(Recording).where(*conditions).order_by(*ordering).limit(limit).offset(offset)))
     jobs: dict[str, list[UploadJob]] = {}
     if rows:
         for job in db.scalars(select(UploadJob).where(UploadJob.recording_id.in_([r.id for r in rows]))):
