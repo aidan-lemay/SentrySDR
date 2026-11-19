@@ -5,9 +5,11 @@ ever talk to the master. The hub sends their commands on to the node, and hands
 what comes back (waterfall rows to everyone watching, audio to its own listener)
 to each browser's queue.
 
-One person controls each tuner: the centre frequency, sample rate and gain. That's
-whoever opened it first, then whoever has been there longest, and an admin can take
-over. Everyone else picks their own frequency and mode inside the span.
+One person at a time owns each tuner: its centre frequency, sample rate and gain.
+Nobody owns it until someone with the tuner permission takes it. They keep it until
+they release it, hand it to another listener who has that permission, or leave. An
+admin can take it from anyone. Everyone else picks their own frequency and mode
+inside the span.
 
 This module needs no numpy, so a master can relay a slave's tuner without it.
 """
@@ -41,6 +43,7 @@ class Viewer:
     user_id: int
     name: str
     is_admin: bool
+    can_own: bool = False
     queue: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(QUEUE_SIZE))
     listen: dict | None = None
     joined_at: float = field(default_factory=time.monotonic)
@@ -104,14 +107,12 @@ class TunerHub:
         self.task: asyncio.Task | None = None
 
     # --- browsers -------------------------------------------------------------------------
-    def join(self, key: tuple[int, str], user_id: int, name: str, is_admin: bool) -> Viewer:
+    def join(self, key: tuple[int, str], user_id: int, name: str, is_admin: bool, can_own: bool = True) -> Viewer:
         room = self.rooms.setdefault(key, Room())
         if len(room.viewers) >= MAX_VIEWERS:
             raise TunerError(f"This tuner already has {MAX_VIEWERS} people on it. Try again later.")
-        viewer = Viewer(next(self.ids), user_id, name, is_admin)
+        viewer = Viewer(next(self.ids), user_id, name, is_admin, can_own or is_admin)
         room.viewers[viewer.id] = viewer
-        if room.controller is None:
-            room.controller = viewer.id
         self._sync(key)
         self._announce(key)
         return viewer
@@ -122,7 +123,7 @@ class TunerHub:
             return
         self.send(key[0], key[1], {"op": "leave", "listener": viewer.id})
         if room.controller == viewer.id:
-            room.controller = min(room.viewers.values(), key=lambda v: v.joined_at).id if room.viewers else None
+            room.controller = None  # free again: someone takes it, it isn't handed on by itself
         if not room.viewers:
             self._sync(key)
             del self.rooms[key]
@@ -144,16 +145,31 @@ class TunerHub:
             viewer.listen = listen
             self.send(key[0], key[1], {"op": "listen", "listener": viewer.id, **listen})
             return
-        if op == "take":
-            if not viewer.is_admin:
-                raise TunerError("Only an admin can take control.")
+        if op == "claim":
+            if not viewer.can_own:
+                raise TunerError("You can listen, but you don't have permission to tune this SDR.")
+            if room.controller is not None and room.controller != viewer.id and not viewer.is_admin:
+                owner = room.viewers.get(room.controller)
+                raise TunerError(f"{owner.name if owner else 'Someone'} has this tuner. They can hand it to you.")
             room.controller = viewer.id
+            self._announce(key)
+            return
+        if op in ("release", "handover"):
+            if room.controller != viewer.id:
+                raise TunerError("You don't have this tuner.")
+            if op == "release":
+                room.controller = None
+            else:
+                to = room.viewers.get(message.get("to"))
+                if to is None or not to.can_own:
+                    raise TunerError("They can't take the tuner: they've left, or don't have permission to tune.")
+                room.controller = to.id
             self._announce(key)
             return
         if op not in ("center", "rate", "gain"):
             return
         if room.controller != viewer.id:
-            raise TunerError("Someone else is tuning this SDR. You can still choose your own frequency inside its span.")
+            raise TunerError("Only the tuner's owner can change that. You can still choose your own frequency inside its span.")
         if op == "center":
             hz = message.get("hz")
             if not isinstance(hz, int) or not FREQ_MIN_HZ <= hz <= FREQ_MAX_HZ:
@@ -213,11 +229,16 @@ class TunerHub:
         if room is None:
             return
         controller = room.viewers.get(room.controller)
+        # The owner sees who it could hand the tuner to; nobody else needs the list.
+        others = [{"id": v.id, "name": v.name} for v in room.viewers.values() if v.can_own and v.id != room.controller]
         for viewer in room.viewers.values():
+            mine = viewer.id == room.controller
             viewer.put(("text", json.dumps({
                 "t": "state", **room.state, "viewers": len(room.viewers),
-                "controller": controller.name if controller else None, "you_control": viewer.id == room.controller,
-                "can_take": viewer.is_admin and viewer.id != room.controller,
+                "controller": controller.name if controller else None, "you_control": mine,
+                "can_claim": viewer.can_own and controller is None,
+                "can_take": viewer.is_admin and controller is not None and not mine,
+                "handover": others if mine else [],
             })))
 
     async def run(self) -> None:

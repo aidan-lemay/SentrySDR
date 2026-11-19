@@ -19,13 +19,20 @@ from ..models import Node, Source, User, UserBookmark
 from ..pipelines import FREQ_MAX_HZ, FREQ_MIN_HZ
 from ..security import client_ip, origin_permitted
 from ..tuner_hub import TunerError
-from .deps import _current_session, ctx_of, effective_permissions, get_db, require
+from .deps import _current_session, ctx_of, current_user, effective_permissions, get_db
 
 log = logging.getLogger("sentrysdr.tuner")
 router = APIRouter(prefix="/api")
 
 MAX_MESSAGE = 4096
 RECHECK_SECONDS = 15  # how often an open tuner checks its viewer may still use it
+
+
+def tuner_user(user: User = Depends(current_user)) -> User:
+    """Listening on a tuner needs Listen live; owning one needs the tuner permission."""
+    if not effective_permissions(user) & {"tuner", "listen_live"}:
+        raise HTTPException(403, "Missing permission: listen_live")
+    return user
 
 
 def _tuner_sources(ctx, db) -> list[tuple[Source, Node]]:
@@ -42,7 +49,7 @@ def _tuner_sources(ctx, db) -> list[tuple[Source, Node]]:
 
 
 @router.get("/tuners")
-def list_tuners(request: Request, _user: User = Depends(require("tuner")), db=Depends(get_db)):
+def list_tuners(request: Request, _user: User = Depends(tuner_user), db=Depends(get_db)):
     """SDRs that can be opened as a tuner now, and who's on each."""
     ctx = ctx_of(request)
     items = []
@@ -63,7 +70,8 @@ def _allowed(ctx, websocket: WebSocket, source_id: int) -> tuple[User, tuple[int
         if found is None:
             return "Sign in again to use the tuner."
         user = found[0]
-        if user.must_change_password or "tuner" not in effective_permissions(user):
+        perms = effective_permissions(user)
+        if user.must_change_password or not perms & {"tuner", "listen_live"}:
             return "You don't have permission to use the tuner."
         source = db.get(Source, source_id)
         if source is None:
@@ -89,7 +97,8 @@ async def tuner_socket(websocket: WebSocket, source_id: int):
         return
     user, key, source_name = allowed
     try:
-        viewer = ctx.tuners.join(key, user.id, user.name or user.email, user.role == "admin")
+        viewer = ctx.tuners.join(key, user.id, user.name or user.email, user.role == "admin",
+                                 can_own="tuner" in effective_permissions(user))
     except TunerError as exc:
         await websocket.send_text(json.dumps({"t": "error", "detail": str(exc), "fatal": True}))
         await websocket.close(code=4429)
@@ -169,12 +178,12 @@ def _count(db, user: User) -> int:
 
 
 @router.get("/me/bookmarks")
-def list_bookmarks(user: User = Depends(require("tuner")), db=Depends(get_db)):
+def list_bookmarks(user: User = Depends(tuner_user), db=Depends(get_db)):
     return [_bookmark_view(b) for b in _mine(db, user)]
 
 
 @router.post("/me/bookmarks", status_code=201)
-def add_bookmark(body: BookmarkBody, user: User = Depends(require("tuner")), db=Depends(get_db)):
+def add_bookmark(body: BookmarkBody, user: User = Depends(tuner_user), db=Depends(get_db)):
     if _count(db, user) >= bookmarks.MAX_BOOKMARKS:
         raise HTTPException(422, f"You have {bookmarks.MAX_BOOKMARKS} bookmarks, the most there can be. Remove some first.")
     item = bookmarks.clean(body.model_dump())
@@ -192,7 +201,7 @@ def _own(db, user: User, bookmark_id: int) -> UserBookmark:
 
 
 @router.put("/me/bookmarks/{bookmark_id}")
-def edit_bookmark(bookmark_id: int, body: BookmarkBody, user: User = Depends(require("tuner")), db=Depends(get_db)):
+def edit_bookmark(bookmark_id: int, body: BookmarkBody, user: User = Depends(tuner_user), db=Depends(get_db)):
     bookmark = _own(db, user, bookmark_id)
     for key, value in bookmarks.clean(body.model_dump()).items():
         setattr(bookmark, key, value)
@@ -201,7 +210,7 @@ def edit_bookmark(bookmark_id: int, body: BookmarkBody, user: User = Depends(req
 
 
 @router.delete("/me/bookmarks/{bookmark_id}")
-def remove_bookmark(bookmark_id: int, user: User = Depends(require("tuner")), db=Depends(get_db)):
+def remove_bookmark(bookmark_id: int, user: User = Depends(tuner_user), db=Depends(get_db)):
     db.delete(_own(db, user, bookmark_id))
     db.commit()
     return {"ok": True}
@@ -214,7 +223,7 @@ class ImportBody(BaseModel):
 
 
 @router.post("/me/bookmarks/import")
-def import_bookmarks(body: ImportBody, user: User = Depends(require("tuner")), db=Depends(get_db)):
+def import_bookmarks(body: ImportBody, user: User = Depends(tuner_user), db=Depends(get_db)):
     """Add bookmarks from a file, skipping ones already there. `replace` clears the old ones first."""
     try:
         found = bookmarks.parse(body.text, body.format)
@@ -244,6 +253,6 @@ def import_bookmarks(body: ImportBody, user: User = Depends(require("tuner")), d
 
 @router.get("/me/bookmarks/export")
 def export_bookmarks(format: str = Query(default="sentrysdr", pattern="^(sentrysdr|gqrx|sdrpp)$"),
-                     user: User = Depends(require("tuner")), db=Depends(get_db)):
+                     user: User = Depends(tuner_user), db=Depends(get_db)):
     text, filename, media = bookmarks.export([_bookmark_view(b) for b in _mine(db, user)], format)
     return Response(text, media_type=media, headers={"Content-Disposition": f'attachment; filename="{filename}"'})

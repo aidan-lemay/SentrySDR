@@ -138,25 +138,38 @@ async def test_a_bad_command_doesnt_stop_the_tuner(tmp_path, fake_rtl_tcp):
 
 
 # --- the hub ------------------------------------------------------------------------------
-def test_hub_routes_frames_and_control():
+def test_hub_routes_frames_and_ownership():
     sent = []
     hub = TunerHub(lambda node, serial, command: sent.append(command) or True)
     key = (2, "SER9")
-    first = hub.join(key, 1, "Ada", is_admin=False)
-    second = hub.join(key, 2, "Bea", is_admin=True)
+    first = hub.join(key, 1, "Ada", is_admin=False, can_own=True)
+    second = hub.join(key, 2, "Bea", is_admin=False, can_own=True)
+    third = hub.join(key, 3, "Cy", is_admin=False, can_own=False)  # Listen live only
     assert sent[-1]["op"] == "sync" and sent[-1]["watching"]
+    assert hub.rooms[key].controller is None  # nobody owns it until they take it
     hub.command(key, second, {"t": "listen", "frequency_hz": 145_100_000, "mode": "nfm", "evil": 1})
     assert sent[-1] == {"op": "listen", "listener": second.id, "frequency_hz": 145_100_000, "mode": "nfm", "deemphasis_us": 75}
-    with pytest.raises(TunerError, match="Someone else"):
-        hub.command(key, second, {"t": "center", "hz": 146_000_000})
+    hub.command(key, third, {"t": "listen", "frequency_hz": 145_200_000, "mode": "am"})  # anyone picks their own channel
+    with pytest.raises(TunerError, match="owner"):
+        hub.command(key, first, {"t": "center", "hz": 146_000_000})
+    with pytest.raises(TunerError, match="permission"):
+        hub.command(key, third, {"t": "claim"})
+    hub.command(key, first, {"t": "claim"})
+    with pytest.raises(TunerError, match="Ada has this tuner"):
+        hub.command(key, second, {"t": "claim"})
     hub.command(key, first, {"t": "center", "hz": 146_000_000})
     assert sent[-1] == {"op": "center", "hz": 146_000_000}
     with pytest.raises(TunerError):
         hub.command(key, first, {"t": "rate", "hz": 3_000_000})
-    with pytest.raises(TunerError, match="admin"):
-        hub.command(key, first, {"t": "take"})
-    hub.command(key, second, {"t": "take"})
+    # The owner sees who it can go to; handing to someone without permission is refused.
+    state = json.loads([item for item in list(first.queue._queue) if item[0] == "text"][-1][1])
+    assert state["you_control"] and [v["name"] for v in state["handover"]] == ["Bea"]
+    with pytest.raises(TunerError):
+        hub.command(key, first, {"t": "handover", "to": third.id})
+    hub.command(key, first, {"t": "handover", "to": second.id})
     assert hub.rooms[key].controller == second.id
+    with pytest.raises(TunerError, match="don't have"):
+        hub.command(key, first, {"t": "release"})
     # Waterfall rows go to everyone, audio only to its listener.
     for queue in (first.queue, second.queue):
         while not queue.empty():
@@ -166,11 +179,25 @@ def test_hub_routes_frames_and_control():
     hub.from_node(3, "SER9", "frame", tuner_session.audio_frame(first.id, 16000.0, 1, -30.0, True, b"\x80" * 8))  # another node
     kinds = lambda q: [q.get_nowait()[1][:1] for _ in range(q.qsize())]  # noqa: E731
     assert kinds(first.queue) == [b"W"] and kinds(second.queue) == [b"W", b"A"]
-    # The controller leaving hands control to whoever's been there longest.
+    # The owner leaving frees it; nobody gets it by themselves.
     hub.leave(key, second)
-    assert hub.rooms[key].controller == first.id and sent[-1] == {"op": "leave", "listener": second.id}
+    assert hub.rooms[key].controller is None and sent[-1] == {"op": "leave", "listener": second.id}
+    hub.command(key, first, {"t": "claim"})
+    hub.command(key, first, {"t": "release"})
+    assert hub.rooms[key].controller is None
     hub.leave(key, first)
+    hub.leave(key, third)
     assert key not in hub.rooms and sent[-1] == {"op": "sync", "watching": False, "listeners": {}}
+
+
+def test_an_admin_can_take_the_tuner():
+    hub = TunerHub(lambda *_: True)
+    key = (1, "S")
+    owner = hub.join(key, 1, "Ada", is_admin=False, can_own=True)
+    admin = hub.join(key, 2, "Root", is_admin=True, can_own=False)  # an admin can always own
+    hub.command(key, owner, {"t": "claim"})
+    hub.command(key, admin, {"t": "claim"})
+    assert hub.rooms[key].controller == admin.id
 
 
 def test_hub_limits_viewers_and_commands():
@@ -179,6 +206,7 @@ def test_hub_limits_viewers_and_commands():
     viewers = [hub.join(key, i, f"U{i}", False) for i in range(8)]
     with pytest.raises(TunerError, match="already has"):
         hub.join(key, 99, "Late", False)
+    hub.command(key, viewers[0], {"t": "claim"})
     for _ in range(100):
         hub.command(key, viewers[0], {"t": "center", "hz": 146_000_000})
     assert viewers[0].allowance < 1
@@ -208,13 +236,27 @@ def test_websocket_needs_origin_signin_and_permission(ctx, app, admin, listener)
     with pytest.raises(Exception):
         with admin.websocket_connect(f"wss://sentry.example.com/api/tuner/{source}/ws", headers={"origin": "https://evil.example"}):
             pass
-    with listener.websocket_connect(f"wss://sentry.example.com/api/tuner/{source}/ws", headers=ORIGIN) as socket:
-        reply = json.loads(socket.receive_text())
-        assert reply["fatal"] and "permission" in reply["detail"]
     anonymous = client_for(app)
     with anonymous.websocket_connect(f"wss://sentry.example.com/api/tuner/{source}/ws", headers=ORIGIN) as socket:
         assert "Sign in" in json.loads(socket.receive_text())["detail"]
+    me = listener.get("/api/me").json()
+    admin.patch(f"/api/admin/users/{me['id']}", json={"perm_overrides": {"listen_live": False}}).raise_for_status()
+    with listener.websocket_connect(f"wss://sentry.example.com/api/tuner/{source}/ws", headers=ORIGIN) as socket:
+        reply = json.loads(socket.receive_text())
+        assert reply["fatal"] and "permission" in reply["detail"]
     assert listener.get("/api/tuners").status_code == 403
+
+
+def test_a_listener_listens_but_cant_own(ctx, app, admin, listener):
+    source = assign_tuner(admin)
+    ctx.tuners.send = lambda *_: True
+    assert listener.get("/api/tuners").status_code == 200
+    with listener.websocket_connect(f"wss://sentry.example.com/api/tuner/{source}/ws", headers=ORIGIN) as socket:
+        assert json.loads(socket.receive_text())["t"] == "hello"
+        state = json.loads(socket.receive_text())
+        assert not state["you_control"] and not state["can_claim"]
+        socket.send_text(json.dumps({"t": "claim"}))
+        assert "permission to tune" in json.loads(socket.receive_text())["detail"]
 
 
 def test_websocket_joins_and_takes_commands(ctx, app, admin, operator):
@@ -225,7 +267,9 @@ def test_websocket_joins_and_takes_commands(ctx, app, admin, operator):
     with operator.websocket_connect(f"wss://sentry.example.com/api/tuner/{source}/ws", headers=ORIGIN) as socket:
         assert json.loads(socket.receive_text())["t"] == "hello"
         state = json.loads(socket.receive_text())
-        assert state["t"] == "state" and state["you_control"] and state["viewers"] == 1
+        assert state["t"] == "state" and not state["you_control"] and state["can_claim"] and state["viewers"] == 1
+        socket.send_text(json.dumps({"t": "claim"}))
+        assert json.loads(socket.receive_text())["you_control"]
         socket.send_text(json.dumps({"t": "center", "hz": 146_000_000}))
         socket.send_text(json.dumps({"t": "center", "hz": 1}))
         assert "centre frequency" in json.loads(socket.receive_text())["detail"]

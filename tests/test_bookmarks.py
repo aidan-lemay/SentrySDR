@@ -39,7 +39,10 @@ def test_crud_is_per_user(ctx, app, operator, admin):
     assert operator.delete(f"/api/me/bookmarks/{bookmark['id']}").json() == {"ok": True}
 
 
-def test_bookmarks_need_the_tuner_permission(ctx, app, listener):
+def test_bookmarks_need_the_tuner_or_listen_live(ctx, app, admin, listener):
+    assert listener.get("/api/me/bookmarks").status_code == 200
+    me = listener.get("/api/me").json()
+    admin.patch(f"/api/admin/users/{me['id']}", json={"perm_overrides": {"listen_live": False}}).raise_for_status()
     assert listener.get("/api/me/bookmarks").status_code == 403
 
 
