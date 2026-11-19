@@ -44,6 +44,10 @@ python3 -m venv "$APP/.venv"
 # Exact, tested versions from requirements.lock; then the app itself without re-resolving them.
 "$APP/.venv/bin/pip" install --quiet -r "$APP/requirements.lock"
 "$APP/.venv/bin/pip" install --quiet --no-deps -e "$APP"
+# The web tuner needs numpy. Only a prebuilt wheel is taken (building it on a Pi takes hours);
+# without one, everything but the tuner still works.
+"$APP/.venv/bin/pip" install --quiet --only-binary=:all: -r "$APP/requirements-tuner.lock" \
+  || echo "numpy isn't available for this system, so the web tuner won't run here. Everything else will."
 
 if [[ "$ROLE" == "master" ]]; then
   npm --prefix "$APP/web" ci --no-audit --no-fund

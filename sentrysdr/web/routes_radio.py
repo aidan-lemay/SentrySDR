@@ -391,7 +391,7 @@ class TargetBody(BaseModel):
 
 def _validate_target(body: TargetBody, db, target_id: int | None = None) -> None:
     allowed = {"audio": pipelines.ANALOG | set(pipelines.DIGITAL), "adsb": {"adsb"}, "ais": {"ais"}, "acars": {"acars"},
-               "rtltcp": {"rtltcp"}}
+               "rtltcp": {"rtltcp"}, "tuner": {"tuner"}}
     if body.modulation not in allowed.get(body.kind, set()):
         raise HTTPException(422, f"Modulation {body.modulation} doesn't fit a {body.kind} target")
     if body.kind == "acars":

@@ -25,6 +25,7 @@ from . import BUILD_ID, __version__, acars, capabilities, coverage, emergencies,
 from .config import Config
 from .engine import UNPLUGGED, MeasureError, Supervisor
 from .live import LiveHub
+from .tuner_hub import TunerHub
 from .models import AcarsMessage, AuditLog, TrackEmergency, BroadcastifySystem, Node, Recorder, Recording, SdrProfile, Setting, Source, Target, UploadJob, UserSession, make_session_factory
 from .sdr import enumerate_serials
 from .security import RateLimiter, SecretBox
@@ -140,6 +141,7 @@ class Context:
         self.tracks: dict[str, dict[str, dict]] = {"adsb": {}, "ais": {}}
         self.live = LiveHub(cfg, self._live_demand)
         self.node_links: dict[int, object] = {}
+        self.tuners = TunerHub(self._tuner_send)
         self.acars_duplicates = acars.Duplicates()
         self.airframes = acars.AirframesFeed()
         self.pending_measures: dict[str, tuple[int, asyncio.Future, str]] = {}
@@ -383,6 +385,16 @@ class Context:
                 result.setdefault(source.node_id, {})[source.serial] = spec
             return result
 
+    def _tuner_send(self, node_id: int, serial: str, command: dict) -> bool:
+        """A command for a web tuner, wherever its SDR is plugged in."""
+        if node_id == self.local_node_id:
+            return self.supervisor is not None and self.supervisor.tuner_command(serial, command)
+        link = self.node_links.get(node_id)
+        if link is None:
+            return False
+        link.send({"t": "tuner", "serial": serial, "command": command})
+        return True
+
     async def restart_sdr(self, node: Node, serial: str) -> None:
         if node.is_local:
             if self.supervisor is None:
@@ -522,8 +534,10 @@ class Context:
             tracks=lambda kind, serial, data: self.update_tracks(kind, node_id, serial, data),
             status=lambda serial, data: self.set_status(node_id, serial, data),
             enumerate_fn=self.enumerate,
+            tuner_out=lambda serial, kind, data: self.tuners.from_node(node_id, serial, kind, data),
         )
-        for coroutine in (self._scheduler_loop, self._upload_loop, self._transcript_loop, self._retention_loop, self._email_loop):
+        for coroutine in (self._scheduler_loop, self._upload_loop, self._transcript_loop, self._retention_loop, self._email_loop,
+                          self.tuners.run):
             self.tasks.append(asyncio.create_task(coroutine(), name=coroutine.__name__))
 
     async def stop(self) -> None:

@@ -15,8 +15,8 @@ COOKIE_NAME = "sentrysdr_session"
 SESSION_SECONDS = 14 * 86400
 
 ROLE_PERMISSIONS = {
-    "admin": {"listen_live", "listen_recordings", "download", "assign", "manage_targets", "protect", "maps", "transcribe"},
-    "operator": {"listen_live", "listen_recordings", "download", "assign", "manage_targets", "protect", "maps", "transcribe"},
+    "admin": {"listen_live", "listen_recordings", "download", "assign", "manage_targets", "protect", "maps", "transcribe", "tuner"},
+    "operator": {"listen_live", "listen_recordings", "download", "assign", "manage_targets", "protect", "maps", "transcribe", "tuner"},
     "listener": {"listen_live", "listen_recordings", "download", "maps"},
 }
 ALL_PERMISSIONS = sorted(ROLE_PERMISSIONS["admin"])

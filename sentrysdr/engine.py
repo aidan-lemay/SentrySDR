@@ -269,6 +269,8 @@ class Worker:
         self.serial = serial
         self.spec: dict | None = None
         self.task: asyncio.Task | None = None
+        self.tuner = None  # a TunerSession while this SDR is a web tuner
+        self.tuner_saved: dict = {}
         self.state = "idle"
         self.error = ""
         self.in_call = False
@@ -497,7 +499,7 @@ class Worker:
     async def _run(self, spec: dict) -> None:
         delay = RESTART_MIN
         pipeline = {"adsb": self._run_adsb, "ais": self._run_ais, "acars": self._run_acars,
-                    "rtltcp": self._run_rtltcp}.get(spec["kind"], self._run_audio)
+                    "rtltcp": self._run_rtltcp, "tuner": self._run_tuner}.get(spec["kind"], self._run_audio)
         self._set_note("")  # a new assignment starts with a clean slate
         self.feed_status = {}
         self.rtl_tcp = {}
@@ -710,6 +712,48 @@ class Worker:
             await stop_process(proc)
             reader.cancel()
 
+    async def _run_tuner(self, index: int, spec: dict) -> str:
+        """The web tuner: rtl_tcp on loopback, read by a TunerSession that steers it live."""
+        try:
+            from . import tuner, tuner_session
+        except ImportError:
+            return "the web tuner needs numpy: install it into SentrySDR's venv (README, \"Web tuner\")"
+        # Where the last session left the stick, so a restart doesn't throw away someone's tuning.
+        saved = self.tuner_saved if self.tuner_saved.get("target_id") == spec["target_id"] else {}
+        center = saved.get("center_hz", spec["frequency_hz"])
+        rate = saved.get("rate", tuner.DEFAULT_RATE)
+        gain = saved.get("gain_db", spec.get("gain_db"))
+        port = tuner_session.free_port()
+        tail = ToolTail()
+        proc = await asyncio.create_subprocess_exec(
+            *pipelines.tuner_args(self.cfg, index, spec, port, rate, center),
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE, env=self.cfg.tool_env(),
+        )
+        reader = asyncio.create_task(_log_stderr(self.serial, proc.stderr, tail, self._on_reset))
+        session = tuner_session.TunerSession(port, center, rate, gain, lambda kind, data: self.sup.tuner_out(self.serial, kind, data),
+                                             asyncio.get_running_loop())
+        session.start()
+        self.tuner = session
+        self._publish("listening", "")
+        try:
+            while proc.returncode is None and session.alive():
+                try:
+                    await aio.wait_for(proc.wait(), 1.0)
+                except asyncio.TimeoutError:
+                    pass
+                self.tuner_saved = {"target_id": spec["target_id"], "center_hz": session.center_hz,
+                                    "rate": session.rate, "gain_db": session.gain_db}
+            if proc.returncode is None:
+                return session.error or "the tuner stopped"
+            await _drained(reader)
+            return exit_message("rtl_tcp", proc.returncode, tail)
+        finally:
+            self.tuner = None
+            await session.stop()
+            self.sup.tuner_out(self.serial, "json", {"t": "state", "running": False})
+            await stop_process(proc)
+            reader.cancel()
+
     async def _run_acars(self, index: int, spec: dict) -> str:
         tail = ToolTail()
         proc = await asyncio.create_subprocess_exec(
@@ -802,8 +846,11 @@ class Supervisor:
 
     def __init__(self, cfg: Config, call_sink: CallSink, pcm: PcmSink, tracks: TrackSink, status: Status,
                  enumerate_fn: Callable[[], list[str]] = sdr.enumerate_serials,
-                 present_fn: Callable[[], set[str] | None] | None = None):
+                 present_fn: Callable[[], set[str] | None] | None = None,
+                 tuner_out: Callable[[str, str, object], None] | None = None):
         self.cfg, self.call_sink, self.pcm, self.tracks, self.status = cfg, call_sink, pcm, tracks, status
+        # A web tuner's output: (serial, "frame", bytes) or (serial, "json", dict).
+        self.tuner_out = tuner_out or (lambda *_: None)
         self.enumerate = enumerate_fn
         # Real sticks are checked in sysfs, which opens nothing. A stand-in list answers for itself.
         if present_fn is None:
@@ -847,6 +894,14 @@ class Supervisor:
         if request.get("op") == "detect":
             return await worker.detect()
         return await worker.measure(**request)
+
+    def tuner_command(self, serial: str, message: dict) -> bool:
+        """Steer a running web tuner. False when that SDR isn't running one."""
+        worker = self.workers.get(serial)
+        if worker is None or worker.tuner is None:
+            return False
+        worker.tuner.command(message)
+        return True
 
     async def restart(self, serial: str) -> None:
         worker = self.workers.get(serial)

@@ -18,7 +18,7 @@ ANALOG = {"nfm", "am", "wfm"}
 DIGITAL = {"p25p1": "-f1", "p25p2": "-f2", "dmr": "-fs", "nxdn48": "-fi", "nxdn96": "-fn", "dstar": "-fd", "ysf": "-fy"}
 # DSD-FME writes one channel per time slot for these modes, and mono for the rest.
 TWO_SLOT = {"p25p2", "dmr"}
-MODULATIONS = ANALOG | set(DIGITAL) | {"adsb", "ais", "acars", "rtltcp"}
+MODULATIONS = ANALOG | set(DIGITAL) | {"adsb", "ais", "acars", "rtltcp", "tuner"}
 RTL_TCP_MIN_PORT = 1024
 # ACARS: one stick decodes several channels, so they must fit in what it can sample.
 ACARS_MIN_HZ = 118_000_000
@@ -67,7 +67,7 @@ def sanitize_spec(spec: dict) -> dict:
         raise SpecError(f"bad assignment: {exc}") from exc
     if not VOLUME_MIN_DB <= clean["volume_db"] <= VOLUME_MAX_DB:
         raise SpecError("volume out of range")
-    if clean["kind"] not in ("audio", "adsb", "ais", "acars", "rtltcp"):
+    if clean["kind"] not in ("audio", "adsb", "ais", "acars", "rtltcp", "tuner"):
         raise SpecError("bad kind")
     if clean["kind"] == "rtltcp":
         if clean["rtl_tcp_port"] is None or not RTL_TCP_MIN_PORT <= clean["rtl_tcp_port"] <= 65535:
@@ -232,6 +232,15 @@ def rtltcp_args(cfg: Config, index: int, spec: dict) -> list[str]:
             "-d", str(index), "-f", str(spec["frequency_hz"])]
     if spec.get("gain_db"):  # rtl_tcp treats 0 as automatic, which is also what no -g means
         args += ["-g", f"{spec['gain_db']:g}"]
+    if spec.get("ppm"):
+        args += ["-P", str(spec["ppm"])]
+    return args
+
+
+def tuner_args(cfg: Config, index: int, spec: dict, port: int, rate: int, center_hz: int) -> list[str]:
+    """rtl_tcp for the web tuner: always loopback and a private port, with SentrySDR as its only client."""
+    args = [cfg.binary("rtl_tcp") or "rtl_tcp", "-a", "127.0.0.1", "-p", str(port), "-d", str(index),
+            "-f", str(center_hz), "-s", str(rate)]
     if spec.get("ppm"):
         args += ["-P", str(spec["ppm"])]
     return args
