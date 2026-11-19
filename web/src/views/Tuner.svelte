@@ -67,6 +67,8 @@
   let gainValue = $state(30);
   let handTo = $state('');
   let dragging = $state(null);  // 'move' | 'low' | 'high' while a drag is under way
+  let marks = $state([]);  // bookmarks in the folders you show, for labels on the spectrum
+  let markRects = [];  // where each label was drawn, to click
 
   let socket = null;
   let retry = null;
@@ -152,7 +154,7 @@
   function setCenter(hz, { moveChannel = true } = {}) {
     if (!owner) return;
     if (!hz) {
-      error = 'Type a centre frequency in MHz, like 146.52.';
+      error = 'Type a center frequency in MHz, like 146.52.';
       return;
     }
     centerEdited = false;
@@ -194,7 +196,7 @@
     else if (message.t === 'state') {
       const first = !sdr.rate && message.rate;
       sdr = message;
-      if (!message.you_control && tab === 'input') tab = 'receiver';
+      if (!message.you_control && tab === 'sdr') tab = 'receiver';
       if (message.center_hz && !centerEdited) centerText = mhz(message.center_hz);
       if (message.gain_db === null) gainAuto = true;
       else if (message.gain_db !== undefined) { gainAuto = false; gainValue = message.gain_db; }
@@ -284,16 +286,16 @@
   // --- drawing ------------------------------------------------------------------------------
   const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
   const rgb = (hex) => [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16));
-  let colours = null;  // 256 entries of [r, g, b] for this contrast
+  let colors = null;  // 256 entries of [r, g, b] for this contrast
 
-  // One hue, from the box colour at the bottom of the range to --waterfall at the top.
-  function buildColours() {
+  // One hue, from the box color at the bottom of the range to --waterfall at the top.
+  function buildColors() {
     const [low, high] = [rgb(css('--box') || '#ffffff'), rgb(css('--waterfall') || '#0b3d91')];
-    colours = new Uint8ClampedArray(256 * 3);
+    colors = new Uint8ClampedArray(256 * 3);
     for (let code = 0; code < 256; code++) {
       const db = code / 2 + DB_FLOOR;
       const t = Math.min(1, Math.max(0, (db - range.low) / Math.max(1, range.high - range.low)));
-      for (let c = 0; c < 3; c++) colours[code * 3 + c] = low[c] + (high[c] - low[c]) * t;
+      for (let c = 0; c < 3; c++) colors[code * 3 + c] = low[c] + (high[c] - low[c]) * t;
     }
   }
 
@@ -301,9 +303,9 @@
     const image = context.createImageData(data.length, 1);
     for (let i = 0; i < data.length; i++) {
       const code = data[i] * 3;
-      image.data[i * 4] = colours[code];
-      image.data[i * 4 + 1] = colours[code + 1];
-      image.data[i * 4 + 2] = colours[code + 2];
+      image.data[i * 4] = colors[code];
+      image.data[i * 4 + 1] = colors[code + 1];
+      image.data[i * 4 + 2] = colors[code + 2];
       image.data[i * 4 + 3] = 255;
     }
     context.putImageData(image, 0, y);
@@ -318,7 +320,7 @@
       return;
     }
     const context = canvas.getContext('2d');
-    if (!colours) buildColours();
+    if (!colors) buildColors();
     context.drawImage(canvas, 0, 0, canvas.width, canvas.height - 1, 0, 1, canvas.width, canvas.height - 1);
     paintRow(context, data, 0);
   }
@@ -326,7 +328,7 @@
   function redrawWaterfall() {
     const canvas = waterfallCanvas;
     if (!canvas) return;
-    buildColours();
+    buildColors();
     const context = canvas.getContext('2d');
     context.fillStyle = css('--box');
     context.fillRect(0, 0, canvas.width, canvas.height);
@@ -382,6 +384,7 @@
       context.fillRect(x(lo), 0, Math.max(2, x(hi) - x(lo)), plotHeight);
       context.globalAlpha = 1;
       context.fillRect(Math.round(x(listen.frequency_hz)), 0, 1, plotHeight);
+      drawMarks(context, x, width, plotHeight);
     }
     if (smooth) {
       // The spectrum: one 2px line.
@@ -400,6 +403,42 @@
       context.fillRect(Math.round(hover.x), 0, 1, plotHeight);
     }
   }
+
+  // Bookmarks as labels across the top, as in GQRX: a line in the folder's color down to the
+  // frequency, the name in ordinary text. Three rows, so near neighbors don't sit on each other.
+  function drawMarks(context, x, width, plotHeight) {
+    markRects = [];
+    const rows = [-Infinity, -Infinity, -Infinity];
+    context.font = '11px sans-serif';
+    for (const mark of marks) {
+      if (mark.frequency_hz < span.low || mark.frequency_hz > span.high) continue;
+      const px = Math.round(x(mark.frequency_hz)) + 0.5;
+      const label = mark.name.length > 18 ? `${mark.name.slice(0, 17)}…` : mark.name;
+      const w = context.measureText(label).width + 8;
+      const left = Math.min(width - w, px);
+      const row = rows.findIndex((right) => left > right + 4);
+      context.strokeStyle = mark.color;
+      context.lineWidth = 1;
+      context.globalAlpha = 0.7;
+      context.beginPath(); context.moveTo(px, row === -1 ? 0 : 3 + row * 16 + 14); context.lineTo(px, plotHeight); context.stroke();
+      context.globalAlpha = 1;
+      if (row === -1) continue;  // no room for its name: the line still shows where it is
+      rows[row] = left + w;
+      const top = 3 + row * 16;
+      context.fillStyle = css('--box');
+      context.fillRect(left, top, w, 14);
+      context.lineWidth = 2;
+      context.strokeRect(left + 1, top + 1, w - 2, 12);
+      context.fillStyle = css('--ink');
+      context.fillText(label, left + 4, top + 11);
+      markRects.push({ left, top, w, h: 14, mark });
+    }
+  }
+
+  $effect(() => {
+    marks;
+    requestAnimationFrame(drawSpectrum);
+  });
 
   $effect(() => {
     range.low; range.high;  // a contrast change repaints everything kept
@@ -438,6 +477,11 @@
   function onDown(event) {
     const point = at(event);
     if (!point || event.button !== 0) return;
+    const hit = markRects.find((r) => point.x >= r.left && point.x <= r.left + r.w && point.y >= r.top && point.y <= r.top + r.h);
+    if (hit) {
+      pick(hit.mark);
+      return;
+    }
     drag = { kind: grab(point), startX: point.x, startHz: point.hz, startFreq: listen.frequency_hz, moved: false };
     try {
       plots.setPointerCapture(event.pointerId);  // keep the drag going outside the plot
@@ -546,9 +590,13 @@
 {:else}
   <div class="tuner-app">
     <header class="tuner-top">
-      <FreqReadout value={listen.frequency_hz} onchange={(hz) => tuneTo(hz)} label="Your channel" />
-      <form class="tuner-goto" onsubmit={(event) => { event.preventDefault(); tuneTo(parseMHz(gotoText)); gotoText = ''; }}>
+      <div class="tuner-freq" title={owner ? 'What you hear. Tuning past the edge of the span moves the SDR to follow.' : `Your own channel, inside the span the SDR is on. ${sdr.controller ? `Only ${sdr.controller}` : 'Only its owner'} can move the SDR.`}>
+        <span class="readout-caption">{owner ? 'You hear (the SDR follows past the edge)' : 'Your own channel (doesn\'t move the SDR)'}</span>
+        <FreqReadout value={listen.frequency_hz} onchange={(hz) => tuneTo(hz)} label={owner ? 'Your receive frequency' : 'Your own channel'} />
+      </div>
+      <form class="tuner-goto pair" onsubmit={(event) => { event.preventDefault(); tuneTo(parseMHz(gotoText)); gotoText = ''; }}>
         <input class="mono" bind:value={gotoText} inputmode="decimal" placeholder="Go to MHz" aria-label="Go to a frequency, in MHz" />
+        <button>Go</button>
       </form>
       {#if audioOn}
         <button onclick={stopAudio}>Stop audio</button>
@@ -591,7 +639,7 @@
 
       <aside class="tuner-panel">
         <div class="tuner-tabs" role="tablist">
-          {#each [['receiver', 'Receiver'], ...(owner ? [['input', 'Input']] : []), ['fft', 'FFT'], ['bookmarks', 'Bookmarks']] as [id, label] (id)}
+          {#each [['receiver', 'Receiver'], ...(owner ? [['sdr', 'SDR']] : []), ['fft', 'FFT'], ['bookmarks', 'Bookmarks']] as [id, label] (id)}
             <button role="tab" aria-selected={tab === id} class:active={tab === id} onclick={() => (tab = id)}>{label}</button>
           {/each}
         </div>
@@ -648,17 +696,22 @@
                 <div><strong class="mono">{rx.rds.ps}</strong> <span class="small dim mono">{rx.rds.pi}</span>{#if rx.rds.rt}<div class="small">{rx.rds.rt}</div>{/if}</div>
               {/if}
             </div>
-            <p class="small dim">Click the waterfall to tune, drag the shaded channel to move it, or drag its edge to change the filter. The mouse wheel steps.</p>
-          {:else if tab === 'input' && owner}
+            {#if owner}
+              <p class="small dim">Click the waterfall to hear there, drag the shaded channel to move it, or drag its edge to change the filter; the mouse wheel steps. Tuning past the edge of the span moves the SDR, as in GQRX. To move the SDR itself, use the SDR tab.</p>
+            {:else}
+              <p class="small dim">This is your own channel inside the span {sdr.controller ? `${sdr.controller} has` : 'the SDR is'} on: click the waterfall, drag the shaded channel or its edges, or use the mouse wheel. Nobody else hears it, and it doesn't move the SDR.</p>
+            {/if}
+          {:else if tab === 'sdr' && owner}
+            <p class="small tuner-warning"><strong>These change the SDR for everyone on it.</strong></p>
             <div class="tuner-grid">
-              <label for="tuner-center">Centre</label>
+              <label for="tuner-center">SDR center</label>
               <form class="tuner-row" onsubmit={(event) => { event.preventDefault(); setCenter(parseMHz(centerText)); }}>
                 <input id="tuner-center" class="mono" inputmode="decimal" bind:value={centerText} oninput={() => (centerEdited = true)} autocomplete="off" />
                 <span class="small">MHz</span>
                 <button class="main">Set</button>
               </form>
               <span></span>
-              <div class="tuner-row"><button onclick={() => setCenter(Math.round(listen.frequency_hz - sdr.rate / 4), { moveChannel: false })}>Move the span to my channel</button></div>
+              <div class="tuner-row"><button onclick={() => setCenter(Math.round(listen.frequency_hz - sdr.rate / 4), { moveChannel: false })}>Center the SDR near my channel</button></div>
               <label for="tuner-rate">Sample rate</label>
               <select id="tuner-rate" value={sdr.rate} onchange={(event) => send({ t: 'rate', hz: Number(event.target.value) })}>
                 {#each RATES as r (r)}<option value={r}>{(r / 1e6).toFixed(3)} MHz</option>{/each}
@@ -678,7 +731,7 @@
                 <button disabled={!handTo} onclick={() => { send({ t: 'handover', to: Number(handTo) }); handTo = ''; }}>Hand over</button>
               </div>
             </div>
-            <p class="small dim">Everyone on this SDR hears inside the span around the centre. Wider sample rates show more and cost its computer more. Gain goes to the stick's nearest step.</p>
+            <p class="small dim">Everyone on this SDR hears inside the span around its center, and your channel moves with it. Wider sample rates show more and cost its computer more. Gain goes to the stick's nearest step.</p>
           {:else if tab === 'fft'}
             <div class="tuner-grid">
               <label for="tuner-low">Range</label>
@@ -696,9 +749,9 @@
               <div class="tuner-row"><input id="tuner-avg" type="range" min="0.05" max="1" step="0.05" bind:value={averaging} onchange={remember} /><span class="small mono">{averaging >= 1 ? 'off' : averaging.toFixed(2)}</span></div>
             </div>
             <p class="small dim">These change only what you see.</p>
-          {:else}
-            <TunerBookmarks current={listen} onpick={pick} />
           {/if}
+          <!-- Always there, so the labels on the spectrum stay while another tab is open. -->
+          <div hidden={tab !== 'bookmarks'}><TunerBookmarks current={listen} onpick={pick} onvisible={(list) => (marks = list)} /></div>
         </div>
       </aside>
     </div>

@@ -471,7 +471,7 @@ async def test_slave_enrols_records_and_uploads_to_master(tmp_path, free_port):
         with ctx.db() as session:
             assert session.get(Node, node_id).serials == ["FIELD1"]
 
-        # The enrolment token can't be used a second time.
+        # The enrollment token can't be used a second time.
         again = await asyncio.to_thread(admin.post, "/api/nodes/agent/enroll", json={"token": token})
         assert again.status_code == 403
 

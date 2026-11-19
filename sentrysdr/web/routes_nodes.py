@@ -1,4 +1,4 @@
-"""Slave nodes: admin enrolment, plus the agent endpoints that slaves dial into.
+"""Slave nodes: admin enrollment, plus the agent endpoints that slaves dial into.
 
 Agent routes authenticate with a per-node bearer key, never a browser cookie.
 """
@@ -65,7 +65,7 @@ class NodeBody(BaseModel):
 
 @router.post("", status_code=201)
 def create_enrollment(body: NodeBody, request: Request, admin: User = Depends(admin_user), db=Depends(get_db)):
-    """Create a slave entry and a one-time enrolment token, shown only here."""
+    """Create a slave entry and a one-time enrollment token, shown only here."""
     ctx = ctx_of(request)
     token = security.new_token()
     node = Node(
@@ -149,7 +149,7 @@ def enroll(body: EnrollBody, request: Request, db=Depends(get_db)):
     if node is None or node.status != "pending" or (node.enroll_expires_at or 0) < time.time():
         ctx.limiter.hit(key, ENROLL_WINDOW)
         ctx.audit("node.enroll_failed", ip=ip)
-        raise HTTPException(403, "Invalid or expired enrolment token")
+        raise HTTPException(403, "Invalid or expired enrollment token")
     device_key = security.new_token()
     node.key_hash = security.hash_token(device_key)
     node.enroll_token_hash, node.enroll_expires_at = None, None  # single use

@@ -5,7 +5,7 @@ ever talk to the master. The hub sends their commands on to the node, and hands
 what comes back (waterfall rows to everyone watching, audio to its own listener)
 to each browser's queue.
 
-One person at a time owns each tuner: its centre frequency, sample rate and gain.
+One person at a time owns each tuner: its center frequency, sample rate and gain.
 Nobody owns it until someone with the tuner permission takes it. They keep it until
 they release it, hand it to another listener who has that permission, or leave. An
 admin can take it from anyone. Everyone else picks their own frequency and mode
@@ -173,7 +173,7 @@ class TunerHub:
         if op == "center":
             hz = message.get("hz")
             if not isinstance(hz, int) or not FREQ_MIN_HZ <= hz <= FREQ_MAX_HZ:
-                raise TunerError(f"Choose a centre frequency from {FREQ_MIN_HZ / 1e6:g} to {FREQ_MAX_HZ / 1e6:g} MHz.")
+                raise TunerError(f"Choose a center frequency from {FREQ_MIN_HZ / 1e6:g} to {FREQ_MAX_HZ / 1e6:g} MHz.")
             self.send(key[0], key[1], {"op": "center", "hz": hz})
         elif op == "rate":
             if message.get("hz") not in SAMPLE_RATES:

@@ -333,7 +333,7 @@ class Receiver:
                 self.rds = RdsDecoder(self.if_rate)
 
     def retune(self, center_hz: int) -> None:
-        """The tuner's centre moved: find this channel in the new span."""
+        """The tuner's center moved: find this channel in the new span."""
         self.center_hz = center_hz
         offset = self.settings.frequency_hz - center_hz
         self.inside = abs(offset) + self.bw / 2 < self.rate / 2
@@ -490,7 +490,7 @@ class Tuner:
         samples = iq_from_u8(raw)
         if not len(samples):
             return [], {}
-        # The stick's DC offset makes a spike at the centre: take out a slowly tracked average.
+        # The stick's DC offset makes a spike at the center: take out a slowly tracked average.
         mean = samples.mean()
         self.dc = self.dc * np.complex64(0.9) + mean * np.complex64(0.1)
         samples = samples - self.dc

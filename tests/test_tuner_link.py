@@ -20,7 +20,7 @@ from .test_radio import make_source, make_target  # noqa: E402
 ORIGIN = {"origin": "https://sentry.example.com"}
 
 # rtl_tcp's protocol: a 12-byte header, then IQ bytes; commands are 5 bytes each.
-# This one sends a carrier 100 kHz above centre and writes down every command it gets.
+# This one sends a carrier 100 kHz above center and writes down every command it gets.
 FAKE_RTL_TCP = r'''#!/usr/bin/env python3
 import math, socket, struct, sys, threading, time
 args = sys.argv[1:]
@@ -272,7 +272,7 @@ def test_websocket_joins_and_takes_commands(ctx, app, admin, operator):
         assert json.loads(socket.receive_text())["you_control"]
         socket.send_text(json.dumps({"t": "center", "hz": 146_000_000}))
         socket.send_text(json.dumps({"t": "center", "hz": 1}))
-        assert "centre frequency" in json.loads(socket.receive_text())["detail"]
+        assert "center frequency" in json.loads(socket.receive_text())["detail"]
         assert {"op": "center", "hz": 146_000_000} in sent
         assert operator.get("/api/tuners").json()[0]["viewers"] == 1
     assert sent[-1] == {"op": "sync", "watching": False, "listeners": {}}

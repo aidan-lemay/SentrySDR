@@ -149,9 +149,9 @@ class Slave:
                         self._save_key(response.json()["key"])
                         log.info("enrolled with master")
                         continue
-                    log.error("enrolment refused: HTTP %s", response.status_code)
+                    log.error("enrollment refused: HTTP %s", response.status_code)
                 except httpx.HTTPError as exc:
-                    log.warning("cannot reach master to enrol: %s", exc)
+                    log.warning("cannot reach master to enroll: %s", exc)
             await asyncio.sleep(delay)
             delay = min(delay * 2, RECONNECT_MAX)
 

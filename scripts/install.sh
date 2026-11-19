@@ -83,6 +83,6 @@ if [[ "$ROLE" == "master" ]]; then
   echo "  4. sudo systemctl enable --now sentrysdr"
   echo "  5. Publish it with an example from $APP/deploy/"
 else
-  echo "  3. Create an enrolment token on the master (Admin > Nodes) and add it to $CONF"
+  echo "  3. Create an enrollment token on the master (Admin > Nodes) and add it to $CONF"
   echo "  4. sudo systemctl enable --now sentrysdr"
 fi

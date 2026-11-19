@@ -82,7 +82,7 @@ def outline(home: tuple[float, float], sectors: list[float]) -> list[list[float]
     """The coverage shape: the farthest point seen in each direction heard so far.
 
     Directions with nothing heard are left out rather than drawn at the receiver,
-    which would spike the outline back to the centre (tar1090 draws it this way too).
+    which would spike the outline back to the center (tar1090 draws it this way too).
     """
     step = 360 / SECTORS
     points = [list(destination(*home, i * step + step / 2, km)) for i, km in enumerate(sectors) if km > 0]

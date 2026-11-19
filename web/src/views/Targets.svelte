@@ -237,7 +237,7 @@
       <p class="small dim form-buttons">rtl_tcp has no password: whoever can reach it controls the stick. It listens only on the address in that machine's configuration file, on the SDR's own port. Only administrators can use it.</p>
     {/if}
     {#if form.kind === 'tuner'}
-      <label class="field"><span>Starting centre frequency (MHz)</span>
+      <label class="field"><span>Starting center frequency (MHz)</span>
         <input class="mono" type="number" inputmode="decimal" step="0.0001" min="0.5" max="2200" bind:value={form.mhz} required />
         <span class="hint">Where the SDR starts. Whoever's tuning it can move it anywhere the stick reaches.</span>
       </label>

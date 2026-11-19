@@ -117,7 +117,7 @@ def rds_block(data: int, offset: str) -> list[int]:
 def rds_bits(pi: int, ps: str, rt: str) -> list[int]:
     groups = []
     for segment in range(4):
-        b = (0 << 12) | (5 << 5) | segment  # group 0A, programme type 5
+        b = (0 << 12) | (5 << 5) | segment  # group 0A, program type 5
         groups.append((pi, b, 0xE0CD, (ord(ps[segment * 2]) << 8) | ord(ps[segment * 2 + 1])))
     rt = rt.ljust(64)
     for segment in range(16):

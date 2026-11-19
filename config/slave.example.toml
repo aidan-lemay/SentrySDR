@@ -13,7 +13,7 @@ name = "field-pi"
 #   Local address of the master:    http://192.168.1.20:8642 (needs local_access there)
 # Plain http is refused unless the address is loopback, private, or Tailscale.
 url = "https://sentry.example.com"
-# From the master's UI: Admin > Nodes. One use, valid for 24 hours. After enrolment the
+# From the master's UI: Admin > Nodes. One use, valid for 24 hours. After enrollment the
 # slave stores its own revocable key and this line can be removed.
 enrollment_token = ""
 # Calls wait here during an outage. The oldest are dropped above this size.

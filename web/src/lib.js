@@ -72,7 +72,7 @@ export function antennaRating(ranges, hz) {
   const found = ranges.filter(([low, high]) => low <= hz && hz <= high).map(ratingOf);
   return RATINGS.map(([id]) => id).find((id) => found.includes(id)) ?? 'outside';
 }
-export const ANTENNA_UNITS = [['in', 'inches'], ['ft', 'feet'], ['cm', 'cm'], ['m', 'metres']];
+export const ANTENNA_UNITS = [['in', 'inches'], ['ft', 'feet'], ['cm', 'cm'], ['m', 'meters']];
 export const formatTime = (epoch) => (epoch ? new Date(epoch * 1000).toLocaleString() : 'Never');
 
 export function formatDuration(seconds) {

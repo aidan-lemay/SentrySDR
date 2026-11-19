@@ -1,4 +1,4 @@
-"""Internet-facing behaviour: who can get in, and what they can't do."""
+"""Internet-facing behavior: who can get in, and what they can't do."""
 from __future__ import annotations
 
 import re

@@ -41,7 +41,7 @@
   let rangeProblem = $state('');
 
   let nodeName = $state('');
-  let enrolment = $state(null);
+  let enrollment = $state(null);
 
   let bans = $state([]);
   let ban = $state({ kind: 'ip', value: '', reason: '' });
@@ -98,7 +98,7 @@
     message = '';
     selected = null;
     oneTimeSecret = null;
-    enrolment = null;
+    enrollment = null;
     if (location.hash !== `#/admin?tab=${next}`) history.replaceState(null, '', `#/admin?tab=${next}`);
     run(loaders[next]);
   }
@@ -311,7 +311,7 @@
     event.preventDefault();
     const reply = await run(() => api('nodes', { method: 'POST', body: { name: nodeName } }));
     if (reply) {
-      enrolment = reply;
+      enrollment = reply;
       nodeName = '';
       await loaders.nodes();
     }
@@ -851,10 +851,10 @@
 {/if}
 
 {#if tab === 'nodes'}
-  {#if enrolment}
+  {#if enrollment}
     <div class="warn">
-      Token for <strong>{enrolment.name}</strong>, shown once and good for 24 hours. Put this in that slave's configuration file:
-      <div class="secret">[master]<br />enrollment_token = "{enrolment.enrollment_token}"</div>
+      Token for <strong>{enrollment.name}</strong>, shown once and good for 24 hours. Put this in that slave's configuration file:
+      <div class="secret">[master]<br />enrollment_token = "{enrollment.enrollment_token}"</div>
     </div>
   {/if}
   <div class="box">

@@ -879,7 +879,7 @@ def _save_recorder(ctx, request, user, db, body: RecorderBody, recorder: Recorde
     if source is None or target is None:
         raise HTTPException(404, "Source or target not found")
     _refuse_rtl_tcp(user, target, db.get(Target, recorder.target_id) if recorder else None)
-    # A schedule overrides the base assignment, so it must honour that lock too.
+    # A schedule overrides the base assignment, so it must honor that lock too.
     _check_lock(ctx, request, user, _base_for(db, body.source_id))
     if recorder is None:
         recorder = Recorder(name=body.name, source_id=source.id, target_id=target.id)

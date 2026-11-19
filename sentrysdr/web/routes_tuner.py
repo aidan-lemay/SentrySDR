@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 
 from .. import bookmarks
-from ..models import Node, Source, User, UserBookmark
+from ..models import BookmarkFolder, Node, Source, User, UserBookmark
 from ..pipelines import FREQ_MAX_HZ, FREQ_MIN_HZ
 from ..security import client_ip, origin_permitted
 from ..tuner_hub import TunerError
@@ -159,22 +159,54 @@ class BookmarkBody(BaseModel):
     frequency_hz: int = Field(ge=FREQ_MIN_HZ, le=FREQ_MAX_HZ)
     mode: str = Field(default="nfm", pattern="^(" + "|".join(bookmarks.MODES) + ")$")
     bandwidth_hz: int | None = Field(default=None, gt=0, le=250_000)
-    folder: str = Field(default="", max_length=bookmarks.FOLDER_LENGTH)
+    folders: list[str] = Field(default_factory=list, max_length=bookmarks.MAX_FOLDERS_EACH)
     notes: str = Field(default="", max_length=bookmarks.NOTES_LENGTH)
+
+
+def folders_of(b: UserBookmark) -> list[str]:
+    """A bookmark's folders. One saved before there could be several has its one folder."""
+    if b.folders is not None:
+        return list(b.folders)
+    return [b.folder] if b.folder else []
 
 
 def _bookmark_view(b: UserBookmark) -> dict:
     return {"id": b.id, "name": b.name, "frequency_hz": b.frequency_hz, "mode": b.mode,
-            "bandwidth_hz": b.bandwidth_hz, "folder": b.folder, "notes": b.notes}
+            "bandwidth_hz": b.bandwidth_hz, "folders": folders_of(b), "notes": b.notes}
 
 
 def _mine(db, user: User) -> list[UserBookmark]:
     return list(db.scalars(select(UserBookmark).where(UserBookmark.user_id == user.id)
-                           .order_by(UserBookmark.folder, UserBookmark.frequency_hz, UserBookmark.id)))
+                           .order_by(UserBookmark.frequency_hz, UserBookmark.id)))
 
 
 def _count(db, user: User) -> int:
     return db.scalar(select(func.count()).select_from(UserBookmark).where(UserBookmark.user_id == user.id))
+
+
+def _colors(db, user: User) -> dict[str, str]:
+    return {f.name: f.color for f in db.scalars(select(BookmarkFolder).where(BookmarkFolder.user_id == user.id))}
+
+
+def _ensure_folders(db, user: User, names, colors: dict[str, str] | None = None) -> None:
+    """Give every folder in use a color: the file's, or the next of the defaults."""
+    have = _colors(db, user)
+    for name in names:
+        if name in have:
+            if colors and name in colors and colors[name] != have[name]:
+                db.scalar(select(BookmarkFolder).where(BookmarkFolder.user_id == user.id, BookmarkFolder.name == name)).color = colors[name]
+            continue
+        color = (colors or {}).get(name) or bookmarks.DEFAULT_COLOURS[len(have) % len(bookmarks.DEFAULT_COLOURS)]
+        db.add(BookmarkFolder(user_id=user.id, name=name, color=color))
+        have[name] = color
+    db.flush()
+
+
+def _store(bookmark: UserBookmark, item: dict) -> None:
+    for key in ("name", "frequency_hz", "mode", "bandwidth_hz", "notes"):
+        setattr(bookmark, key, item[key])
+    bookmark.folders = item["folders"]
+    bookmark.folder = item["folders"][0] if item["folders"] else ""
 
 
 @router.get("/me/bookmarks")
@@ -187,8 +219,10 @@ def add_bookmark(body: BookmarkBody, user: User = Depends(tuner_user), db=Depend
     if _count(db, user) >= bookmarks.MAX_BOOKMARKS:
         raise HTTPException(422, f"You have {bookmarks.MAX_BOOKMARKS} bookmarks, the most there can be. Remove some first.")
     item = bookmarks.clean(body.model_dump())
-    bookmark = UserBookmark(user_id=user.id, **item)
+    bookmark = UserBookmark(user_id=user.id)
+    _store(bookmark, item)
     db.add(bookmark)
+    _ensure_folders(db, user, item["folders"])
     db.commit()
     return _bookmark_view(bookmark)
 
@@ -203,8 +237,9 @@ def _own(db, user: User, bookmark_id: int) -> UserBookmark:
 @router.put("/me/bookmarks/{bookmark_id}")
 def edit_bookmark(bookmark_id: int, body: BookmarkBody, user: User = Depends(tuner_user), db=Depends(get_db)):
     bookmark = _own(db, user, bookmark_id)
-    for key, value in bookmarks.clean(body.model_dump()).items():
-        setattr(bookmark, key, value)
+    item = bookmarks.clean(body.model_dump())
+    _store(bookmark, item)
+    _ensure_folders(db, user, item["folders"])
     db.commit()
     return _bookmark_view(bookmark)
 
@@ -216,6 +251,64 @@ def remove_bookmark(bookmark_id: int, user: User = Depends(tuner_user), db=Depen
     return {"ok": True}
 
 
+# --- folders ----------------------------------------------------------------------------------
+@router.get("/me/bookmark-folders")
+def list_folders(user: User = Depends(tuner_user), db=Depends(get_db)):
+    """Every folder a bookmark is in, with its color and how many bookmarks are in it."""
+    counts: dict[str, int] = {}
+    for b in _mine(db, user):
+        for name in folders_of(b):
+            counts[name] = counts.get(name, 0) + 1
+    _ensure_folders(db, user, sorted(counts))
+    db.commit()
+    colors = _colors(db, user)
+    return [{"name": name, "color": colors[name], "count": counts[name]} for name in sorted(counts, key=str.lower)]
+
+
+class FolderBody(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=bookmarks.FOLDER_LENGTH)
+    color: str | None = Field(default=None, pattern=r"^#[0-9a-fA-F]{6}$")
+
+
+def _rename(db, user: User, old: str, new: str | None) -> None:
+    """Move every bookmark from one folder to another (or out of it, with None)."""
+    for b in _mine(db, user):
+        names = folders_of(b)
+        if old in names:
+            names = [new if n == old else n for n in names if n is not None]
+            _store(b, {**_bookmark_view(b), "folders": bookmarks.clean_folders([n for n in names if n])})
+
+
+@router.put("/me/bookmark-folders/{name:path}")
+def edit_folder(name: str, body: FolderBody, user: User = Depends(tuner_user), db=Depends(get_db)):
+    """Recolour a folder, or rename it: every bookmark in it moves with it."""
+    folder = db.scalar(select(BookmarkFolder).where(BookmarkFolder.user_id == user.id, BookmarkFolder.name == name))
+    if folder is None:
+        raise HTTPException(404, "Folder not found")
+    if body.color:
+        folder.color = body.color.lower()
+    new = body.name.strip() if body.name else None
+    if new and new != name:
+        if db.scalar(select(BookmarkFolder).where(BookmarkFolder.user_id == user.id, BookmarkFolder.name == new)):
+            raise HTTPException(422, f"You already have a folder called {new}.")
+        _rename(db, user, name, new)
+        folder.name = new
+    db.commit()
+    return {"name": folder.name, "color": folder.color}
+
+
+@router.delete("/me/bookmark-folders/{name:path}")
+def remove_folder(name: str, user: User = Depends(tuner_user), db=Depends(get_db)):
+    """Take the folder off every bookmark in it. The bookmarks themselves stay."""
+    _rename(db, user, name, None)
+    folder = db.scalar(select(BookmarkFolder).where(BookmarkFolder.user_id == user.id, BookmarkFolder.name == name))
+    if folder is not None:
+        db.delete(folder)
+    db.commit()
+    return {"ok": True}
+
+
+# --- import and export -----------------------------------------------------------------------------
 class ImportBody(BaseModel):
     format: str = Field(pattern="^(sentrysdr|gqrx|sdrpp)$")
     text: str = Field(max_length=900_000)
@@ -226,7 +319,7 @@ class ImportBody(BaseModel):
 def import_bookmarks(body: ImportBody, user: User = Depends(tuner_user), db=Depends(get_db)):
     """Add bookmarks from a file, skipping ones already there. `replace` clears the old ones first."""
     try:
-        found = bookmarks.parse(body.text, body.format)
+        found, colors = bookmarks.parse(body.text, body.format)
     except (ValueError, AttributeError, TypeError):
         raise HTTPException(422, "That file isn't in the format chosen.")
     if not found:
@@ -238,15 +331,20 @@ def import_bookmarks(body: ImportBody, user: User = Depends(tuner_user), db=Depe
     existing = {(b.name, b.frequency_hz, b.mode) for b in _mine(db, user)}
     room = bookmarks.MAX_BOOKMARKS - len(existing)
     added = skipped = 0
+    used: list[str] = []
     for item in found:
         if (item["name"], item["frequency_hz"], item["mode"]) in existing:
             skipped += 1
             continue
         if added >= room:
             break
-        db.add(UserBookmark(user_id=user.id, **item))
+        bookmark = UserBookmark(user_id=user.id)
+        _store(bookmark, item)
+        db.add(bookmark)
         existing.add((item["name"], item["frequency_hz"], item["mode"]))
+        used += [f for f in item["folders"] if f not in used]
         added += 1
+    _ensure_folders(db, user, used, colors)
     db.commit()
     return {"added": added, "skipped": skipped, "left_out": len(found) - added - skipped}
 
@@ -254,5 +352,5 @@ def import_bookmarks(body: ImportBody, user: User = Depends(tuner_user), db=Depe
 @router.get("/me/bookmarks/export")
 def export_bookmarks(format: str = Query(default="sentrysdr", pattern="^(sentrysdr|gqrx|sdrpp)$"),
                      user: User = Depends(tuner_user), db=Depends(get_db)):
-    text, filename, media = bookmarks.export([_bookmark_view(b) for b in _mine(db, user)], format)
+    text, filename, media = bookmarks.export([_bookmark_view(b) for b in _mine(db, user)], _colors(db, user), format)
     return Response(text, media_type=media, headers={"Content-Disposition": f'attachment; filename="{filename}"'})
