@@ -14,6 +14,7 @@
   import EmailLink from './EmailLink.svelte';
   import Account from './views/Account.svelte';
   import Admin from './views/Admin.svelte';
+  import Tuner from './views/Tuner.svelte';
 
   let user = $state(null);
   let loading = $state(true);
@@ -30,6 +31,7 @@
     { id: 'targets', label: 'Targets', show: can('manage_targets') },
     { id: 'maps', label: 'Maps', show: can('maps') },
     { id: 'messages', label: 'Messages', show: can('maps') },
+    { id: 'tuner', label: 'Tuner', show: can('tuner') },
     { id: 'alerts', label: 'Alerts', show: can('listen_recordings') || can('maps'), count: alertCount },
     { id: 'admin', label: 'Admin', show: user?.role === 'admin' },
     { id: 'account', label: 'My account' },
@@ -126,6 +128,8 @@
       <Scanner />
     {:else if view === 'messages'}
       <Messages {route} {user} />
+    {:else if view === 'tuner'}
+      {#key route}<Tuner {route} {user} />{/key}
     {:else if view === 'account'}
       <Account {user} onChange={refreshUser} />
     {:else if view === 'admin'}

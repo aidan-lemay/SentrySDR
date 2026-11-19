@@ -43,7 +43,7 @@
     eu: ['Europe', [131.525, 131.725, 131.825]],
   };
   const MAX_SPAN_MHZ = 2;
-  const MODE_NAMES = { adsb: 'ADS-B', ais: 'AIS', acars: 'ACARS', rtltcp: 'rtl_tcp' };
+  const MODE_NAMES = { adsb: 'ADS-B', ais: 'AIS', acars: 'ACARS', rtltcp: 'rtl_tcp', tuner: 'Tuner' };
   // These frequencies are the standard ones each decoder listens on.
   const FIXED = { adsb: { modulation: 'adsb', mhz: 1090 }, ais: { modulation: 'ais', mhz: 162 } };
 
@@ -108,7 +108,7 @@
     const body = {
       name: form.name, kind: form.kind,
       frequency_hz: form.kind === 'acars' ? channelsHz[0] : Math.round(Number(fixed ? fixed.mhz : form.mhz) * 1e6),
-      modulation: form.kind === 'acars' ? 'acars' : form.kind === 'rtltcp' ? 'rtltcp' : fixed ? fixed.modulation : form.modulation,
+      modulation: form.kind === 'acars' ? 'acars' : ['rtltcp', 'tuner'].includes(form.kind) ? form.kind : fixed ? fixed.modulation : form.modulation,
       acars_channels: channelsHz, airframes_enabled: form.kind === 'acars' && form.airframes_enabled,
       feeds: feedsBody(form.kind, form.feeds),
       squelch: Number(form.squelch), volume_db: Number(form.volume_db || 0),
@@ -196,6 +196,7 @@
         <option value="adsb">ADS-B aircraft (1090 MHz)</option>
         <option value="ais">AIS ships (162 MHz)</option>
         <option value="acars">ACARS aircraft messages</option>
+        <option value="tuner">Tuner: tune around from the web, like GQRX</option>
         {#if isAdmin || form.kind === 'rtltcp'}<option value="rtltcp">rtl_tcp: raw samples for GQRX or SDR++</option>{/if}
       </select>
     </label>
@@ -234,6 +235,13 @@
         <span class="hint">The program that connects can retune it. Nothing is recorded while an SDR serves rtl_tcp.</span>
       </label>
       <p class="small dim form-buttons">rtl_tcp has no password: whoever can reach it controls the stick. It listens only on the address in that machine's configuration file, on the SDR's own port. Only administrators can use it.</p>
+    {/if}
+    {#if form.kind === 'tuner'}
+      <label class="field"><span>Starting centre frequency (MHz)</span>
+        <input class="mono" type="number" inputmode="decimal" step="0.0001" min="0.5" max="2200" bind:value={form.mhz} required />
+        <span class="hint">Where the SDR starts. Whoever's tuning it can move it anywhere the stick reaches.</span>
+      </label>
+      <p class="small dim form-buttons">An SDR assigned this opens under Tuner, for anyone with the Tuner permission. Nothing is recorded while an SDR is a tuner.</p>
     {/if}
     {#if form.kind === 'audio'}
       <label class="field"><span>Frequency (MHz)</span><input class="mono" type="number" inputmode="decimal" step="0.0001" min="0.5" max="2200" bind:value={form.mhz} required /></label>

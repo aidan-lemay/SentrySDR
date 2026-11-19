@@ -390,6 +390,31 @@ Sharing runs wherever the target runs, on the master or a slave, and stops when 
 - **MarineTraffic, AISHub and VesselFinder:** register a station with the service first. Each gives you a UDP host and port. Tick **Send to** for that service and enter both. Up to six destinations per target.
 - UDP can't confirm delivery, so the Sources page only lists where data is being sent. Check the service's station page to confirm it's arriving.
 
+## Web tuner
+
+Tune around with an SDR from the browser, like GQRX: a spectrum and waterfall, any centre frequency the stick can reach, and your own channel with its own mode. It works the same for an SDR on a slave, through the master.
+
+1. Under **Targets**, add a target of type **Tuner**. Its frequency is only where the SDR starts.
+2. Assign it to an SDR on the **Sources** page. Nothing is recorded while an SDR is a tuner.
+3. Open it from **Tuner** in the menu, or **Open tuner** next to that SDR on Sources. Each tuner opens in its own tab.
+
+On the page:
+
+- **Waterfall and spectrum:** tap or click to tune there, in the step you choose; a mouse wheel steps up and down. Hovering shows the frequency and level under the pointer. **Waterfall range** sets the contrast for you only; until you set it, it's chosen from the first second of signal.
+- **Your channel:** frequency, mode (NFM, AM, WFM mono, WFM stereo, USB, LSB, CW), bandwidth, squelch and volume, with a signal meter. WFM stereo also shows the station's RDS name and text. Press **Start audio** first: browsers don't play sound until you've pressed something.
+- **The SDR:** centre frequency, sample rate (the width of the span, 0.25 to 2.4 MHz) and gain. Type any frequency the stick can tune; there are no bands to set up first.
+- **Bookmarks:** yours, kept with your account on the master, so they're the same on every SDR, on every machine. Choosing one outside the span moves the span there, if you're the one tuning. **Import and export** reads and writes SentrySDR's own JSON, GQRX's `bookmarks.csv` and SDR++'s frequency manager lists. GQRX and SDR++ keep less, so a round trip through them can lose notes, or turn a mode into its nearest equivalent.
+
+**Sharing one SDR:** up to 8 people can be on a tuner at once. One of them tunes it: the centre frequency, sample rate and gain. That's whoever opened it first, then whoever has been on it longest after they leave, and an admin can **Take control**. Everyone else picks their own frequency and mode inside the span, and hears only their own channel.
+
+**Who can use it:** the **Web tuner** permission, which admins and operators have and an admin can give anyone under **Admin > Users**. Opening one is recorded in the audit log. An open tuner checks every 15 seconds that its user is still signed in and allowed, and that the SDR is still a tuner.
+
+**What it costs:** the SDR's own machine does the work and sends the browser only waterfall rows and compressed audio: about 0.1 Mbit/s of waterfall, plus 0.1 to 0.5 Mbit/s of audio depending on the mode. On a desktop computer, a tuner takes about 5% of one core, each extra listener well under 1%, and WFM stereo about 5% more. A Raspberry Pi 4 is roughly 5 to 8 times slower per core, so allow a quarter to a third of a core per tuner, more with stereo. While nobody has it open, a tuner reads the stick and does nothing else.
+
+**numpy:** the tuner needs numpy, which `install.sh` installs from a prebuilt package. There's none for 32-bit Raspberry Pi OS, so on that the install carries on without it, and a tuner target there shows a fault saying so. Everything else works. Use 64-bit Raspberry Pi OS for a slave that should run a tuner.
+
+**How it's kept private:** the tuner runs rtl_tcp bound to 127.0.0.1 on a private port, with SentrySDR as its only client, so unlike an [rtl_tcp target](#rtl_tcp-using-an-sdr-from-gqrx-or-sdr) nothing on the network can connect to the stick. Browsers reach it only through the master, over a websocket signed in like the rest of the site. The websocket only opens for a page on this site's own address, so another site can't open one using your sign-in.
+
 ## rtl_tcp: using an SDR from GQRX or SDR++
 
 An **rtl_tcp** target hands an SDR to `rtl_tcp`, so a program such as GQRX or SDR++ can use it over the network. Nothing is recorded while it does. Each SDR has its own port, so several can serve rtl_tcp at once, on the master and on any slave.
@@ -533,6 +558,7 @@ Outbound, the master connects to the upload and feed services you turn on, and t
 - **An SDR shows "SDR not connected" or "SDR disconnected":** check it's plugged in, `list-sdrs`, that its serial is in `sdr.serials` on the right node, that no other stick has the same serial, and that nothing else (GQRX, SDR++, `dump1090-fa`) has it open. It starts again by itself once it can.
 - **An SDR seems stuck:** select **Restart** on it, or **Restart service** under **Admin > Nodes** (see [USB connections](#usb-connections)).
 - **"couldn't get USB buffer memory", or a tool that exits as soon as it starts, often on whichever SDR started last:** raise the machine's limit; see [USB buffer memory](#usb-buffer-memory).
+- **A tuner shows "the web tuner needs numpy":** install it with `sudo /opt/sentrysdr/.venv/bin/pip install --only-binary=:all: -r /opt/sentrysdr/requirements-tuner.lock`, then restart the service. On 32-bit Raspberry Pi OS there's no package for it; see [Web tuner](#web-tuner).
 - **"tool not installed":** that target needs a decoder. Re-run the install with `--with-decoders`.
 - **Records nothing, or only static:** see [Tuning call detection](#tuning-call-detection) and [USB connections](#usb-connections).
 - **Upload failures** show on each recording, with the service's reply.

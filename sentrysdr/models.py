@@ -299,6 +299,20 @@ class UserWatch(Base):
     created_at: Mapped[float] = mapped_column(default=now)
 
 
+class UserBookmark(Base):
+    """A frequency one user saved in the web tuner. Kept on the master, so it's the same on every SDR."""
+    __tablename__ = "user_bookmarks"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(120))
+    frequency_hz: Mapped[int] = mapped_column()
+    mode: Mapped[str] = mapped_column(String(12), default="nfm")
+    bandwidth_hz: Mapped[int | None] = mapped_column(nullable=True)
+    folder: Mapped[str] = mapped_column(String(60), default="")
+    notes: Mapped[str] = mapped_column(String(500), default="")
+    created_at: Mapped[float] = mapped_column(default=now)
+
+
 class AlertSent(Base):
     """A call or message already emailed to a user, so it goes once."""
     __tablename__ = "alerts_sent"

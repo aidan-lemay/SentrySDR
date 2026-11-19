@@ -10,7 +10,7 @@
   const PERMISSIONS = [
     ['listen_live', 'Listen live'], ['listen_recordings', 'Play recordings'], ['download', 'Download'],
     ['assign', 'Assign and schedule'], ['manage_targets', 'Manage targets'], ['protect', 'Protect recordings'],
-    ['transcribe', 'Request transcripts'], ['maps', 'Maps'],
+    ['transcribe', 'Request transcripts'], ['maps', 'Maps'], ['tuner', 'Web tuner'],
   ];
 
   let tab = $state('users');

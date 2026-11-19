@@ -10,10 +10,13 @@ import asyncio
 import json
 import logging
 
-from fastapi import APIRouter, Depends, Request, WebSocket, WebSocketDisconnect
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
+from pydantic import BaseModel, Field
+from sqlalchemy import func, select
 
-from ..models import Node, Source, User
+from .. import bookmarks
+from ..models import Node, Source, User, UserBookmark
+from ..pipelines import FREQ_MAX_HZ, FREQ_MIN_HZ
 from ..security import client_ip, origin_permitted
 from ..tuner_hub import TunerError
 from .deps import _current_session, ctx_of, effective_permissions, get_db, require
@@ -139,3 +142,108 @@ async def tuner_socket(websocket: WebSocket, source_id: int):
             await websocket.close()
         except RuntimeError:
             pass
+
+
+# --- bookmarks ------------------------------------------------------------------------------
+class BookmarkBody(BaseModel):
+    name: str = Field(default="", max_length=bookmarks.NAME_LENGTH)
+    frequency_hz: int = Field(ge=FREQ_MIN_HZ, le=FREQ_MAX_HZ)
+    mode: str = Field(default="nfm", pattern="^(" + "|".join(bookmarks.MODES) + ")$")
+    bandwidth_hz: int | None = Field(default=None, gt=0, le=250_000)
+    folder: str = Field(default="", max_length=bookmarks.FOLDER_LENGTH)
+    notes: str = Field(default="", max_length=bookmarks.NOTES_LENGTH)
+
+
+def _bookmark_view(b: UserBookmark) -> dict:
+    return {"id": b.id, "name": b.name, "frequency_hz": b.frequency_hz, "mode": b.mode,
+            "bandwidth_hz": b.bandwidth_hz, "folder": b.folder, "notes": b.notes}
+
+
+def _mine(db, user: User) -> list[UserBookmark]:
+    return list(db.scalars(select(UserBookmark).where(UserBookmark.user_id == user.id)
+                           .order_by(UserBookmark.folder, UserBookmark.frequency_hz, UserBookmark.id)))
+
+
+def _count(db, user: User) -> int:
+    return db.scalar(select(func.count()).select_from(UserBookmark).where(UserBookmark.user_id == user.id))
+
+
+@router.get("/me/bookmarks")
+def list_bookmarks(user: User = Depends(require("tuner")), db=Depends(get_db)):
+    return [_bookmark_view(b) for b in _mine(db, user)]
+
+
+@router.post("/me/bookmarks", status_code=201)
+def add_bookmark(body: BookmarkBody, user: User = Depends(require("tuner")), db=Depends(get_db)):
+    if _count(db, user) >= bookmarks.MAX_BOOKMARKS:
+        raise HTTPException(422, f"You have {bookmarks.MAX_BOOKMARKS} bookmarks, the most there can be. Remove some first.")
+    item = bookmarks.clean(body.model_dump())
+    bookmark = UserBookmark(user_id=user.id, **item)
+    db.add(bookmark)
+    db.commit()
+    return _bookmark_view(bookmark)
+
+
+def _own(db, user: User, bookmark_id: int) -> UserBookmark:
+    bookmark = db.get(UserBookmark, bookmark_id)
+    if bookmark is None or bookmark.user_id != user.id:
+        raise HTTPException(404, "Bookmark not found")
+    return bookmark
+
+
+@router.put("/me/bookmarks/{bookmark_id}")
+def edit_bookmark(bookmark_id: int, body: BookmarkBody, user: User = Depends(require("tuner")), db=Depends(get_db)):
+    bookmark = _own(db, user, bookmark_id)
+    for key, value in bookmarks.clean(body.model_dump()).items():
+        setattr(bookmark, key, value)
+    db.commit()
+    return _bookmark_view(bookmark)
+
+
+@router.delete("/me/bookmarks/{bookmark_id}")
+def remove_bookmark(bookmark_id: int, user: User = Depends(require("tuner")), db=Depends(get_db)):
+    db.delete(_own(db, user, bookmark_id))
+    db.commit()
+    return {"ok": True}
+
+
+class ImportBody(BaseModel):
+    format: str = Field(pattern="^(sentrysdr|gqrx|sdrpp)$")
+    text: str = Field(max_length=900_000)
+    replace: bool = False
+
+
+@router.post("/me/bookmarks/import")
+def import_bookmarks(body: ImportBody, user: User = Depends(require("tuner")), db=Depends(get_db)):
+    """Add bookmarks from a file, skipping ones already there. `replace` clears the old ones first."""
+    try:
+        found = bookmarks.parse(body.text, body.format)
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(422, "That file isn't in the format chosen.")
+    if not found:
+        raise HTTPException(422, "No bookmarks found in that file. Check the format chosen matches it.")
+    if body.replace:
+        for old in _mine(db, user):
+            db.delete(old)
+        db.flush()
+    existing = {(b.name, b.frequency_hz, b.mode) for b in _mine(db, user)}
+    room = bookmarks.MAX_BOOKMARKS - len(existing)
+    added = skipped = 0
+    for item in found:
+        if (item["name"], item["frequency_hz"], item["mode"]) in existing:
+            skipped += 1
+            continue
+        if added >= room:
+            break
+        db.add(UserBookmark(user_id=user.id, **item))
+        existing.add((item["name"], item["frequency_hz"], item["mode"]))
+        added += 1
+    db.commit()
+    return {"added": added, "skipped": skipped, "left_out": len(found) - added - skipped}
+
+
+@router.get("/me/bookmarks/export")
+def export_bookmarks(format: str = Query(default="sentrysdr", pattern="^(sentrysdr|gqrx|sdrpp)$"),
+                     user: User = Depends(require("tuner")), db=Depends(get_db)):
+    text, filename, media = bookmarks.export([_bookmark_view(b) for b in _mine(db, user)], format)
+    return Response(text, media_type=media, headers={"Content-Disposition": f'attachment; filename="{filename}"'})

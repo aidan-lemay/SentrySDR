@@ -30,7 +30,7 @@
   const can = (permission) => user.permissions.includes(permission);
   const isAdmin = user.role === 'admin';
   const canAssign = isAdmin || user.permissions.includes('assign');
-  const MODE_LABELS = { adsb: 'ADS-B', rtltcp: 'rtl_tcp' };
+  const MODE_LABELS = { adsb: 'ADS-B', rtltcp: 'rtl_tcp', tuner: 'Tuner' };
   // What to paste into GQRX's Device string. The buffer settings help over a network.
   const gqrxString = (address) => `rtl_tcp=${address},buffers=16,psize=16384`;
   const wildcard = (address) => /^(0\.0\.0\.0|::|\[::\]):/.test(address);
@@ -271,6 +271,9 @@
                 {/if}
                 {#if can('maps') && source.active_target?.kind === 'acars'}
                   <a class="button" href="#/messages">Messages</a>
+                {/if}
+                {#if can('tuner') && source.active_target?.kind === 'tuner'}
+                  <a class="button" href={`#/tuner?source=${source.id}`} target="_blank" rel="noopener">Open tuner</a>
                 {/if}
               </div>
             </td>

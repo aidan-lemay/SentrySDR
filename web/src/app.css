@@ -17,6 +17,7 @@
   --amber: #7a4f00;
   --touch: 44px;
   --viz: #2a78d6;        /* map receiver marks (blue 450), checked on #ffffff */
+  --waterfall: #0b3d91;  /* the tuner waterfall's strongest signal: one hue, from --box up to this */
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -34,6 +35,7 @@
     --green: #8fd98a;
     --amber: #e6c060;
     --viz: #3987e5;        /* blue 400, checked on #202020 */
+    --waterfall: #b8d6ff;
   }
 }
 
@@ -242,3 +244,19 @@ audio { width: 100%; }
   .call audio { max-width: 28rem; }
   audio { max-width: 28rem; }
 }
+
+/* The web tuner. The canvases fill the width; the waterfall keeps one pixel per row. */
+.tuner-view { padding: .4rem; }
+.tuner-readout { min-height: 1.3rem; }
+.tuner-plots { cursor: crosshair; touch-action: manipulation; }
+.tuner-spectrum { display: block; width: 100%; height: 120px; border-bottom: 1px solid var(--rule); }
+.tuner-waterfall { display: block; width: 100%; height: 240px; image-rendering: pixelated; background: var(--box); }
+.tuner-axis { position: relative; height: 1.2rem; }
+.tuner-axis span { position: absolute; transform: translateX(-50%); white-space: nowrap; }
+.tuner-axis span.start { transform: none; }
+.tuner-axis span.end { transform: translateX(-100%); }
+.tuner-axis span.quarter { display: none; }  /* room for five labels only when wide */
+@media (min-width: 760px) { .tuner-axis span.quarter { display: inline; } }
+.tuner-meter { width: 100%; height: 1.2rem; }
+.tuner-volume { display: inline-flex; align-items: center; gap: .4rem; min-height: var(--touch); }
+.tuner-summary { padding: .7rem 0; }

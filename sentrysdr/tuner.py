@@ -498,7 +498,7 @@ class Tuner:
         self.recent = np.concatenate((self.recent, samples))[-self.spectrum.size * 4:]
         self.since_row += len(samples) / self.rate
         if self.since_row >= 1 / WATERFALL_FPS:
-            self.since_row = 0.0
+            self.since_row = min(self.since_row - 1 / WATERFALL_FPS, 1 / WATERFALL_FPS)  # carry over, never bunch up
             rows.append(self.spectrum.row(self.recent))
         audio: dict[int, list[np.ndarray]] = {listener: [] for listener in self.receivers}
         if not self.receivers:

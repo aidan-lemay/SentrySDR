@@ -225,7 +225,7 @@ async def test_sdrs_on_one_machine_start_apart(tmp_path, monkeypatch):
 async def test_a_start_waiting_its_turn_can_be_stopped(tmp_path, monkeypatch):
     monkeypatch.setattr(engine, "START_GAP_SECONDS", 30)
     bins = tmp_path / "bin"
-    install_tool(bins, "AIS-catcher", "#!/bin/sh\nsleep 60\n")
+    install_tool(bins, "AIS-catcher", "#!/bin/sh\nexec sleep 60\n")  # exec: no child left holding the pipes
     sup = supervisor(make_config(tmp_path, bin_dirs=[bins]), [])
     try:
         await sup.apply({"SER1": spec(kind="ais", modulation="ais", frequency_hz=162_000_000),
