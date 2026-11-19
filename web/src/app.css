@@ -162,6 +162,8 @@ legend { font-weight: bold; padding: 0 .3rem; }
 .ranges td { padding: 0 .4rem .4rem 0; }
 .ranges td:last-child { width: 1%; padding-right: 0; }
 .ranges tr.adding td { border-top: 1px dashed var(--rule); padding-top: .4rem; }
+.ranges tr.rating-row td { padding-top: 0; padding-bottom: .6rem; }
+.ratings { display: flex; flex-wrap: wrap; gap: 0 1rem; }
 
 /* --- tables: labelled rows on a phone, ordinary tables when wide --- */
 .table thead { position: absolute; left: -9999px; }

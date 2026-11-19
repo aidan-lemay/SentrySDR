@@ -1,6 +1,7 @@
 <script>
   import { onMount, untrack } from 'svelte';
   import { api, formatMHz, formatTime } from '../lib.js';
+  import Pager from '../Pager.svelte';
 
   let { route, user } = $props();
   const canMark = user.permissions.includes('protect');
@@ -12,6 +13,9 @@
   let search = $state('');
   let showEmpty = $state(false);
   let importantOnly = $state(false);
+  let start = $state('');
+  let end = $state('');
+  let order = $state('desc');
   let error = $state('');
   let loaded = $state(false);
 
@@ -19,7 +23,10 @@
   const idFilter = $derived(new URLSearchParams(route.split('?')[1] ?? '').get('id'));  // from an alert email
 
   // The filters last searched with. Polling uses these, not what's half typed.
-  let applied = { search: '', showEmpty: false, importantOnly: false };
+  const DEFAULTS = { search: '', showEmpty: false, importantOnly: false, start: '', end: '', order: 'desc' };
+  let applied = $state({ ...DEFAULTS });
+  // Anything typed, ticked or linked that isn't the default view: Clear then shows.
+  const filtered = $derived(!!(tailFilter || idFilter || search || showEmpty || importantOnly || start || end || order !== 'desc'));
   let generation = 0;
 
   async function load() {
@@ -27,6 +34,9 @@
     if (applied.search) params.set('search', applied.search);
     if (applied.showEmpty) params.set('show_empty', 'true');
     if (applied.importantOnly) params.set('important', 'true');
+    if (applied.start) params.set('start', new Date(applied.start).getTime() / 1000);
+    if (applied.end) params.set('end', new Date(applied.end).getTime() / 1000);
+    if (applied.order !== 'desc') params.set('order', applied.order);
     if (tailFilter) params.set('tail', tailFilter);
     if (idFilter) params.set('id', idFilter);
     const mine = ++generation;
@@ -54,9 +64,17 @@
 
   function applyFilters(event) {
     event.preventDefault();
-    applied = { search, showEmpty, importantOnly };
+    applied = { search, showEmpty, importantOnly, start, end, order };
     offset = 0;
     load();
+  }
+
+  function clearFilters() {
+    ({ search, showEmpty, importantOnly, start, end, order } = DEFAULTS);
+    applied = { ...DEFAULTS };
+    offset = 0;
+    if (tailFilter || idFilter) location.hash = '#/messages';  // the route change reloads
+    else load();
   }
 
   async function setImportant(message, value) {
@@ -67,16 +85,16 @@
     }
   }
 
-  function page(delta) {
+  function page(delta, top = false) {
     offset = Math.max(0, offset + delta);
     load();
-    scrollTo(0, 0);
+    if (!top) scrollTo(0, 0);
   }
 
   // New messages arrive on the first page by themselves; older pages stay still.
   let polling = false;
   async function poll() {
-    if (polling || offset !== 0 || document.hidden) return;
+    if (polling || offset !== 0 || applied.order !== 'desc' || document.hidden) return;
     polling = true;
     try {
       await load();
@@ -103,13 +121,28 @@
     <div class="pair">
       <input type="search" bind:value={search} aria-label="Search messages" placeholder="Flight, registration, label or text" />
       <button class="main">Search</button>
+      {#if filtered}<button type="button" onclick={clearFilters}>Clear</button>{/if}
     </div>
     <div class="flags">
       <label class="tick small"><input type="checkbox" bind:checked={showEmpty} onchange={applyFilters} /> Show messages with no text</label>
       <label class="tick small"><input type="checkbox" bind:checked={importantOnly} onchange={applyFilters} /> Important only</label>
     </div>
+    <label class="field"><span>Order</span>
+      <select bind:value={order} onchange={applyFilters}>
+        <option value="desc">Newest first</option>
+        <option value="asc">Oldest first</option>
+      </select>
+    </label>
+    <details open={!!(applied.start || applied.end)}>
+      <summary class="small">Date range</summary>
+      <label class="field"><span>From</span><input type="datetime-local" bind:value={start} /></label>
+      <label class="field"><span>To</span><input type="datetime-local" bind:value={end} /></label>
+      <div class="buttons form-buttons"><button class="main">Apply dates</button></div>
+    </details>
   </div>
 </form>
+
+<Pager {offset} {total} size={PAGE} order={applied.order} onpage={(delta) => page(delta, true)} />
 
 <div class="box">
   {#each items as message (message.id)}
@@ -141,10 +174,4 @@
   {/each}
 </div>
 
-{#if total > PAGE}
-  <div class="pager">
-    <button disabled={offset === 0} onclick={() => page(-PAGE)}>Newer</button>
-    <span class="small">{offset + 1} to {Math.min(offset + PAGE, total)} of {total}</span>
-    <button disabled={offset + PAGE >= total} onclick={() => page(PAGE)}>Older</button>
-  </div>
-{/if}
+<Pager {offset} {total} size={PAGE} order={applied.order} onpage={(delta) => page(delta)} />

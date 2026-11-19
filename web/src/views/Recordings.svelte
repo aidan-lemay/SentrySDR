@@ -3,6 +3,7 @@
   import NowPlaying from '../NowPlaying.svelte';
   import { CallPlayer } from '../player.svelte.js';
   import { api, formatMHz, formatTime, formatDuration, formatSize } from '../lib.js';
+  import Pager from '../Pager.svelte';
 
   let { user, route } = $props();
   const PAGE = 25;
@@ -16,6 +17,7 @@
   let end = $state('');
   let protectedOnly = $state(false);
   let importantOnly = $state(false);
+  let order = $state('desc');
   let error = $state('');
   let loaded = $state(false);
   let transcribing = $state({});
@@ -26,7 +28,10 @@
   const callFilter = $derived(new URLSearchParams(route.split('?')[1] ?? '').get('call'));  // from an alert email
 
   // The filters last searched with. Polling uses these, not what's half typed in the form.
-  let applied = { search: '', start: '', end: '', protectedOnly: false, importantOnly: false };
+  const DEFAULTS = { search: '', start: '', end: '', protectedOnly: false, importantOnly: false, order: 'desc' };
+  let applied = $state({ ...DEFAULTS });
+  // Anything typed, ticked or linked that isn't the default view: Clear then shows.
+  const filtered = $derived(!!(sourceFilter || callFilter || search || start || end || protectedOnly || importantOnly || order !== 'desc'));
   let generation = 0;
   let loadFailed = false;
 
@@ -39,6 +44,7 @@
     if (applied.end) params.set('end', new Date(applied.end).getTime() / 1000);
     if (applied.protectedOnly) params.set('protected', 'true');
     if (applied.importantOnly) params.set('important', 'true');
+    if (applied.order !== 'desc') params.set('order', applied.order);
     const mine = ++generation;
     try {
       const reply = await api(`recordings?${params}`);
@@ -69,16 +75,24 @@
 
   function applyFilters(event) {
     event.preventDefault();
-    applied = { search, start, end, protectedOnly, importantOnly };
+    applied = { search, start, end, protectedOnly, importantOnly, order };
     offset = 0;
     load();
+  }
+
+  function clearFilters() {
+    ({ search, start, end, protectedOnly, importantOnly, order } = DEFAULTS);
+    applied = { ...DEFAULTS };
+    offset = 0;
+    if (sourceFilter || callFilter) location.hash = '#/recordings';  // the route change reloads
+    else load();
   }
 
   // New calls, upload results and transcripts show up without reloading. Only the
   // first page follows along, so an older page doesn't shift while you listen.
   let polling = false;
   async function poll() {
-    if (polling || offset !== 0 || document.hidden) return;
+    if (polling || offset !== 0 || applied.order !== 'desc' || document.hidden) return;
     polling = true;
     try {
       await load();
@@ -97,13 +111,18 @@
 
   function toggleAutoplay() {
     player.toggle();
-    if (player.on && offset !== 0) page(-offset);  // new calls arrive on the first page
+    if (player.on && applied.order !== 'desc') {  // new calls arrive on the first page, newest first
+      order = 'desc';
+      applied = { ...applied, order };
+      offset = 0;
+      load();
+    } else if (player.on && offset !== 0) page(-offset);
   }
 
-  function page(delta) {
+  function page(delta, top = false) {
     offset = Math.max(0, offset + delta);
     load();
-    scrollTo(0, 0);
+    if (!top) scrollTo(0, 0);
   }
 
   async function setProtected(call, value) {
@@ -172,17 +191,27 @@
     <div class="pair">
       <input type="search" bind:value={search} aria-label="Search recordings" placeholder="Target, source or transcript" />
       <button class="main">Search</button>
+      {#if filtered}<button type="button" onclick={clearFilters}>Clear</button>{/if}
     </div>
     <label class="tick small"><input type="checkbox" checked={player.on} onchange={toggleAutoplay} /> Autoplay new calls as they finish, matching this search</label>
+    <label class="field"><span>Order</span>
+      <select bind:value={order} onchange={applyFilters} disabled={player.on} title={player.on ? 'Autoplay shows the newest first' : null}>
+        <option value="desc">Newest first</option>
+        <option value="asc">Oldest first</option>
+      </select>
+    </label>
     <details>
       <summary class="small">Date and other filters</summary>
       <label class="field"><span>From</span><input type="datetime-local" bind:value={start} /></label>
       <label class="field"><span>To</span><input type="datetime-local" bind:value={end} /></label>
       <div class="field"><span>Protected</span><label class="tick"><input type="checkbox" bind:checked={protectedOnly} /> Protected calls only</label></div>
       <div class="field"><span>Important</span><label class="tick"><input type="checkbox" bind:checked={importantOnly} /> Important only: your keywords, or marked by hand</label></div>
+      <div class="buttons form-buttons"><button class="main">Apply filters</button></div>
     </details>
   </div>
 </form>
+
+<Pager {offset} {total} size={PAGE} order={applied.order} onpage={(delta) => page(delta, true)} />
 
 <NowPlaying {player} />
 
@@ -233,10 +262,4 @@
   {/each}
 </div>
 
-{#if total > PAGE}
-  <div class="pager">
-    <button disabled={offset === 0} onclick={() => page(-PAGE)}>Newer</button>
-    <span class="small">{offset + 1} to {Math.min(offset + PAGE, total)} of {total}</span>
-    <button disabled={offset + PAGE >= total} onclick={() => page(PAGE)}>Older</button>
-  </div>
-{/if}
+<Pager {offset} {total} size={PAGE} order={applied.order} onpage={(delta) => page(delta)} />

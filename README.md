@@ -336,7 +336,15 @@ Keeping only happens when the time runs out, not when someone turns the schedule
 
 Describe each antenna under **Admin > Antennas**: name, type, length and the frequency ranges it works on. Use **+ Add** for each band, so a dual-band antenna gets two ranges. Then choose the antenna on each SDR under **Admin > SDR sources**. One antenna can feed several SDRs, for example through a splitter.
 
-If a target is outside every range of an SDR's antenna, the target pickers mark it **(may not suit)**, choosing it says why, and assigning or scheduling it shows a warning. It still works, because an antenna often hears more than its rated bands. An antenna with no ranges isn't checked. Removing an antenna leaves its SDRs with none set.
+Rate each range **Ideal**, **Usable** or **Deaf**. Ranges can overlap, and the best rating covering a frequency counts. With 100 to 200 MHz Ideal and 80 to 220 MHz Usable, 110 MHz is Ideal and 205 MHz is Usable. So a Deaf range only matters where no Ideal or Usable range also covers it. Ranges saved before ratings existed count as Ideal.
+
+How a target's frequency rates on an SDR's antenna:
+
+- **Ideal:** nothing is said.
+- **Usable:** the target pickers mark it **(antenna usable)**, and assigning or scheduling it adds a note.
+- **Deaf, or outside every range:** the pickers mark it **(may not suit)**, choosing it says why, and assigning or scheduling it shows a warning.
+
+Any of them can still be assigned, because an antenna often hears more than its rated bands. An antenna with no ranges isn't checked. Removing an antenna leaves its SDRs with none set.
 
 An older database's antenna type and frequency range on each source are turned into antennas on first start. Sources with the same type and range share one.
 
@@ -353,7 +361,7 @@ Under **Admin > SDR sources**, each SDR can record what it can do: its tuner, fr
 
 ACARS is the short text messages aircraft send on VHF. An ACARS target lists the channels to decode: **North America** and **Europe** fill in the usual ones, and **+ Add** adds others. One stick decodes all of a target's channels at once with `acarsdec`, so they must fit within 2 MHz. North America's fifth channel, 129.125 MHz, doesn't fit with the other four, so it needs its own target and stick. Gain matters: acarsdec's AGC usually sits at maximum, so set a fixed gain on the stick.
 
-Messages appear on the **Messages** page, newest first, and update by themselves. Search by flight, registration, label or text. Messages with no text, mostly link checks, are hidden unless you tick **Show messages with no text**. On the ADS-B map, an aircraft that sent messages in the last hour links to them, matched by registration through tar1090's aircraft database. Flight numbers aren't matched, because ACARS and ADS-B use different airline codes. If two sticks hear the same message, it's kept once.
+Messages appear on the **Messages** page, newest first, and update by themselves. Search by flight, registration, label or text, choose **Oldest first**, or narrow it to a date range. **Clear** goes back to the full list, newest first, including from a link to one aircraft's messages. Recordings has the same order and Clear, and both pages, like Emergencies, have Newer and Older above the list as well as below. New messages and calls only appear by themselves on the first page, newest first. Messages with no text, mostly link checks, are hidden unless you tick **Show messages with no text**. On the ADS-B map, an aircraft that sent messages in the last hour links to them, matched by registration through tar1090's aircraft database. Flight numbers aren't matched, because ACARS and ADS-B use different airline codes. If two sticks hear the same message, it's kept once.
 
 To feed [airframes.io](https://airframes.io), set a **Station ID** under **Admin > Uploads and feeds**, for example `KE-KSEA-ACARS`: your initials, the nearest airport's ICAO code, then ACARS. Then tick **Feed messages to airframes.io** on the target. No account is needed. Messages are kept for 30 days by default, set under **Admin > Settings**. Messages from a slave are lost while its link to the master is down.
 

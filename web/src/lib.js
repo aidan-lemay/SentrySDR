@@ -60,11 +60,18 @@ export const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 
 export const formatMHz = (hz) => (hz == null ? '' : `${(hz / 1e6).toFixed(4).replace(/0{1,2}$/, '')} MHz`);
 const plainMHz = (hz) => String(+(hz / 1e6).toFixed(4));
+// How well an antenna works over a range, best first; where ranges overlap the best wins. Keep in step with routes_radio.py.
+export const RATINGS = [['ideal', 'Ideal'], ['usable', 'Usable'], ['deaf', 'Deaf']];
+const ratingOf = (range) => (RATINGS.some(([id]) => id === range[2]) ? range[2] : 'ideal');
 export const formatRanges = (ranges) => (ranges?.length
-  ? `${ranges.map(([low, high]) => `${plainMHz(low)} to ${plainMHz(high)}`).join(', ')} MHz`
+  ? `${ranges.map((r) => `${plainMHz(r[0])} to ${plainMHz(r[1])}${ratingOf(r) === 'ideal' ? '' : ` (${ratingOf(r)})`}`).join(', ')} MHz`
   : 'Not set');
-// An antenna with no ranges entered isn't judged, as on the server.
-export const antennaCovers = (ranges, hz) => !ranges?.length || ranges.some(([low, high]) => low <= hz && hz <= high);
+// ideal, usable or deaf; 'outside' when no range covers it; null when there are no ranges to judge by, as on the server.
+export function antennaRating(ranges, hz) {
+  if (!ranges?.length) return null;
+  const found = ranges.filter(([low, high]) => low <= hz && hz <= high).map(ratingOf);
+  return RATINGS.map(([id]) => id).find((id) => found.includes(id)) ?? 'outside';
+}
 export const ANTENNA_UNITS = [['in', 'inches'], ['ft', 'feet'], ['cm', 'cm'], ['m', 'metres']];
 export const formatTime = (epoch) => (epoch ? new Date(epoch * 1000).toLocaleString() : 'Never');
 
@@ -145,11 +152,15 @@ export function stickProblems(source, target) {
   if ((source.cap_min_hz != null && hz < source.cap_min_hz) || (source.cap_max_hz != null && hz > source.cap_max_hz)) found.push('outside stick range');
   const needed = neededUses(target);
   if (source.uses?.length && needed.length && !needed.some((use) => source.uses.includes(use))) found.push('stick not set up for this');
-  if (!antennaCovers(source.antenna_ranges, hz)) found.push('outside antenna range');
+  const rating = antennaRating(source.antenna_ranges, hz);
+  if (rating === 'outside') found.push('outside antenna range');
+  if (rating === 'deaf') found.push('antenna deaf here');
   return found;
 }
+// A softer note than a problem: the antenna works here, just not at its best.
+export const antennaUsable = (source, target) => !!(source && target) && antennaRating(source.antenna_ranges, target.frequency_hz) === 'usable';
 // Short, so a long target name still fits in a dropdown. The hint below it gives the reasons.
-export const problemNote = (source, target) => (stickProblems(source, target).length ? ' (may not suit)' : '');
+export const problemNote = (source, target) => (stickProblems(source, target).length ? ' (may not suit)' : antennaUsable(source, target) ? ' (antenna usable)' : '');
 export const formatRange = (low, high) => (low == null && high == null ? 'Not set' : `${low == null ? '?' : plainMHz(low)} to ${high == null ? '?' : plainMHz(high)} MHz`);
 
 // Feeding other services. Keep in step with sentrysdr/feeds.py.

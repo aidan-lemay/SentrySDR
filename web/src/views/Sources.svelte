@@ -1,6 +1,6 @@
 <script>
   import { onMount } from 'svelte';
-  import { api, DEFAULT_GAIN_DB, feedLabel, formatMHz, formatTime, formatDuration, nearestStep, problemNote, STATE_LABELS, stickProblems } from '../lib.js';
+  import { api, DEFAULT_GAIN_DB, feedLabel, formatMHz, formatTime, formatDuration, nearestStep, antennaUsable, problemNote, STATE_LABELS, stickProblems } from '../lib.js';
   import Notice from '../Notice.svelte';
   import { NOTICE_MS } from '../notice.svelte.js';
   import GainField from '../GainField.svelte';
@@ -309,6 +309,8 @@
                     </select>
                     {#if draft.target !== '' && stickProblems(source, targets.find((t) => t.id === Number(draft.target))).length}
                       <span class="hint st-warn">This SDR may not suit that target: {stickProblems(source, targets.find((t) => t.id === Number(draft.target))).join(', ')}. You can still assign it.</span>
+                    {:else if draft.target !== '' && antennaUsable(source, targets.find((t) => t.id === Number(draft.target)))}
+                      <span class="hint">Its antenna is usable at that frequency, but not ideal.</span>
                     {/if}
                   </label>
                   <div class="buttons form-buttons"><button class="main" disabled={source.locked && !isAdmin} onclick={() => assign(source)}>Assign</button></div>
