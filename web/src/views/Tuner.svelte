@@ -54,6 +54,7 @@
   let connected = $state(false);
   let audioOn = $state(false);
   let centerText = $state('');
+  let centerEdited = false;  // typed but not set yet: updates from the server leave it alone
   let listenText = $state('');
   let hover = $state(null);  // { hz, db } under the pointer
   let gainAuto = $state(true);
@@ -114,6 +115,7 @@
       error = 'Type a centre frequency in MHz, like 146.52.';
       return;
     }
+    centerEdited = false;
     send({ t: 'center', hz });
   }
 
@@ -155,7 +157,7 @@
     else if (message.t === 'state') {
       const first = !sdr.rate && message.rate;
       sdr = message;
-      if (message.center_hz && document.activeElement?.id !== 'tuner-center') centerText = mhz(message.center_hz);
+      if (message.center_hz && !centerEdited) centerText = mhz(message.center_hz);
       if (message.gain_db === null) gainAuto = true;
       else if (message.gain_db !== undefined) { gainAuto = false; gainValue = message.gain_db; }
       if (first) {
@@ -536,7 +538,7 @@
       <form class="field" onsubmit={(event) => { event.preventDefault(); setCenter(parseMHz(centerText)); }}>
         <span>Centre frequency (MHz)</span>
         <div class="pair">
-          <input id="tuner-center" class="mono" inputmode="decimal" bind:value={centerText} autocomplete="off" disabled={!sdr.you_control} />
+          <input id="tuner-center" class="mono" inputmode="decimal" bind:value={centerText} oninput={() => (centerEdited = true)} autocomplete="off" disabled={!sdr.you_control} />
           <button class="main" disabled={!sdr.you_control}>Set</button>
         </div>
         <span class="hint">Any frequency the stick can tune. Everyone on this SDR hears inside the span around it.</span>
