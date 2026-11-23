@@ -10,7 +10,7 @@ import pytest
 pytest.importorskip("numpy")
 
 from sentrysdr import tuner_session  # noqa: E402
-from sentrysdr.tuner_hub import TunerError, TunerHub  # noqa: E402
+from sentrysdr.tuner_hub import QUEUE_SIZE, WATERFALL_ROOM, TunerError, TunerHub  # noqa: E402
 from sentrysdr.web.routes_nodes import decode_tuner_frame  # noqa: E402
 
 from .conftest import add_user, client_for, make_config  # noqa: E402
@@ -188,6 +188,23 @@ def test_hub_routes_frames_and_ownership():
     hub.leave(key, first)
     hub.leave(key, third)
     assert key not in hub.rooms and sent[-1] == {"op": "sync", "watching": False, "listeners": {}}
+
+
+def test_a_backed_up_browser_keeps_room_for_audio():
+    hub = TunerHub(lambda *_: True)
+    key = (1, "S")
+    viewer = hub.join(key, 1, "Ada", is_admin=False)
+    while not viewer.queue.empty():
+        viewer.queue.get_nowait()
+    row = tuner_session.waterfall_frame(146_000_000, 2_048_000, b"\x01" * 4)
+    sound = tuner_session.audio_frame(viewer.id, 16000.0, 1, -30.0, True, b"\x80" * 8)
+    for _ in range(QUEUE_SIZE):
+        hub.from_node(1, "S", "frame", row)
+    assert viewer.queue.qsize() == WATERFALL_ROOM  # rows stop at half full
+    for _ in range(QUEUE_SIZE):
+        hub.from_node(1, "S", "frame", sound)
+    kinds = [viewer.queue.get_nowait()[1][:1] for _ in range(viewer.queue.qsize())]
+    assert kinds.count(b"A") == QUEUE_SIZE - WATERFALL_ROOM  # the other half is audio's
 
 
 def test_an_admin_can_take_the_tuner():

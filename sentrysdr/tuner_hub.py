@@ -33,6 +33,10 @@ SAMPLE_RATES = (250_000, 1_024_000, 1_536_000, 1_800_000, 2_048_000, 2_400_000)
 MODES = ("nfm", "am", "wfm", "wfm_stereo", "usb", "lsb", "cw")
 MAX_VIEWERS = 8
 QUEUE_SIZE = 96  # frames waiting for one browser; past this its frames are dropped, not buffered
+# Waterfall rows stop being queued once this many frames are waiting, so on a link too slow for
+# everything the rest of the queue is kept for audio and messages: a missing row is barely seen,
+# a missing piece of audio is heard.
+WATERFALL_ROOM = QUEUE_SIZE // 2
 SYNC_SECONDS = 3.0
 COMMANDS_PER_SECOND = 30
 
@@ -50,7 +54,9 @@ class Viewer:
     allowance: float = COMMANDS_PER_SECOND
     checked_at: float = field(default_factory=time.monotonic)
 
-    def put(self, item: tuple[str, object]) -> None:
+    def put(self, item: tuple[str, object], waterfall: bool = False) -> None:
+        if waterfall and self.queue.qsize() >= WATERFALL_ROOM:
+            return  # falling behind: let audio through first
         try:
             self.queue.put_nowait(item)
         except asyncio.QueueFull:
@@ -194,7 +200,7 @@ class TunerHub:
         if kind == "frame" and isinstance(data, (bytes, bytearray)) and data:
             if data[:1] == b"W":
                 for viewer in room.viewers.values():
-                    viewer.put(("bytes", bytes(data)))
+                    viewer.put(("bytes", bytes(data)), waterfall=True)
             elif data[:1] == b"A" and len(data) >= 5:
                 viewer = room.viewers.get(struct.unpack_from("<I", data, 1)[0])
                 if viewer is not None:

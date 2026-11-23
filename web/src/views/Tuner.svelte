@@ -188,8 +188,12 @@
   }
 
   function onText(message) {
-    if (message.t === 'hello') sourceName = message.source;
-    else if (message.t === 'error') {
+    if (message.t === 'hello') {
+      sourceName = message.source;
+      // A reconnect is a new listener to the server, with no channel yet: tell it ours again,
+      // or the waterfall comes back but the audio doesn't. (On the first connect there's none to send.)
+      sendListen();
+    } else if (message.t === 'error') {
       if (message.fatal) fatal = message.detail;
       else error = message.detail;
     } else if (message.t === 'rx') rx = message;
@@ -243,12 +247,14 @@
     MULAW[code] = negative ? -x : x;
   }
 
+  const LEAD_START = 0.25, LEAD_MAX = 1.0;  // seconds of audio kept in hand
+
   function startAudio() {
     const context = new AudioContext();
     const gain = context.createGain();
     gain.gain.value = muted ? 0 : volume;
     gain.connect(context.destination);
-    audio = { context, gain, next: 0 };
+    audio = { context, gain, next: 0, lead: LEAD_START };
     audioOn = true;
   }
 
@@ -267,11 +273,18 @@
       const out = buffer.getChannelData(c);
       for (let i = 0; i < frames; i++) out[i] = MULAW[bytes[i * channels + c]];
     }
+    // The browser can suspend audio (another app took the output, a headset was unplugged). Its clock
+    // stops then, so ask for it back rather than dropping every piece from here on.
+    if (context.state !== 'running') context.resume().catch(() => {});
     const now = context.currentTime;
-    // A quarter of a second in hand smooths out the network. Fallen behind: start again a little ahead.
+    // Audio in hand smooths out the network: a quarter of a second to start. Each time it runs dry
+    // the network is jumpier than that (a tunnel or proxy can be), so keep a little more, up to LEAD_MAX.
     // Too far ahead (the tab was asleep): drop this piece so the delay doesn't keep growing.
-    if (audio.next < now + 0.05) audio.next = now + 0.25;
-    if (audio.next > now + 1.0) return;
+    if (audio.next < now + 0.05) {
+      if (audio.next) audio.lead = Math.min(LEAD_MAX, audio.lead + 0.1);
+      audio.next = now + audio.lead;
+    }
+    if (audio.next > now + audio.lead + 0.75) return;
     const node = context.createBufferSource();
     node.buffer = buffer;
     node.connect(audio.gain);
