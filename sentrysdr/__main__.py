@@ -139,9 +139,9 @@ def cmd_measure(cfg, serial: str, mhz: float, mode: str, gain: float | None, ppm
         print("No samples read. If this SDR has a target, clear it or stop the service first.", file=sys.stderr)
         print(detail[-1] if detail else "rtl_fm gave no error.", file=sys.stderr)
         return 1
-    summary = pipelines.measure_summary(levels)
-    print(f"Level: lowest {summary['low']}, typical {summary['typical']}, highest {summary['high']}")
-    print(f"Suggested squelch: {summary['suggested']}")
+    summary = pipelines.measure_summary(levels, rate)
+    print(f"Noise: lowest {summary['low']:g} dB, typical {summary['typical']:g} dB, highest {summary['high']:g} dB")
+    print(f"Suggested squelch: {summary['suggested']:g} dB")
     if summary["moved"]:
         print("The level moved a lot, so something may have transmitted. Measure again if this looks wrong.")
     print("This is only valid for this frequency, mode and gain, and with this antenna.")

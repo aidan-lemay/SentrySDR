@@ -31,8 +31,13 @@ DSD_OUTPUT_RATE = 8000
 FREQ_MIN_HZ = 500_000
 FREQ_MAX_HZ = 2_200_000_000
 # Noise peaks above its average and drifts as a stick warms up. In testing, quiet readings
-# stayed under 1.3x within a run, but 1.6x still let one stick open by itself.
-SQUELCH_MARGIN = 2.0
+# stayed under 1.3x within a run, but 1.6x still let one stick open by itself: 2x is 6 dB.
+SQUELCH_MARGIN_DB = 6.0
+# Squelch is in dB: a channel's power against full scale, as the web tuner's meter and squelch
+# show it. None is off, recording everything. rtl_fm gets it converted to its own scale.
+SQUELCH_DB_MIN = -130.0
+SQUELCH_DB_MAX = 0.0
+RTL_FM_MINIMUM_RATE = 1_000_000  # rtl_fm's MINIMUM_RATE: it reads the stick at least this fast
 VOLUME_MIN_DB = -20.0
 VOLUME_MAX_DB = 30.0
 
@@ -54,7 +59,7 @@ def sanitize_spec(spec: dict) -> dict:
             "kind": str(spec.get("kind", "audio")),
             "frequency_hz": int(spec["frequency_hz"]),
             "modulation": str(spec["modulation"]),
-            "squelch": int(spec.get("squelch", 0)),
+            "squelch": None if spec.get("squelch") is None else round(float(spec["squelch"]), 1),
             "gain_db": None if spec.get("gain_db") is None else float(spec["gain_db"]),
             "ppm": int(spec.get("ppm", 0)),
             "volume_db": float(spec.get("volume_db") or 0),
@@ -88,7 +93,7 @@ def sanitize_spec(spec: dict) -> dict:
         raise SpecError("bad modulation")
     if not FREQ_MIN_HZ <= clean["frequency_hz"] <= FREQ_MAX_HZ:
         raise SpecError("frequency out of range")
-    if not 0 <= clean["squelch"] <= 100000:
+    if clean["squelch"] is not None and not SQUELCH_DB_MIN <= clean["squelch"] <= SQUELCH_DB_MAX:
         raise SpecError("squelch out of range")
     if not -500 <= clean["ppm"] <= 500:
         raise SpecError("ppm out of range")
@@ -97,18 +102,47 @@ def sanitize_spec(spec: dict) -> dict:
     return clean
 
 
+# --- squelch: dB, and rtl_fm's own scale ---------------------------------------------------
+# rtl_fm reads the stick at `rate * d` (d = MINIMUM_RATE // rate + 1), takes 127 off each byte,
+# and sums every d samples into one, so a steady signal comes out d times larger. Its squelch
+# (-l) is the RMS of those I and Q values. The tuner's dB is the channel's mean |I + jQ|^2, with
+# each byte scaled to +-1 (divided by 128). So a level L is 20 log10(L * sqrt(2) / (128 d)) dB.
+def rtl_fm_decimation(rate: int) -> int:
+    return RTL_FM_MINIMUM_RATE // rate + 1
+
+
+def level_to_db(level: float, rate: int) -> float:
+    """rtl_fm's squelch scale, at this rtl_fm sample rate, as dB."""
+    if level <= 0:
+        return SQUELCH_DB_MIN
+    db = 20 * math.log10(level * math.sqrt(2) / (128 * rtl_fm_decimation(rate)))
+    return max(SQUELCH_DB_MIN, round(db, 1))
+
+
+def db_to_level(db: float, rate: int) -> int:
+    """dB as rtl_fm's squelch scale. Never 0, which would turn its squelch off."""
+    return max(1, round(128 * rtl_fm_decimation(rate) * 10 ** (db / 20) / math.sqrt(2)))
+
+
+def rtl_fm_squelch(spec: dict) -> str:
+    if spec["squelch"] is None:
+        return "0"  # off
+    return str(db_to_level(spec["squelch"], measure_rate(spec["modulation"])))
+
+
 def rtl_fm_args(cfg: Config, index: int, spec: dict) -> list[str]:
     modulation = spec["modulation"]
+    squelch = rtl_fm_squelch(spec)
     args = [cfg.binary("rtl_fm") or "rtl_fm", "-d", str(index), "-f", str(spec["frequency_hz"])]
     if modulation == "nfm":
-        args += ["-M", "fm", "-s", str(PCM_RATE), "-l", str(spec["squelch"]), "-E", "dc"]
+        args += ["-M", "fm", "-s", str(PCM_RATE), "-l", squelch, "-E", "dc"]
     elif modulation == "am":
-        args += ["-M", "am", "-s", str(PCM_RATE), "-l", str(spec["squelch"]), "-E", "dc"]
+        args += ["-M", "am", "-s", str(PCM_RATE), "-l", squelch, "-E", "dc"]
     elif modulation == "wfm":
-        args += ["-M", "fm", "-s", "170k", "-A", "fast", "-r", str(PCM_RATE), "-l", str(spec["squelch"]), "-E", "deemp"]
+        args += ["-M", "fm", "-s", "170k", "-A", "fast", "-r", str(PCM_RATE), "-l", squelch, "-E", "deemp"]
     elif modulation in DIGITAL:
         # Decoders need the unfiltered discriminator signal at 48 kHz.
-        args += ["-M", "fm", "-s", str(DIGITAL_INPUT_RATE), "-l", str(spec["squelch"])]
+        args += ["-M", "fm", "-s", str(DIGITAL_INPUT_RATE), "-l", squelch]
     else:
         raise SpecError(f"{modulation} is not an rtl_fm mode")
     if spec.get("gain_db") is not None:  # omitting -g selects tuner AGC
@@ -119,7 +153,7 @@ def rtl_fm_args(cfg: Config, index: int, spec: dict) -> list[str]:
 
 
 def measure_rate(modulation: str) -> int:
-    """rtl_fm's sample rate for a mode. Its squelch scale differs between rates."""
+    """rtl_fm's sample rate for a mode, which its squelch scale depends on. Matches rtl_fm_args."""
     if modulation == "wfm":
         return 170_000
     return DIGITAL_INPUT_RATE if modulation in DIGITAL else PCM_RATE
@@ -153,16 +187,17 @@ def signal_levels(pcm: bytes, rate: int, settle_seconds: float = 1.0) -> list[fl
     return sorted(levels)
 
 
-def suggest_squelch(levels: list[float]) -> int:
-    """A level above the noise. Uses the quiet end so a brief call doesn't inflate it."""
-    return math.ceil(levels[len(levels) // 10] * SQUELCH_MARGIN)
+def suggest_squelch(levels: list[float], rate: int) -> float:
+    """A squelch in whole dB above the noise. Uses the quiet end so a brief call doesn't inflate it."""
+    return float(min(SQUELCH_DB_MAX, math.ceil(level_to_db(levels[len(levels) // 10], rate) + SQUELCH_MARGIN_DB)))
 
 
-def measure_summary(levels: list[float]) -> dict:
+def measure_summary(levels: list[float], rate: int) -> dict:
+    """The noise in dB, on the same scale as the squelch and the web tuner's meter."""
     low, typical, high = levels[len(levels) // 10], levels[len(levels) // 2], levels[-1]
     return {
-        "low": round(low), "typical": round(typical), "high": round(high),
-        "suggested": suggest_squelch(levels),
+        "low": level_to_db(low, rate), "typical": level_to_db(typical, rate), "high": level_to_db(high, rate),
+        "suggested": suggest_squelch(levels, rate),
         "moved": high > low * 2,  # something probably transmitted during the reading
     }
 

@@ -437,7 +437,7 @@ class Worker:
                 drain.cancel()
             levels = await asyncio.to_thread(pipelines.signal_levels, bytes(pcm), rate)
             if levels:
-                return pipelines.measure_summary(levels)
+                return pipelines.measure_summary(levels, rate)
         if tail.usbfs:
             raise MeasureError(f"The SDR {USBFS_FAULT}")
         raise MeasureError(f"No samples from the SDR. {tail[-1] if tail else ''}".strip()[:300])
@@ -585,7 +585,7 @@ class Worker:
             tasks.append(asyncio.create_task(_log_stderr(self.serial, proc.stderr, tail, self._on_reset)))
             self._publish("listening", "")
             open_since: float | None = None
-            warn_stuck = spec["squelch"] > 0 and not digital
+            warn_stuck = spec["squelch"] is not None and not digital
 
             while True:
                 try:

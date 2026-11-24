@@ -195,7 +195,7 @@ RTL-SDRs are USB 2.0 devices, and a bad connection can look like a radio problem
 - failed USB resets, and a stick dropping off the bus
 - `rtl_fm` taking about 4 seconds to start instead of about 1, or failing with `Failed to set center freq`
 - `rtl_fm` not responding when told to stop
-- noise readings around 60 times too high, which would suggest a squelch that misses real calls (this one lined up with the reset errors, but we couldn't reproduce it)
+- noise readings around 35 dB too high, which would suggest a squelch that misses real calls (this one lined up with the reset errors, but we couldn't reproduce it)
 
 The same sticks ran with no USB errors when plugged straight into the computer. We didn't separate USB 3.0 from the stacked hubs as the cause, so avoid both. Short extension cables were fine.
 
@@ -436,11 +436,20 @@ An **rtl_tcp** target hands an SDR to `rtl_tcp`, so a program such as GQRX or SD
 
 ## Tuning call detection
 
-A call is whatever passes the target's **squelch level**. If the level is below the noise, the squelch never closes, and you get back-to-back `max_call_seconds` recordings of static. After 10 minutes open, the Sources page shows a warning. A squelch of `0` records continuously, split into `max_call_seconds` pieces.
+A call is whatever passes the target's **squelch**, in dB. If it's below the noise, the squelch never closes, and you get back-to-back `max_call_seconds` recordings of static. After 10 minutes open, the Sources page shows a warning. Leave the squelch empty to record continuously, split into `max_call_seconds` pieces.
 
-The noise level changes a lot with stick, frequency, mode, gain and antenna, so one number doesn't suit every target. On an R828D stick with AGC, for example, noise read about 64 at 444.85 MHz but about 540 at 154 MHz.
+The noise level changes a lot with stick, frequency, mode, gain and antenna, so one number doesn't suit every target. On an R828D stick with AGC, for example, noise read about −39 dB at 444.85 MHz but about −20 dB at 154 MHz.
 
-**Squelch profiles** hold this per stick and target. On the Sources page, open **Squelch profiles** on an SDR, choose a target and gain, and select **Measure noise** while the channel is quiet. Measuring works for SDRs on slaves too, and pauses that SDR for about 10 seconds. Save the suggestion, then raise it if noise still records or lower it if weak calls are missed.
+**Squelch uses the web tuner's scale:** a channel's power in dB against the stick's full scale, the number on the tuner's signal meter. So you can find a level in the [web tuner](#web-tuner) and type it into a target or profile. Two things keep the numbers comparable:
+
+- **Use the same stick and gain.** Gain moves the noise and the signal together, so a level found at 30 dB of gain doesn't suit 40 dB, or AGC.
+- **Allow a dB or two for noise.** The recorder hears a slightly wider channel than the tuner's default filter, about 16 kHz against 12.5 kHz for NFM and 10 kHz for AM, so it reads noise about 1 dB higher for NFM and 2 dB higher for AM. A steady signal reads the same in both.
+
+The recorder can't use a squelch below about −75 dB for NFM and AM, −66 dB for digital voice, or −55 dB for WFM. Anything lower acts like that floor, which is still far below any stick's noise.
+
+Squelch numbers from older versions are converted to dB when you upgrade.
+
+**Squelch profiles** hold this per stick and target. On the Sources page, open **Squelch profiles** on an SDR, choose a target and gain, and select **Measure noise** while the channel is quiet. Measuring works for SDRs on slaves too, and pauses that SDR for about 10 seconds. It suggests a squelch 6 dB above the quiet end of the noise. Save the suggestion, then raise it if noise still records or lower it if weak calls are missed.
 
 - A profile replaces the target's squelch and the source's gain when that target runs on that SDR. Other SDRs and targets keep their own settings.
 - Changing a target's frequency or mode removes its profiles, because the readings no longer apply.

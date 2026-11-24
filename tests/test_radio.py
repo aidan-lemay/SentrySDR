@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import math
 import sqlite3
 import subprocess
 import time
@@ -511,20 +512,51 @@ def test_no_job_when_target_upload_disabled(ctx, tmp_path, admin):
 def spec(**overrides):
     return pipelines.sanitize_spec({
         "recorder_id": 1, "source_id": 1, "target_id": 1, "frequency_hz": 444_444_000,
-        "modulation": "nfm", "squelch": 50, **overrides,
+        "modulation": "nfm", "squelch": -41.1, **overrides,
     })
 
 
 def test_nfm_uses_tuner_agc_when_gain_unset(ctx):
     args = pipelines.rtl_fm_args(ctx.cfg, 2, spec())
     assert args[1:5] == ["-d", "2", "-f", "444444000"] and "-g" not in args
-    assert args[args.index("-l") + 1] == "50"
+    assert args[args.index("-l") + 1] == "50"  # -41.1 dB at rtl_fm's 16 kHz
 
 
-@pytest.mark.parametrize("modulation", ["nfm", "am", "wfm", "dmr", "p25p1"])
-def test_every_rtl_fm_mode_uses_the_targets_squelch(ctx, modulation):
-    args = pipelines.rtl_fm_args(ctx.cfg, 0, spec(modulation=modulation, squelch=137))
-    assert args[args.index("-l") + 1] == "137"
+# rtl_fm's scale depends on its rate: 16 kHz sums 63 samples, 170 kHz 6, 48 kHz 21.
+@pytest.mark.parametrize("modulation, level", [("nfm", "101"), ("am", "101"), ("wfm", "10"), ("dmr", "34"), ("p25p1", "34")])
+def test_every_rtl_fm_mode_uses_the_targets_squelch_on_its_own_scale(ctx, modulation, level):
+    args = pipelines.rtl_fm_args(ctx.cfg, 0, spec(modulation=modulation, squelch=-35.0))
+    assert args[args.index("-l") + 1] == level
+
+
+def test_squelch_off_and_extremes(ctx):
+    def level(**overrides):
+        args = pipelines.rtl_fm_args(ctx.cfg, 0, spec(**overrides))
+        return args[args.index("-l") + 1]
+    assert level(squelch=None) == "0"  # off: records everything
+    assert level(squelch=-130.0) == "1"  # never rounds down to 0, which would turn it off
+    assert level(squelch=0.0) == "5702"  # a full-scale signal
+
+
+# rtl_fm's levels are whole numbers, so quiet ones are coarse: within half a step from -45 dB up.
+@pytest.mark.parametrize("db", [-45.0, -41.1, -39.0, -20.0, -3.3])
+def test_squelch_db_and_rtl_fm_levels_agree_both_ways(db):
+    for rate in (16000, 48000):
+        assert pipelines.level_to_db(pipelines.db_to_level(db, rate), rate) == pytest.approx(db, abs=0.5)
+
+
+def test_the_quietest_squelch_rtl_fm_can_take_depends_on_its_rate():
+    # Its smallest level is 1: anything quieter acts the same, which is far below any stick's noise.
+    assert pipelines.level_to_db(1, 16000) == -75.1 and pipelines.level_to_db(1, 48000) == -65.6
+    assert pipelines.db_to_level(-100.0, 48000) == 1
+
+
+def test_rtl_fm_levels_match_the_tuners_db():
+    """A steady carrier at amplitude a (bytes 127 +- 128a) is 20 log10(a) dB in the tuner. rtl_fm sums 63
+    samples of 128a into 8064a, and its RMS over I and Q is 8064a / sqrt(2)."""
+    a = 0.05
+    tuner_db = 20 * math.log10(a)
+    assert pipelines.level_to_db(8064 * a / math.sqrt(2), 16000) == pytest.approx(tuner_db, abs=0.1)
 
 
 def test_measure_reads_at_the_targets_rate_and_gain(ctx):
@@ -545,7 +577,12 @@ def test_signal_levels_skip_settling_and_match_rms():
 
 def test_suggested_squelch_ignores_a_brief_transmission():
     pcm = iq(0, 1) + iq(64, 9) + iq(3000, 1)
-    assert pipelines.suggest_squelch(pipelines.signal_levels(pcm, 16000)) == 128
+    assert pipelines.suggest_squelch(pipelines.signal_levels(pcm, 16000), 16000) == -33.0  # noise -39 dB, plus 6
+
+
+def test_measure_summary_is_in_db():
+    summary = pipelines.measure_summary([64.0] * 20, 16000)
+    assert summary == {"low": -39.0, "typical": -39.0, "high": -39.0, "suggested": -33.0, "moved": False}
 
 
 def test_signal_levels_ignore_a_partial_sample_and_too_little_audio():
@@ -559,7 +596,7 @@ def test_manual_gain_and_ppm_passed(ctx):
 
 @pytest.mark.parametrize("bad", [
     {"modulation": "nfm; rm -rf /"}, {"frequency_hz": 1}, {"frequency_hz": "abc"},
-    {"squelch": -1}, {"gain_db": 999}, {"ppm": 99999}, {"kind": "shell"},
+    {"squelch": 0.5}, {"squelch": -131}, {"squelch": "loud"}, {"gain_db": 999}, {"ppm": 99999}, {"kind": "shell"},
 ])
 def test_sanitize_rejects_bad_values(bad):
     with pytest.raises(pipelines.SpecError):
@@ -799,7 +836,7 @@ def test_upgrade_adds_new_columns_to_an_old_database(tmp_path):
 def local_setup(admin, ctx, serial="SER1", target_mhz=441.0, **target):
     source = admin.post("/api/sources", json={"serial": serial, "name": f"Stick {serial}", "gain_db": 10.0}).json()["id"]
     target_id = admin.post("/api/targets", json={
-        "name": f"T{target_mhz}", "frequency_hz": int(target_mhz * 1e6), "modulation": "nfm", "squelch": 50, **target,
+        "name": f"T{target_mhz}", "frequency_hz": int(target_mhz * 1e6), "modulation": "nfm", "squelch": -41.1, **target,
     }).json()["id"]
     return source, target_id
 
@@ -813,20 +850,20 @@ def test_profile_sets_squelch_and_gain_for_that_stick_and_target_only(admin, ctx
     two = admin.post("/api/sources", json={"serial": "SER2", "name": "Other", "gain_db": 20.0}).json()["id"]
     for source in (one, two):
         admin.post(f"/api/sources/{source}/assign", json={"target_id": target})
-    saved = admin.put(f"/api/sources/{one}/profiles/{target}", json={"squelch": 98, "gain_db": 19.2, "noise_level": 62})
+    saved = admin.put(f"/api/sources/{one}/profiles/{target}", json={"squelch": -35.3, "gain_db": 19.2, "noise_level": -39.2})
     assert saved.status_code == 200 and saved.json()["measured_at"]
     first, second = running_spec(ctx, "SER1"), running_spec(ctx, "SER2")
-    assert (first["squelch"], first["gain_db"]) == (98, 19.2)
-    assert (second["squelch"], second["gain_db"]) == (50, 20.0)
+    assert (first["squelch"], first["gain_db"]) == (-35.3, 19.2)
+    assert (second["squelch"], second["gain_db"]) == (-41.1, 20.0)
     view = next(s for s in admin.get("/api/sources").json() if s["id"] == one)
-    assert view["active_target"]["from_profile"] and view["active_target"]["squelch"] == 98
-    assert view["profiles"][0]["squelch"] == 98
+    assert view["active_target"]["from_profile"] and view["active_target"]["squelch"] == -35.3
+    assert view["profiles"][0]["squelch"] == -35.3
 
 
 def test_profile_with_empty_gain_means_agc_not_the_source_gain(admin, ctx):
     source, target = local_setup(admin, ctx)
     admin.post(f"/api/sources/{source}/assign", json={"target_id": target})
-    admin.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": 101, "gain_db": None})
+    admin.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": -34.9, "gain_db": None})
     assert running_spec(ctx, "SER1")["gain_db"] is None
 
 
@@ -834,20 +871,20 @@ def test_saving_again_replaces_and_removing_restores_defaults(admin, ctx):
     source, target = local_setup(admin, ctx)
     admin.post(f"/api/sources/{source}/assign", json={"target_id": target})
     path = f"/api/sources/{source}/profiles/{target}"
-    admin.put(path, json={"squelch": 98})
-    admin.put(path, json={"squelch": 120, "gain_db": 7.1})
+    admin.put(path, json={"squelch": -35.3})
+    admin.put(path, json={"squelch": -33.5, "gain_db": 7.1})
     view = next(s for s in admin.get("/api/sources").json() if s["id"] == source)
-    assert len(view["profiles"]) == 1 and view["profiles"][0]["squelch"] == 120
+    assert len(view["profiles"]) == 1 and view["profiles"][0]["squelch"] == -33.5
     assert view["profiles"][0]["measured_at"] is None  # typed in, not measured
     assert admin.delete(path).status_code == 200
-    assert (running_spec(ctx, "SER1")["squelch"], running_spec(ctx, "SER1")["gain_db"]) == (50, 10.0)
+    assert (running_spec(ctx, "SER1")["squelch"], running_spec(ctx, "SER1")["gain_db"]) == (-41.1, 10.0)
     assert admin.delete(path).status_code == 404
 
 
 def test_retuning_a_target_removes_profiles_but_renaming_keeps_them(admin, ctx):
     source, target = local_setup(admin, ctx)
-    admin.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": 98})
-    body = {"frequency_hz": 441_000_000, "modulation": "nfm", "squelch": 50}
+    admin.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": -35.3})
+    body = {"frequency_hz": 441_000_000, "modulation": "nfm", "squelch": -41.1}
     reply = admin.put(f"/api/targets/{target}", json={"name": "Renamed", **body}).json()
     assert reply["profiles_cleared"] == 0
     reply = admin.put(f"/api/targets/{target}", json={"name": "Renamed", **{**body, "frequency_hz": 444_850_000}}).json()
@@ -857,28 +894,28 @@ def test_retuning_a_target_removes_profiles_but_renaming_keeps_them(admin, ctx):
 
 def test_deleting_a_source_or_target_removes_its_profiles(admin, ctx):
     source, target = local_setup(admin, ctx)
-    admin.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": 98})
+    admin.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": -35.3})
     admin.delete(f"/api/targets/{target}")
     with ctx.db() as session:
         assert session.scalar(select(SdrProfile)) is None
     target = admin.post("/api/targets", json={"name": "T", "frequency_hz": 441_000_000, "modulation": "nfm"}).json()["id"]
-    admin.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": 98})
+    admin.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": -35.3})
     admin.delete(f"/api/sources/{source}")
     with ctx.db() as session:
         assert session.scalar(select(SdrProfile)) is None
 
 
-@pytest.mark.parametrize("squelch", [-1, 100001])
+@pytest.mark.parametrize("squelch", [1, -131, 50])
 def test_profile_values_are_validated(admin, ctx, squelch):
     source, target = local_setup(admin, ctx)
     assert admin.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": squelch}).status_code == 422
-    assert admin.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": 1, "gain_db": 99}).status_code == 422
+    assert admin.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": -40, "gain_db": 99}).status_code == 422
 
 
 def test_only_audio_targets_have_profiles(admin, ctx):
     source, _ = local_setup(admin, ctx)
     adsb = admin.post("/api/targets", json={"name": "A", "kind": "adsb", "frequency_hz": 1_090_000_000, "modulation": "adsb"}).json()["id"]
-    assert admin.put(f"/api/sources/{source}/profiles/{adsb}", json={"squelch": 9}).status_code == 422
+    assert admin.put(f"/api/sources/{source}/profiles/{adsb}", json={"squelch": -56.0}).status_code == 422
     assert admin.post(f"/api/sources/{source}/measure", json={"target_id": adsb}).status_code == 422
 
 
@@ -890,7 +927,7 @@ def fake_supervisor(ctx, result=None, error=None):
             calls.append((serial, request))
             if error:
                 raise MeasureError(error)
-            return result or {"low": 61, "typical": 62, "high": 70, "suggested": 98, "moved": False}
+            return result or {"low": -39.4, "typical": -39.2, "high": -38.0, "suggested": -33.0, "moved": False}
 
     ctx.supervisor = Fake()
     return calls
@@ -901,7 +938,7 @@ def test_measure_uses_the_targets_frequency_and_sources_ppm(admin, ctx):
     target = admin.post("/api/targets", json={"name": "T", "frequency_hz": 444_850_000, "modulation": "wfm"}).json()["id"]
     calls = fake_supervisor(ctx)
     reply = admin.post(f"/api/sources/{source}/measure", json={"target_id": target, "gain_db": 19.2})
-    assert reply.status_code == 200 and reply.json()["suggested"] == 98 and reply.json()["gain_db"] == 19.2
+    assert reply.status_code == 200 and reply.json()["suggested"] == -33.0 and reply.json()["gain_db"] == 19.2
     assert calls == [("SER1", {"frequency_hz": 444_850_000, "modulation": "wfm", "gain_db": 19.2, "ppm": 4})]
     assert any(e["action"] == "source.measured" for e in admin.get("/api/admin/audit").json())
 
@@ -926,28 +963,28 @@ def test_listeners_cannot_measure_or_save_profiles(admin, ctx, app):
     add_user(ctx, "listener@example.com")
     client = client_for(app, "listener@example.com")
     assert client.post(f"/api/sources/{source}/measure", json={"target_id": target}).status_code == 403
-    assert client.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": 1}).status_code == 403
+    assert client.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": -75.1}).status_code == 403
     assert client.delete(f"/api/sources/{source}/profiles/{target}").status_code == 403
     anonymous = client_for(app)
     assert anonymous.post(f"/api/sources/{source}/measure", json={"target_id": target}).status_code == 401
-    assert anonymous.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": 1}).status_code == 401
+    assert anonymous.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": -75.1}).status_code == 401
     assert calls == []
 
 
 def test_a_lock_covers_measuring_and_profiles_for_everyone_but_admins(admin, ctx, app):
     source, target = local_setup(admin, ctx)
     admin.post(f"/api/sources/{source}/assign", json={"target_id": target})
-    admin.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": 98})
+    admin.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": -35.3})
     lock(admin, source)
     calls = fake_supervisor(ctx)
     add_user(ctx, "op@example.com", role="operator")
     operator = client_for(app, "op@example.com")
     assert operator.post(f"/api/sources/{source}/measure", json={"target_id": target}).status_code == 403
-    assert operator.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": 1}).status_code == 403
+    assert operator.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": -75.1}).status_code == 403
     assert operator.delete(f"/api/sources/{source}/profiles/{target}").status_code == 403
-    assert calls == [] and running_spec(ctx, "SER1")["squelch"] == 98
+    assert calls == [] and running_spec(ctx, "SER1")["squelch"] == -35.3
     assert admin.post(f"/api/sources/{source}/measure", json={"target_id": target}).status_code == 200
-    assert admin.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": 110}).status_code == 200
+    assert admin.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": -34.2}).status_code == 200
 
 
 def test_operator_can_measure_and_save_on_an_unlocked_source(admin, ctx, app):
@@ -956,7 +993,7 @@ def test_operator_can_measure_and_save_on_an_unlocked_source(admin, ctx, app):
     add_user(ctx, "op@example.com", role="operator")
     operator = client_for(app, "op@example.com")
     assert operator.post(f"/api/sources/{source}/measure", json={"target_id": target}).status_code == 200
-    assert operator.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": 98}).status_code == 200
+    assert operator.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": -35.3}).status_code == 200
 
 
 @pytest.mark.parametrize("bad", [
@@ -977,7 +1014,7 @@ def pending_future(ctx, node_id=7, op="measure"):
     return loop, future
 
 
-GOOD_RESULT = {"low": 61, "typical": 62, "high": 70, "suggested": 98, "moved": False}
+GOOD_RESULT = {"low": -39.4, "typical": -39.2, "high": -38.0, "suggested": -33.0, "moved": False}
 
 
 def test_a_node_cannot_answer_another_nodes_measurement(ctx):
@@ -986,7 +1023,7 @@ def test_a_node_cannot_answer_another_nodes_measurement(ctx):
     ctx.finish_measure(7, {"id": "other", "ok": True, "result": GOOD_RESULT})
     assert not future.done()
     ctx.finish_measure(7, {"id": "abc", "ok": True, "result": GOOD_RESULT})
-    assert future.result()["suggested"] == 98
+    assert future.result()["suggested"] == -33.0
     loop.close()
 
 
@@ -1066,8 +1103,8 @@ def test_gain_must_be_a_step_once_steps_are_known(admin):
     source = make_source(admin, gain_steps=steps, gain_db=17.9)
     assert admin.post("/api/sources", json={"serial": "SER2", "name": "T", "gain_steps": steps}).status_code == 201  # AGC is fine
     target = make_target(admin)
-    assert admin.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": 80, "gain_db": 10}).status_code == 422
-    saved = admin.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": 80, "gain_db": 7.1})
+    assert admin.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": -37.0, "gain_db": 10}).status_code == 422
+    saved = admin.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": -37.0, "gain_db": 7.1})
     assert saved.status_code == 200 and saved.json()["warning"] is None
     assert admin.post(f"/api/sources/{source}/assign", json={"target_id": target}).json()["warning"] is None
 
@@ -1075,12 +1112,12 @@ def test_gain_must_be_a_step_once_steps_are_known(admin):
 def test_a_gain_saved_before_detection_can_stay(admin):
     source = make_source(admin, gain_db=40.2)  # no steps known yet
     target = make_target(admin)
-    admin.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": 80, "gain_db": 33}).raise_for_status()
+    admin.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": -37.0, "gain_db": 33}).raise_for_status()
     body = {"serial": "SER1", "name": "S", "gain_steps": [7.1, 17.9, 19.2]}
     kept = admin.put(f"/api/sources/{source}", json={**body, "gain_db": 40.2})
     assert kept.status_code == 200 and "will use 19.2 dB" in kept.json()["warning"]  # detected later: still saves
     assert admin.put(f"/api/sources/{source}", json={**body, "gain_db": 30}).status_code == 422  # but not a new off-step value
-    assert admin.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": 90, "gain_db": 33}).status_code == 200
+    assert admin.put(f"/api/sources/{source}/profiles/{target}", json={"squelch": -36.1, "gain_db": 33}).status_code == 200
     assert "so it will get 19.2 dB" in admin.post(f"/api/sources/{source}/assign", json={"target_id": target}).json()["warning"]
 
 
@@ -1572,6 +1609,49 @@ def test_volume_from_the_network_is_validated(bad):
 def test_a_slave_without_volume_in_its_saved_assignment_still_loads():
     assert spec()["volume_db"] == 0
     assert spec(volume_db=None)["volume_db"] == 0
+
+
+def test_a_database_from_before_db_squelch_converts_once(tmp_path):
+    db = tmp_path / "old.db"
+    make_session_factory(db)
+    with make_session_factory(db)() as session:
+        node = Node(name="n", is_local=True, status="active")
+        session.add(node)
+        session.flush()
+        session.add(Source(node_id=node.id, serial="S", name="S"))
+        session.commit()
+    connection = sqlite3.connect(db)
+    insert = "INSERT INTO targets (name, kind, frequency_hz, modulation, squelch, clearcut_enabled, rdio_enabled) VALUES (?, ?, ?, ?, ?, 0, 0)"
+    connection.execute(insert, ("Voice", "audio", 441_000_000, "nfm", 50))
+    connection.execute(insert, ("Broadcast", "audio", 98_100_000, "wfm", 60))
+    connection.execute(insert, ("Always on", "audio", 441_000_000, "nfm", 0))
+    connection.execute(insert, ("Planes", "adsb", 1_090_000_000, "adsb", 50))
+    connection.execute("INSERT INTO sdr_profiles (source_id, target_id, squelch, noise_level, updated_by) VALUES (1, 1, 98, 64, '')")
+    for column in ("squelch_db",):
+        connection.execute(f"ALTER TABLE targets DROP COLUMN {column}")
+    for column in ("squelch_db", "noise_db"):
+        connection.execute(f"ALTER TABLE sdr_profiles DROP COLUMN {column}")
+    connection.commit()
+    connection.close()
+    for _ in range(2):  # a second start changes nothing
+        with make_session_factory(db)() as session:
+            targets = {t.name: t for t in session.scalars(select(Target))}
+            assert targets["Voice"].squelch_db == -41.1 and targets["Broadcast"].squelch_db == -19.1
+            assert targets["Always on"].squelch_db is None and targets["Planes"].squelch_db is None
+            assert {t.squelch for t in targets.values()} == {0}
+            profile = session.scalar(select(SdrProfile))
+            assert (profile.squelch_db, profile.noise_db, profile.squelch, profile.noise_level) == (-35.3, -39.0, 0, None)
+
+
+def test_targets_take_squelch_in_db_or_off(admin, ctx):
+    made = admin.post("/api/targets", json={"name": "T", "frequency_hz": 441_000_000}).json()
+    assert made["squelch"] == -40.0 and "squelch_db" not in made  # the default
+    off = admin.post("/api/targets", json={"name": "O", "frequency_hz": 441_000_000, "squelch": None}).json()
+    assert off["squelch"] is None
+    for bad in (50, -131, "x"):
+        assert admin.post("/api/targets", json={"name": "B", "frequency_hz": 441_000_000, "squelch": bad}).status_code == 422
+    with ctx.db() as session:
+        assert {t.squelch for t in session.scalars(select(Target))} == {0}  # nothing for the upgrade to convert
 
 
 def test_a_database_from_before_volume_upgrades(tmp_path):

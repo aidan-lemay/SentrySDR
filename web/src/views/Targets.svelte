@@ -7,7 +7,7 @@
   import { clearAfter } from '../notice.svelte.js';
 
   const blank = () => ({
-    id: null, name: '', kind: 'audio', mhz: '', modulation: 'nfm', squelch: 50, volume_db: 0,
+    id: null, name: '', kind: 'audio', mhz: '', modulation: 'nfm', squelch: -40, volume_db: 0,
     clearcut_enabled: false, clearcut_system: '', clearcut_id: '', rdio_enabled: false, rdio_system: '', rdio_talkgroup: '',
     broadcastify_enabled: false, broadcastify_system_ref: '', broadcastify_slot: '',
     channels: [], newChannel: '', airframes_enabled: false, feeds: blankFeeds(),
@@ -65,6 +65,7 @@
   onMount(refresh);
 
   const optionalInt = (value) => (value === '' || value === null ? null : Number(value));
+  const optionalNumber = (value) => (value === '' || value === null || value === undefined ? null : Number(value));
 
   // --- ACARS channels
   let channelProblem = $state('');
@@ -111,7 +112,7 @@
       modulation: form.kind === 'acars' ? 'acars' : ['rtltcp', 'tuner'].includes(form.kind) ? form.kind : fixed ? fixed.modulation : form.modulation,
       acars_channels: channelsHz, airframes_enabled: form.kind === 'acars' && form.airframes_enabled,
       feeds: feedsBody(form.kind, form.feeds),
-      squelch: Number(form.squelch), volume_db: Number(form.volume_db || 0),
+      squelch: optionalNumber(form.squelch), volume_db: Number(form.volume_db || 0),
       clearcut_enabled: form.clearcut_enabled, clearcut_system: form.clearcut_system || null, clearcut_id: optionalInt(form.clearcut_id),
       rdio_enabled: form.rdio_enabled, rdio_system: optionalInt(form.rdio_system), rdio_talkgroup: optionalInt(form.rdio_talkgroup),
       broadcastify_enabled: Boolean(form.broadcastify_enabled), broadcastify_system_ref: optionalInt(form.broadcastify_system_ref), broadcastify_slot: optionalInt(form.broadcastify_slot),
@@ -166,7 +167,7 @@
           <td class="title-cell">{target.name}</td>
           <td data-label="Frequency"><span class="mono">{target.kind === 'acars' ? (target.acars_channels ?? []).map((hz) => +(hz / 1e6).toFixed(4)).join(', ') + ' MHz' : formatMHz(target.frequency_hz)}</span></td>
           <td data-label="Mode"><span>{MODE_NAMES[target.modulation] ?? target.modulation.toUpperCase()}</span></td>
-          {#if target.kind === 'audio'}<td data-label="Squelch"><span class="mono">{target.squelch || 'Off'}</span></td>{:else}<td class="wide-only"></td>{/if}
+          {#if target.kind === 'audio'}<td data-label="Squelch"><span class="mono">{target.squelch == null ? 'Off' : `${target.squelch} dB`}</span></td>{:else}<td class="wide-only"></td>{/if}
           <td data-label="Sends to"><span>{[target.clearcut_enabled && 'ClearCut', target.rdio_enabled && 'RDIO', target.broadcastify_enabled && 'Broadcastify', target.airframes_enabled && 'airframes.io', ...feedSummary(target)].filter(Boolean).join(', ') || 'None'}</span></td>
           <td>
             {#if target.kind !== 'rtltcp' || isAdmin}
@@ -250,9 +251,9 @@
           {#each MODULATIONS as option (option.value)}<option value={option.value}>{option.label}</option>{/each}
         </select>
       </label>
-      <label class="field"><span>Squelch level</span>
-        <input class="mono" type="number" inputmode="numeric" min="0" max="100000" bind:value={form.squelch} />
-        <span class="hint">Used on any SDR without a saved profile for this target. Must sit above the noise, so measure each SDR on the Sources page. 0 records all the time.</span>
+      <label class="field"><span>Squelch (dB)</span>
+        <input class="mono" type="number" min="-130" max="0" step="0.1" placeholder="Off" bind:value={form.squelch} />
+        <span class="hint">The same scale as the web tuner's signal meter and squelch, so a level that works there works here at the same gain. Used on any SDR without a saved profile for this target. Must sit above the noise: measure each SDR on the Sources page. Leave empty to record all the time.</span>
       </label>
       <label class="field"><span>Volume (dB)</span>
         <input class="mono" type="number" inputmode="decimal" min="-20" max="30" step="1" bind:value={form.volume_db} />
