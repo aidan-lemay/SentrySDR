@@ -167,3 +167,34 @@ export const formatRange = (low, high) => (low == null && high == null ? 'Not se
 export const ADSB_AGGREGATORS = [['adsbx', 'ADS-B Exchange'], ['airplanes_live', 'airplanes.live'], ['adsb_lol', 'adsb.lol'], ['adsb_fi', 'adsb.fi']];
 export const AIS_SERVICES = [['marinetraffic', 'MarineTraffic'], ['aishub', 'AISHub'], ['vesselfinder', 'VesselFinder']];
 export const feedLabel = (key) => [...ADSB_AGGREGATORS, ...AIS_SERVICES, ['community', 'aiscatcher.org']].find(([id]) => id === key)?.[1] ?? key;
+
+// --- how one user arranges the Sources page -----------------------------------------------
+// A saved layout is { items: [{ source: id } | { group, sources: [id], collapsed }] }. Groups and
+// ungrouped sources mix in one list. arrangeSources() lays the current sources out by it: ones it
+// doesn't mention (new since) go at the end, ones that are gone are left out, empty groups stay.
+export function arrangeSources(sources, layout) {
+  const byId = new Map(sources.map((s) => [s.id, s]));
+  const placed = new Set();
+  const take = (id) => {
+    const source = byId.get(id);
+    if (!source || placed.has(id)) return null;
+    placed.add(id);
+    return source;
+  };
+  const entries = [];
+  for (const item of layout?.items ?? []) {
+    if (item.group !== undefined) {
+      entries.push({ group: item.group, collapsed: !!item.collapsed, sources: (item.sources ?? []).map(take).filter(Boolean) });
+    } else {
+      const source = take(item.source);
+      if (source) entries.push({ source });
+    }
+  }
+  for (const source of sources) if (!placed.has(source.id)) entries.push({ source });
+  return entries;
+}
+
+// The arranged entries back into what's saved.
+export const layoutOf = (entries) => ({
+  items: entries.map((e) => (e.source ? { source: e.source.id } : { group: e.group, collapsed: e.collapsed, sources: e.sources.map((s) => s.id) })),
+});

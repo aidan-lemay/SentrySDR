@@ -1,7 +1,7 @@
 <script>
   import { onMount } from 'svelte';
   import QRCode from 'qrcode';
-  import { api, formatTime } from '../lib.js';
+  import { api, arrangeSources, formatTime, layoutOf } from '../lib.js';
   import Notice from '../Notice.svelte';
   import { clearAfter } from '../notice.svelte.js';
 
@@ -86,6 +86,96 @@
     }
   }
 
+  // --- how the Sources page is arranged: for this user only --------------------------------
+  let arranged = $state(null);  // what arrangeSources() gives, once the section is opened
+  let allSources = [];
+  let groupName = $state('');
+  let layoutNote = $state(null);  // { kind, text }
+  let saveTimer;
+
+  async function openLayout(event) {
+    if (!event.currentTarget.open || arranged) return;
+    try {
+      const [sources, layout] = await Promise.all([api('sources'), api('me/source-layout')]);
+      allSources = sources;
+      arranged = arrangeSources(sources, layout);
+    } catch (failure) {
+      layoutNote = { kind: 'err', text: failure.message };
+    }
+  }
+
+  // Every change saves itself, a moment later so a run of clicks is one save.
+  function saveLayout() {
+    clearTimeout(saveTimer);
+    layoutNote = null;
+    saveTimer = setTimeout(async () => {
+      try {
+        await api('me/source-layout', { method: 'PUT', body: layoutOf(arranged) });
+        layoutNote = { kind: 'msg', text: 'Saved.' };
+      } catch (failure) {
+        layoutNote = { kind: 'err', text: failure.message };
+      }
+    }, 400);
+  }
+
+  function move(list, i, step) {
+    [list[i], list[i + step]] = [list[i + step], list[i]];
+    saveLayout();
+  }
+
+  // A source into a group (at its end), or out of one (to just after it).
+  function setGroup(from, i, to) {
+    const list = from === null ? arranged : arranged[from].sources;
+    const source = from === null ? list[i].source : list[i];
+    if (to === '') {
+      list.splice(i, 1);
+      arranged.splice(from + 1, 0, { source });
+    } else {
+      const group = arranged[Number(to)];
+      list.splice(i, 1);
+      group.sources.push(source);
+    }
+    saveLayout();
+  }
+
+  const groupTaken = (name, except = null) => arranged.some((e) => e !== except && e.group?.toLowerCase() === name.toLowerCase());
+
+  function addGroup(event) {
+    event.preventDefault();
+    const name = groupName.trim();
+    if (!name) return;
+    if (groupTaken(name)) {
+      layoutNote = { kind: 'err', text: `You already have a group called ${name}.` };
+      return;
+    }
+    arranged.push({ group: name, collapsed: false, sources: [] });
+    groupName = '';
+    saveLayout();
+  }
+
+  function renameGroup(entry) {
+    const name = prompt('Rename the group', entry.group)?.trim();
+    if (!name || name === entry.group) return;
+    if (groupTaken(name, entry)) {
+      layoutNote = { kind: 'err', text: `You already have a group called ${name}.` };
+      return;
+    }
+    entry.group = name;
+    saveLayout();
+  }
+
+  // Its sources stay where the group was.
+  function removeGroup(i) {
+    arranged.splice(i, 1, ...arranged[i].sources.map((source) => ({ source })));
+    saveLayout();
+  }
+
+  function resetLayout() {
+    if (!confirm('Put the Sources page back in the usual order, with no groups?')) return;
+    arranged = arrangeSources(allSources, { items: [] });
+    saveLayout();
+  }
+
   onMount(async () => {
     if (!forced) activity = (await api('me/audit').catch(() => [])) ?? [];
   });
@@ -154,6 +244,70 @@
   </fieldset>
 {/if}
 
+{#if !forced}
+  <fieldset>
+    <legend>Sources page</legend>
+    <details ontoggle={openLayout}>
+      <summary class="small" style="padding:.3rem 0">Order and groups</summary>
+      <p class="small dim">How the Sources page looks to you, on any device. Nobody else sees it. Collapse a group on the Sources page itself.</p>
+      {#if layoutNote?.kind === 'err'}<div class="err" role="alert">{layoutNote.text}</div>{/if}
+      {#if arranged && !arranged.length}<p class="small dim">No sources yet.</p>{/if}
+      {#if arranged?.length}
+        <ol class="arrange">
+          {#each arranged as entry, i (entry.source ? `s${entry.source.id}` : `g${entry.group}`)}
+            {#if entry.source}
+              <li>{@render line(entry.source, arranged, i, null)}</li>
+            {:else}
+              <li class="group">
+                <div class="line">
+                  <strong>{entry.group}</strong>
+                  <span class="buttons">
+                    <button aria-label={`Move ${entry.group} up`} disabled={i === 0} onclick={() => move(arranged, i, -1)}>↑</button>
+                    <button aria-label={`Move ${entry.group} down`} disabled={i === arranged.length - 1} onclick={() => move(arranged, i, 1)}>↓</button>
+                    <button onclick={() => renameGroup(entry)}>Rename</button>
+                    <button onclick={() => removeGroup(i)}>Remove</button>
+                  </span>
+                </div>
+                <ol class="arrange inner">
+                  {#each entry.sources as source, j (source.id)}
+                    <li>{@render line(source, entry.sources, j, i)}</li>
+                  {:else}
+                    <li class="small dim">Empty. Choose this group for a source to put it here.</li>
+                  {/each}
+                </ol>
+              </li>
+            {/if}
+          {/each}
+        </ol>
+        <form onsubmit={addGroup}>
+          <label class="field"><span>New group</span><input bind:value={groupName} maxlength="60" /></label>
+          <div class="buttons form-buttons">
+            <button>Add group</button>
+            <button type="button" onclick={resetLayout}>Back to the usual order</button>
+            {#if layoutNote?.kind === 'msg'}<span class="small st-ok" role="status">{layoutNote.text}</span>{/if}
+          </div>
+        </form>
+      {/if}
+    </details>
+  </fieldset>
+{/if}
+
+{#snippet line(source, list, i, group)}
+  <div class="line">
+    <span>{source.name}</span>
+    <span class="buttons">
+      <button aria-label={`Move ${source.name} up`} disabled={i === 0} onclick={() => move(list, i, -1)}>↑</button>
+      <button aria-label={`Move ${source.name} down`} disabled={i === list.length - 1} onclick={() => move(list, i, 1)}>↓</button>
+      <select aria-label={`Group for ${source.name}`} value={group === null ? '' : String(group)} onchange={(event) => setGroup(group, i, event.target.value)}>
+        <option value="">No group</option>
+        {#each arranged as entry, k (entry.source ? `s${entry.source.id}` : `g${entry.group}`)}
+          {#if !entry.source}<option value={String(k)}>{entry.group}</option>{/if}
+        {/each}
+      </select>
+    </span>
+  </div>
+{/snippet}
+
 {#if !forced && activity.length}
   <div class="box">
     <h2>Recent activity</h2>
@@ -171,3 +325,13 @@
     </table>
   </div>
 {/if}
+
+<style>
+  .arrange { list-style: none; padding: 0; margin: .4rem 0; }
+  .arrange li { border-bottom: 1px solid var(--rule); padding: .15rem 0; }
+  .arrange li:last-child { border-bottom: 0; }
+  .arrange.inner { margin: 0 0 .2rem .4rem; padding-left: .6rem; border-left: 3px solid var(--rule); }
+  .line { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0 .6rem; }
+  .line .buttons { margin: .15rem 0; }
+  .line select { width: auto; max-width: 12rem; }
+</style>

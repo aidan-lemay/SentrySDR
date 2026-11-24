@@ -1,6 +1,6 @@
 <script>
   import { onMount } from 'svelte';
-  import { api, DEFAULT_GAIN_DB, feedLabel, formatMHz, formatTime, formatDuration, nearestStep, antennaUsable, problemNote, STATE_LABELS, stickProblems } from '../lib.js';
+  import { api, arrangeSources, DEFAULT_GAIN_DB, feedLabel, formatMHz, formatTime, formatDuration, nearestStep, antennaUsable, problemNote, STATE_LABELS, stickProblems } from '../lib.js';
   import Notice from '../Notice.svelte';
   import { NOTICE_MS } from '../notice.svelte.js';
   import GainField from '../GainField.svelte';
@@ -18,6 +18,9 @@
   let notices = $state({});
   let recent = $state({});
   let measures = $state({});
+  // This user's own order and groups, set on the My account page. Collapsing a group is done here.
+  let layout = $state({ items: [] });
+  const entries = $derived(arrangeSources(sources, layout));
 
   // Info and warnings clear themselves after a while. Errors stay until the next action.
   const noticeTimers = {};
@@ -72,8 +75,28 @@
     }
   }
 
+  async function loadLayout() {
+    try {
+      layout = await api('me/source-layout');
+    } catch {
+      // Not essential: the sources still show, in the usual order.
+    }
+  }
+
+  async function toggleGroup(name) {
+    const group = layout.items.find((item) => item.group === name);
+    if (!group) return;
+    group.collapsed = !group.collapsed;
+    try {
+      layout = await api('me/source-layout', { method: 'PUT', body: layout });
+    } catch (failure) {
+      error = `Couldn't remember that: ${failure.message}`;
+    }
+  }
+
   onMount(() => {
     refresh();
+    loadLayout();
     const timer = setInterval(poll, 3000);
     return () => {
       clearInterval(timer);
@@ -215,7 +238,29 @@
   <div class="box">
     <table class="table">
       <thead><tr><th>Source</th><th>Tuned to</th><th>Status</th><th>Last activity</th><th>Actions</th></tr></thead>
-      {#each sources as source (source.id)}
+      {#each entries as entry (entry.source ? `s${entry.source.id}` : `g${entry.group}`)}
+        {#if entry.source}
+          {@render row(entry.source)}
+        {:else if entry.sources.length}
+          <tbody class="group-head">
+            <tr><td colspan="5"><div class="group-line">
+              <button class="link-button" aria-expanded={!entry.collapsed} onclick={() => toggleGroup(entry.group)}>
+                <span aria-hidden="true">{entry.collapsed ? '▸' : '▾'}</span> <strong>{entry.group}</strong>
+              </button>
+              <span class="small dim">{entry.sources.length} source{entry.sources.length === 1 ? '' : 's'}</span>
+              {#if entry.collapsed && entry.sources.some((s) => s.in_call)}<span class="st-air small">ON AIR</span>{/if}
+            </div></td></tr>
+          </tbody>
+          {#if !entry.collapsed}
+            {#each entry.sources as source (source.id)}{@render row(source)}{/each}
+          {/if}
+        {/if}
+      {/each}
+    </table>
+  </div>
+{/if}
+
+{#snippet row(source)}
         {@const draft = drafts[source.id]}
         <tbody>
           <tr>
@@ -257,7 +302,11 @@
                 {#if canAssign && source.feeds?.sending?.length}<br /><span class="small">Sending to {source.feeds.sending.map(feedLabel).join(', ')}</span>{/if}
               </div>
             </td>
-            <td data-label="Last activity"><span class="small">{formatTime(source.last_call_at)}</span></td>
+            {#if records(source)}
+              <td data-label="Last activity"><span class="small">{formatTime(source.last_call_at)}</span></td>
+            {:else}
+              <td class="wide-only"></td><!-- this target doesn't make calls -->
+            {/if}
             <td class="actions">
               <div class="buttons">
                 {#if can('listen_live') && source.active_target?.kind === 'audio'}
@@ -367,7 +416,9 @@
             </td>
           </tr>
         </tbody>
-      {/each}
-    </table>
-  </div>
-{/if}
+{/snippet}
+
+<style>
+  .group-line { display: flex; flex-wrap: wrap; align-items: center; gap: 0 .6rem; }
+  .group-line button { text-decoration: none; }
+</style>

@@ -331,6 +331,12 @@
     await loaders.nodes();
   }, `${node.name} revoked.`);
 
+  // A revoked node stays in the database, since its SDR entries refer to it, but leaves this list.
+  const removeNode = (node) => confirm(`Remove ${node.name} from this list? It's already revoked, so this only tidies the list.`) && run(async () => {
+    await api(`nodes/${node.id}/hide`, { method: 'POST' });
+    await loaders.nodes();
+  }, `${node.name} removed.`);
+
   // --- nodes: no warning while offline
   const setNodeQuiet = (node, quiet) => run(async () => {
     await api(`nodes/${node.id}/quiet`, { method: 'POST', body: { quiet } });
@@ -885,6 +891,7 @@
               <div class="buttons" style="margin:0">
                 {#if node.status === 'active'}<button onclick={() => restartService(node)} disabled={!node.online && !node.is_local}>Restart service</button>{/if}
                 {#if !node.is_local && node.status !== 'revoked'}<button class="bad" onclick={() => revokeNode(node)}>Revoke</button>{/if}
+                {#if node.status === 'revoked'}<button onclick={() => removeNode(node)}>Remove</button>{/if}
               </div>
             </td>
           </tr>

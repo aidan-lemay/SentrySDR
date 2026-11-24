@@ -49,6 +49,8 @@ class User(Base):
     # Aircraft and ship emergencies: which codes (None = the defaults), how far away (None = anywhere), and email.
     emergency_codes: Mapped[list | None] = mapped_column(JSON, nullable=True)
     emergency_km: Mapped[int | None] = mapped_column(nullable=True)
+    # How this user arranges the Sources page: order, groups, which groups are collapsed. Theirs alone.
+    source_layout: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     email_emergencies: Mapped[bool | None] = mapped_column(nullable=True)
 
 
@@ -101,6 +103,8 @@ class Node(Base):
     version: Mapped[str | None] = mapped_column(String(32), nullable=True)  # as the node reported it
     build: Mapped[str | None] = mapped_column(String(16), nullable=True)
     quiet_offline: Mapped[bool | None] = mapped_column(nullable=True)  # known to be offline at times: no warning
+    # A revoked node an admin removed from the list. The row stays: its SDR entries refer to it.
+    hidden: Mapped[bool | None] = mapped_column(nullable=True)
 
 
 class Source(Base):

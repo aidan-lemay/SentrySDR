@@ -16,6 +16,8 @@
   let start = $state('');
   let end = $state('');
   let order = $state('desc');
+  let from = $state('');  // a source to show only, as JSON [node, serial]; '' for all
+  let sources = $state([]);  // every SDR messages have come from
   let error = $state('');
   let loaded = $state(false);
 
@@ -23,10 +25,10 @@
   const idFilter = $derived(new URLSearchParams(route.split('?')[1] ?? '').get('id'));  // from an alert email
 
   // The filters last searched with. Polling uses these, not what's half typed.
-  const DEFAULTS = { search: '', showEmpty: false, importantOnly: false, start: '', end: '', order: 'desc' };
+  const DEFAULTS = { search: '', showEmpty: false, importantOnly: false, start: '', end: '', order: 'desc', from: '' };
   let applied = $state({ ...DEFAULTS });
   // Anything typed, ticked or linked that isn't the default view: Clear then shows.
-  const filtered = $derived(!!(tailFilter || idFilter || search || showEmpty || importantOnly || start || end || order !== 'desc'));
+  const filtered = $derived(!!(tailFilter || idFilter || search || showEmpty || importantOnly || start || end || from || order !== 'desc'));
   let generation = 0;
 
   async function load() {
@@ -37,6 +39,11 @@
     if (applied.start) params.set('start', new Date(applied.start).getTime() / 1000);
     if (applied.end) params.set('end', new Date(applied.end).getTime() / 1000);
     if (applied.order !== 'desc') params.set('order', applied.order);
+    if (applied.from) {
+      const [node, serial] = JSON.parse(applied.from);
+      params.set('node', node);
+      params.set('serial', serial);
+    }
     if (tailFilter) params.set('tail', tailFilter);
     if (idFilter) params.set('id', idFilter);
     const mine = ++generation;
@@ -64,13 +71,13 @@
 
   function applyFilters(event) {
     event.preventDefault();
-    applied = { search, showEmpty, importantOnly, start, end, order };
+    applied = { search, showEmpty, importantOnly, start, end, order, from };
     offset = 0;
     load();
   }
 
   function clearFilters() {
-    ({ search, showEmpty, importantOnly, start, end, order } = DEFAULTS);
+    ({ search, showEmpty, importantOnly, start, end, order, from } = DEFAULTS);
     applied = { ...DEFAULTS };
     offset = 0;
     if (tailFilter || idFilter) location.hash = '#/messages';  // the route change reloads
@@ -103,9 +110,30 @@
     }
   }
 
+  // Where each message came from, as a filter. Only worth showing with more than one place.
+  const sourceKey = (message) => JSON.stringify([message.node_name, message.serial]);
+  const sourceLabel = (message) => `${message.source_name || message.serial}${message.node_name ? ` on ${message.node_name}` : ''}`;
+  async function loadSources() {
+    try {
+      sources = await api('messages/sources');
+    } catch {
+      // Only the filter needs it.
+    }
+  }
+
+  function showOnly(message, event) {
+    from = sourceKey(message);
+    applyFilters(event);
+  }
+
   onMount(() => {
+    loadSources();
     const timer = setInterval(poll, 5000);
-    return () => clearInterval(timer);
+    const sourcesTimer = setInterval(loadSources, 60000);
+    return () => {
+      clearInterval(timer);
+      clearInterval(sourcesTimer);
+    };
   });
 </script>
 
@@ -127,6 +155,16 @@
       <label class="tick small"><input type="checkbox" bind:checked={showEmpty} onchange={applyFilters} /> Show messages with no text</label>
       <label class="tick small"><input type="checkbox" bind:checked={importantOnly} onchange={applyFilters} /> Important only</label>
     </div>
+    {#if sources.length > 1 || from}
+      <label class="field"><span>Source</span>
+        <select bind:value={from} onchange={applyFilters}>
+          <option value="">All sources</option>
+          {#each sources as item (`${item.node}|${item.serial}`)}
+            <option value={JSON.stringify([item.node, item.serial])}>{item.name}{item.node ? ` on ${item.node}` : ''} ({item.count})</option>
+          {/each}
+        </select>
+      </label>
+    {/if}
     <label class="field"><span>Order</span>
       <select bind:value={order} onchange={applyFilters}>
         <option value="desc">Newest first</option>
@@ -151,9 +189,10 @@
         <strong class="mono">{message.flight || 'No flight'}</strong>
         {#if message.tail}<a class="mono small" href={`#/messages?tail=${encodeURIComponent(message.tail)}`}>{message.tail}</a>{/if}
         {#if message.label}<span class="small dim">label {message.label}</span>{/if}
+        <button class="link-button small source-tag" title="Show only messages from here" onclick={(event) => showOnly(message, event)}>{sourceLabel(message)}</button>
       </div>
       <div class="small">{formatTime(message.received_at)}, <span class="mono">{formatMHz(message.frequency_hz)}</span>{message.level != null ? `, ${message.level.toFixed(1)} dB` : ''}</div>
-      <div class="small dim">{message.source_name || message.serial}{message.node_name ? ` on ${message.node_name}` : ''}{message.fed ? ', sent to airframes.io' : ''}</div>
+      {#if message.fed}<div class="small dim">Sent to airframes.io</div>{/if}
       {#if message.matches.length || message.important}
         <div class="small">
           {#if message.matches.length}<span class="st-bad">Matches: {message.matches.join(', ')}</span>{/if}
@@ -175,3 +214,7 @@
 </div>
 
 <Pager {offset} {total} size={PAGE} order={applied.order} onpage={(delta) => page(delta)} />
+
+<style>
+  .source-tag { min-height: 0; margin-left: .3rem; padding: 0 .35rem; border: 1px solid var(--rule); border-radius: 1em; text-decoration: none; }
+</style>

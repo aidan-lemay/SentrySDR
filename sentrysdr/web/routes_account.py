@@ -289,3 +289,69 @@ def totp_disable(body: DisableTotp, request: Request, user: User = Depends(curre
 def my_audit(user: User = Depends(current_user), db=Depends(get_db)):
     rows = db.scalars(select(AuditLog).where(AuditLog.user_id == user.id).order_by(AuditLog.ts.desc()).limit(100))
     return [{"ts": r.ts, "action": r.action, "ip": r.ip, "target": r.target} for r in rows]
+
+
+# --- how this user arranges the Sources page ------------------------------------------------
+# Cosmetic and per user: the order, any groups, and which groups are collapsed. Sources the
+# layout doesn't mention (new ones) go at the end; ones that no longer exist are skipped by the page.
+LAYOUT_ITEMS = 500
+LAYOUT_GROUPS = 50
+GROUP_NAME_LENGTH = 60
+
+
+class LayoutItem(BaseModel):
+    source: int | None = None
+    group: str | None = Field(default=None, max_length=GROUP_NAME_LENGTH)
+    sources: list[int] = Field(default_factory=list, max_length=LAYOUT_ITEMS)
+    collapsed: bool = False
+
+
+class LayoutBody(BaseModel):
+    items: list[LayoutItem] = Field(default_factory=list, max_length=LAYOUT_ITEMS)
+
+
+def clean_layout(body: LayoutBody) -> dict:
+    """The layout as stored: each item a source or a named group of sources, every source once."""
+    seen: set[int] = set()
+    names: set[str] = set()
+    items: list[dict] = []
+
+    def take(source_id: int) -> bool:
+        if source_id in seen:
+            raise HTTPException(422, "A source can only be in one place.")
+        seen.add(source_id)
+        return True
+
+    for item in body.items:
+        if (item.source is None) == (item.group is None):
+            raise HTTPException(422, "Each item is a source or a group.")
+        if item.source is not None:
+            take(item.source)
+            items.append({"source": item.source})
+            continue
+        name = item.group.strip()
+        if not name:
+            raise HTTPException(422, "Give the group a name.")
+        if name.lower() in names:
+            raise HTTPException(422, f"You already have a group called {name}.")
+        names.add(name.lower())
+        items.append({"group": name, "sources": [s for s in item.sources if take(s)], "collapsed": item.collapsed})
+    if len(names) > LAYOUT_GROUPS:
+        raise HTTPException(422, f"There can be up to {LAYOUT_GROUPS} groups.")
+    if len(seen) > LAYOUT_ITEMS:
+        raise HTTPException(422, "That's more sources than a layout can hold.")
+    return {"items": items}
+
+
+@router.get("/me/source-layout")
+def get_source_layout(user: User = Depends(current_user)):
+    return user.source_layout or {"items": []}
+
+
+@router.put("/me/source-layout")
+def put_source_layout(body: LayoutBody, user: User = Depends(current_user), db=Depends(get_db)):
+    layout = clean_layout(body)
+    user = db.merge(user)
+    user.source_layout = layout
+    db.commit()
+    return layout
