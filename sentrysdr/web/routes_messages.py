@@ -28,6 +28,7 @@ def _view(message: AcarsMessage, words: list[str] | None = None) -> dict:
 def list_messages(
     user: User = Depends(require("maps")), db=Depends(get_db),
     search: str = Query(default="", max_length=200), tail: str = Query(default="", max_length=16),
+    node: str | None = Query(default=None, max_length=120), serial: str | None = Query(default=None, max_length=64),
     show_empty: bool = False, important: bool = False, id: int | None = None,  # one message, from an alert email
     start: float | None = None, end: float | None = None, order: str = Query(default="desc", pattern="^(asc|desc)$"),
     limit: int = Query(default=50, ge=1, le=200), offset: int = Query(default=0, ge=0),
@@ -42,6 +43,10 @@ def list_messages(
         conditions.append(AcarsMessage.has_text.is_(True))
     if tail:
         conditions.append(AcarsMessage.tail == normalize_tail(tail))
+    if node is not None:
+        conditions.append(AcarsMessage.node_name == node)
+    if serial is not None:
+        conditions.append(AcarsMessage.serial == serial)
     if start is not None:
         conditions.append(AcarsMessage.received_at >= start)
     if end is not None:
@@ -62,6 +67,22 @@ def list_messages(
                                   else (AcarsMessage.received_at.desc(), AcarsMessage.id.desc())))
                       .limit(limit).offset(offset))
     return {"items": [_view(m, words) for m in rows], "total": total}
+
+
+@router.get("/messages/sources")
+def message_sources(_user: User = Depends(require("maps")), db=Depends(get_db)):
+    """Every SDR messages have come from, to filter by: one per stick on a node, under its latest name."""
+    rows = db.execute(select(AcarsMessage.node_name, AcarsMessage.serial, AcarsMessage.source_name,
+                             func.max(AcarsMessage.received_at), func.count())
+                      .group_by(AcarsMessage.node_name, AcarsMessage.serial, AcarsMessage.source_name))
+    found: dict[tuple[str, str], dict] = {}
+    for node_name, serial, source_name, last, count in rows:
+        item = found.setdefault((node_name, serial), {"node": node_name, "serial": serial, "name": "", "last": 0, "count": 0})
+        item["count"] += count
+        if last >= item["last"]:  # a renamed SDR shows as it's called now
+            item["last"], item["name"] = last, source_name or item["name"]
+    items = sorted(found.values(), key=lambda i: ((i["name"] or i["serial"]).lower(), i["node"].lower()))
+    return [{"node": i["node"], "serial": i["serial"], "name": i["name"] or i["serial"], "count": i["count"]} for i in items]
 
 
 def registrations(request: Request) -> Registrations | None:

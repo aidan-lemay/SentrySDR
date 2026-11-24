@@ -56,7 +56,7 @@ def _view(ctx: Context, node: Node) -> dict:
 @router.get("")
 def list_nodes(request: Request, _admin: User = Depends(admin_user), db=Depends(get_db)):
     ctx = ctx_of(request)
-    return [_view(ctx, n) for n in db.scalars(select(Node).order_by(Node.id))]
+    return [_view(ctx, n) for n in db.scalars(select(Node).where(Node.hidden.is_not(True)).order_by(Node.id))]
 
 
 class NodeBody(BaseModel):
@@ -91,6 +91,20 @@ def revoke_node(node_id: int, request: Request, admin: User = Depends(admin_user
         ctx.loop.call_soon_threadsafe(link.disconnect)
     ctx.audit("node.revoked", user=admin, ip=ip_of(request), target=node.name)
     return {"detail": "Revoked"}
+
+
+@router.post("/{node_id}/hide")
+def hide_node(node_id: int, request: Request, admin: User = Depends(admin_user), db=Depends(get_db)):
+    """Take a revoked node off the list. Its row stays, since its SDR entries still refer to it."""
+    node = db.get(Node, node_id)
+    if node is None or node.is_local or node.hidden:
+        raise HTTPException(404, "Node not found")
+    if node.status != "revoked":
+        raise HTTPException(409, "Revoke the node before removing it.")
+    node.hidden = True
+    db.commit()
+    ctx_of(request).audit("node.removed", user=admin, ip=ip_of(request), target=node.name)
+    return {"detail": "Removed"}
 
 
 class QuietBody(BaseModel):
