@@ -88,7 +88,7 @@ def clean_listen(raw: dict) -> dict | None:
     """A listener's choice from a browser, with only known fields, or None."""
     try:
         listen = {"frequency_hz": int(raw["frequency_hz"]), "mode": str(raw.get("mode", "nfm")),
-                  "deemphasis_us": int(raw.get("deemphasis_us", 75))}
+                  "deemphasis_us": int(raw.get("deemphasis_us", 75)), "morse": raw.get("morse") is True}
         if raw.get("bandwidth_hz") is not None:
             listen["bandwidth_hz"] = int(raw["bandwidth_hz"])
         if raw.get("squelch_db") is not None:
@@ -215,7 +215,7 @@ class TunerHub:
             elif data.get("t") == "rx":
                 viewer = room.viewers.get(data.get("listener"))
                 if viewer is not None:
-                    viewer.put(("text", json.dumps({key: data.get(key) for key in ("t", "level_db", "open", "inside", "stereo", "rds")})))
+                    viewer.put(("text", json.dumps({key: data.get(key) for key in ("t", "level_db", "open", "inside", "stereo", "rds", "morse")})))
 
     def node_gone(self, node_id: int) -> None:
         for (owner, serial), room in self.rooms.items():

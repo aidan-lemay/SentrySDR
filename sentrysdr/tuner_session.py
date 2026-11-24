@@ -61,6 +61,7 @@ def clean_settings(raw: dict) -> tuner.Settings | None:
         squelch = raw.get("squelch_db")
         deemphasis = int(raw.get("deemphasis_us", 75))
         settings = tuner.Settings(
+            morse=raw.get("morse") is True,
             frequency_hz=frequency, mode=mode,
             bandwidth_hz=None if bandwidth is None else int(bandwidth),
             squelch_db=None if squelch is None else float(squelch),
@@ -256,6 +257,8 @@ class TunerSession:
                                   "open": receiver.open, "inside": receiver.inside, "stereo": receiver.stereo}
                         if receiver.rds is not None:
                             status["rds"] = receiver.rds.text.view()
+                        if receiver.morse is not None:
+                            status["morse"] = receiver.morse.view()
                         self._emit("json", status)
                 if now - last_state >= STATE_SECONDS:
                     last_state = now

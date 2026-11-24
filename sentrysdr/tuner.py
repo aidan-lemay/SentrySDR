@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from .morse import MorseReader
+
 # Sample rates an RTL-SDR can do, in Hz, that the tuner offers.
 SAMPLE_RATES = (250_000, 1_024_000, 1_536_000, 1_800_000, 2_048_000, 2_400_000)
 DEFAULT_RATE = 2_048_000
@@ -288,6 +290,10 @@ class Settings:
     bandwidth_hz: int | None = None
     squelch_db: float | None = None  # None: always open
     deemphasis_us: int = 75
+    morse: bool = False  # decode Morse: CW, or an ID sent as a tone in NFM or AM
+
+
+MORSE_MODES = ("cw", "nfm", "am")
 
 
 class Receiver:
@@ -331,6 +337,11 @@ class Receiver:
                 # The pilot comes out of its filter n/8 samples late: hold the multiplex back as much.
                 self.delay = np.zeros(self.pilot.delay, dtype=np.float32)
                 self.rds = RdsDecoder(self.if_rate)
+        self.morse: MorseReader | None = None
+        if settings.morse and settings.mode in MORSE_MODES:
+            # CW mode: the filtered channel. NFM and AM: the audio, for a tone.
+            cw = settings.mode == "cw"
+            self.morse = MorseReader(self.if_rate if cw else self.audio_rate, from_audio=not cw, bandwidth=self.bw)
 
     def retune(self, center_hz: int) -> None:
         """The tuner's center moved: find this channel in the new span."""
@@ -369,7 +380,10 @@ class Receiver:
             steps = np.arange(len(y)) * (-2 * np.pi * self.fine_hz / self.if_rate) + self.mix_phase
             y *= np.exp(1j * steps)
             self.mix_phase = float((steps[-1] - 2 * np.pi * self.fine_hz / self.if_rate) % (2 * np.pi))
-        audio = self._demodulate(y.astype(np.complex64))
+        y = y.astype(np.complex64)
+        audio = self._demodulate(y)
+        if self.morse is not None:  # before the squelch, so a squelch set too high doesn't stop it
+            self.morse.push(y if self.settings.mode == "cw" else audio)
         squelch = self.settings.squelch_db
         self.open = squelch is None or self.level_db >= squelch
         return audio if self.open else np.zeros_like(audio)

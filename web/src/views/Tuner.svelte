@@ -38,7 +38,8 @@
   const saved = (() => {
     try { return JSON.parse(localStorage.getItem('sentrysdr-tuner') || '{}'); } catch { return {}; }
   })();
-  let listen = $state({ frequency_hz: 0, mode: saved.mode ?? 'nfm', bandwidth_hz: null, deemphasis_us: saved.deemphasis_us ?? 75 });
+  let listen = $state({ frequency_hz: 0, mode: saved.mode ?? 'nfm', bandwidth_hz: null, deemphasis_us: saved.deemphasis_us ?? 75, morse: saved.morse ?? true });
+  const MORSE_MODES = ['cw', 'nfm', 'am'];  // keep in step with sentrysdr/tuner.py
   let step = $state(saved.step ?? 12500);
   let volume = $state(saved.volume ?? 0.8);
   let muted = $state(false);
@@ -53,7 +54,7 @@
   let tab = $state('receiver');
 
   let sdr = $state({ running: false });
-  let rx = $state({ level_db: DB_FLOOR, open: false, inside: true, stereo: false, rds: null });
+  let rx = $state({ level_db: DB_FLOOR, open: false, inside: true, stereo: false, rds: null, morse: null });
   let error = $state('');
   let fatal = $state('');
   let sourceName = $state('');
@@ -89,7 +90,7 @@
 
   function remember() {
     try {
-      localStorage.setItem('sentrysdr-tuner', JSON.stringify({ mode: listen.mode, deemphasis_us: listen.deemphasis_us, step, volume, split, averaging,
+      localStorage.setItem('sentrysdr-tuner', JSON.stringify({ mode: listen.mode, deemphasis_us: listen.deemphasis_us, morse: listen.morse, step, volume, split, averaging,
         ...(rangeSet ? { low: range.low, high: range.high } : {}) }));
       if (listen.frequency_hz) localStorage.setItem(`sentrysdr-tuner-${sourceId}`, String(listen.frequency_hz));
     } catch { /* private window: not remembered */ }
@@ -692,6 +693,12 @@
                 <input id="tuner-volume" type="range" min="0" max="2" step="0.05" bind:value={volume} onchange={remember} />
                 <label class="small"><input type="checkbox" bind:checked={muted} /> Mute</label>
               </div>
+              {#if MORSE_MODES.includes(listen.mode)}
+                <span>Morse</span>
+                <label class="small" title={listen.mode === 'cw' ? 'Decodes the CW you hear.' : 'Decodes a Morse ID sent as a tone, such as a repeater or VOR identifying itself.'}>
+                  <input type="checkbox" bind:checked={listen.morse} onchange={sendListen} /> Decode{listen.mode === 'cw' ? '' : ' IDs sent as a tone'}
+                </label>
+              {/if}
               {#if listen.mode === 'wfm' || listen.mode === 'wfm_stereo'}
                 <label for="tuner-deemph">De-emphasis</label>
                 <select id="tuner-deemph" bind:value={listen.deemphasis_us} onchange={sendListen}>
@@ -707,6 +714,13 @@
               {#if rx.rds && (rx.rds.ps || rx.rds.rt)}
                 <span>RDS</span>
                 <div><strong class="mono">{rx.rds.ps}</strong> <span class="small dim mono">{rx.rds.pi}</span>{#if rx.rds.rt}<div class="small">{rx.rds.rt}</div>{/if}</div>
+              {/if}
+              {#if listen.morse && MORSE_MODES.includes(listen.mode)}
+                <span>Decoded</span>
+                <div>
+                  <div class="mono tuner-morse" aria-live="polite">{rx.morse?.text || '…'}</div>
+                  <div class="small dim">{rx.morse?.wpm ? `About ${rx.morse.wpm} WPM` : 'Listening for Morse'}{rx.morse?.tone_hz ? `, ${rx.morse.tone_hz} Hz tone` : ''}</div>
+                </div>
               {/if}
             </div>
             {#if owner}

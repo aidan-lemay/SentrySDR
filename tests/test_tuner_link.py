@@ -148,7 +148,7 @@ def test_hub_routes_frames_and_ownership():
     assert sent[-1]["op"] == "sync" and sent[-1]["watching"]
     assert hub.rooms[key].controller is None  # nobody owns it until they take it
     hub.command(key, second, {"t": "listen", "frequency_hz": 145_100_000, "mode": "nfm", "evil": 1})
-    assert sent[-1] == {"op": "listen", "listener": second.id, "frequency_hz": 145_100_000, "mode": "nfm", "deemphasis_us": 75}
+    assert sent[-1] == {"op": "listen", "listener": second.id, "frequency_hz": 145_100_000, "mode": "nfm", "deemphasis_us": 75, "morse": False}
     hub.command(key, third, {"t": "listen", "frequency_hz": 145_200_000, "mode": "am"})  # anyone picks their own channel
     with pytest.raises(TunerError, match="owner"):
         hub.command(key, first, {"t": "center", "hz": 146_000_000})
