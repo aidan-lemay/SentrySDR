@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from . import feeds
 from .config import Config
 
-ANALOG = {"nfm", "am", "wfm"}
+ANALOG = {"nfm", "fm", "am", "wfm"}  # nfm: 12.5 kHz channels; fm: 25 kHz (5 kHz deviation)
 # Values are DSD-FME decode flags.
 DIGITAL = {"p25p1": "-f1", "p25p2": "-f2", "dmr": "-fs", "nxdn48": "-fi", "nxdn96": "-fn", "dstar": "-fd", "ysf": "-fy"}
 # DSD-FME writes one channel per time slot for these modes, and mono for the rest.
@@ -26,6 +26,8 @@ ACARS_MAX_HZ = 137_000_000
 ACARS_MAX_SPAN_HZ = 2_000_000
 ACARS_MAX_CHANNELS = 8
 PCM_RATE = 16000
+# Wideband FM needs more than PCM_RATE to fit 5 kHz deviation; rtl_fm resamples it to PCM_RATE.
+FM_WIDE_RATE = 24000
 DIGITAL_INPUT_RATE = 48000
 DSD_OUTPUT_RATE = 8000
 FREQ_MIN_HZ = 500_000
@@ -136,6 +138,8 @@ def rtl_fm_args(cfg: Config, index: int, spec: dict) -> list[str]:
     args = [cfg.binary("rtl_fm") or "rtl_fm", "-d", str(index), "-f", str(spec["frequency_hz"])]
     if modulation == "nfm":
         args += ["-M", "fm", "-s", str(PCM_RATE), "-l", squelch, "-E", "dc"]
+    elif modulation == "fm":
+        args += ["-M", "fm", "-s", str(FM_WIDE_RATE), "-r", str(PCM_RATE), "-l", squelch, "-E", "dc"]
     elif modulation == "am":
         args += ["-M", "am", "-s", str(PCM_RATE), "-l", squelch, "-E", "dc"]
     elif modulation == "wfm":
@@ -156,6 +160,8 @@ def measure_rate(modulation: str) -> int:
     """rtl_fm's sample rate for a mode, which its squelch scale depends on. Matches rtl_fm_args."""
     if modulation == "wfm":
         return 170_000
+    if modulation == "fm":
+        return FM_WIDE_RATE
     return DIGITAL_INPUT_RATE if modulation in DIGITAL else PCM_RATE
 
 

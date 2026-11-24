@@ -523,10 +523,22 @@ def test_nfm_uses_tuner_agc_when_gain_unset(ctx):
 
 
 # rtl_fm's scale depends on its rate: 16 kHz sums 63 samples, 170 kHz 6, 48 kHz 21.
-@pytest.mark.parametrize("modulation, level", [("nfm", "101"), ("am", "101"), ("wfm", "10"), ("dmr", "34"), ("p25p1", "34")])
+@pytest.mark.parametrize("modulation, level", [("nfm", "101"), ("fm", "68"), ("am", "101"), ("wfm", "10"), ("dmr", "34"), ("p25p1", "34")])
 def test_every_rtl_fm_mode_uses_the_targets_squelch_on_its_own_scale(ctx, modulation, level):
     args = pipelines.rtl_fm_args(ctx.cfg, 0, spec(modulation=modulation, squelch=-35.0))
     assert args[args.index("-l") + 1] == level
+
+
+def test_wideband_fm_reads_wider_and_still_gives_16_khz_audio(ctx):
+    args = pipelines.rtl_fm_args(ctx.cfg, 0, spec(modulation="fm"))
+    assert args[args.index("-M") + 1] == "fm" and args[args.index("-s") + 1] == "24000" and args[args.index("-r") + 1] == "16000"
+    narrow = pipelines.rtl_fm_args(ctx.cfg, 0, spec(modulation="nfm"))
+    assert narrow[narrow.index("-s") + 1] == "16000" and "-r" not in narrow  # narrowband unchanged
+    # Measuring reads at the rate it records at, so the noise and the squelch are on one scale.
+    assert pipelines.measure_rate("fm") == 24000
+    measured = pipelines.measure_args(ctx.cfg, 0, 146_940_000, "fm", None)
+    assert measured[measured.index("-s") + 1] == "24000"
+    assert capabilities.use_for("audio", "fm") == {"voice"}
 
 
 def test_squelch_off_and_extremes(ctx):

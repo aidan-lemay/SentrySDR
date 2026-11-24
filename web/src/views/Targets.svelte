@@ -43,7 +43,7 @@
     eu: ['Europe', [131.525, 131.725, 131.825]],
   };
   const MAX_SPAN_MHZ = 2;
-  const MODE_NAMES = { adsb: 'ADS-B', ais: 'AIS', acars: 'ACARS', rtltcp: 'rtl_tcp', tuner: 'Tuner' };
+  const MODE_NAMES = { nfm: 'NFM (12.5 kHz)', fm: 'FM (25 kHz)', adsb: 'ADS-B', ais: 'AIS', acars: 'ACARS', rtltcp: 'rtl_tcp', tuner: 'Tuner' };
   // These frequencies are the standard ones each decoder listens on.
   const FIXED = { adsb: { modulation: 'adsb', mhz: 1090 }, ais: { modulation: 'ais', mhz: 162 } };
 
@@ -250,6 +250,7 @@
         <select bind:value={form.modulation}>
           {#each MODULATIONS as option (option.value)}<option value={option.value}>{option.label}</option>{/each}
         </select>
+        {#if ['nfm', 'fm'].includes(form.modulation)}<span class="hint">Narrowband for public safety and business radio, which has been 12.5 kHz since 2013. Wideband for ham repeaters, low band (25 to 50 MHz) and older systems. RadioReference lists them as FMN and FM.</span>{/if}
       </label>
       <label class="field"><span>Squelch (dB)</span>
         <input class="mono" type="number" min="-130" max="0" step="0.1" placeholder="Off" bind:value={form.squelch} />
