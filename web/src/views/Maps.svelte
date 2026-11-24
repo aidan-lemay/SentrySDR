@@ -24,16 +24,46 @@
     ? (item.flight?.trim() || item.hex)
     : (item.shipname?.trim() || item.mmsi);
 
+  // Where to read about a registration: the FAA's registry for a US N-number, which its search box
+  // takes without the N, and FlightAware for any country, which takes it without the hyphen.
+  const US_REGISTRATION = /^N[1-9][0-9A-Z]{0,4}$/;
+  function registryLinks(registration) {
+    const reg = String(registration).toUpperCase().replace(/[^A-Z0-9-]/g, '');
+    if (!reg) return [];
+    const flightaware = ['FlightAware', `https://www.flightaware.com/resources/registration/${encodeURIComponent(reg.replace(/-/g, ''))}`];
+    return US_REGISTRATION.test(reg)
+      ? [['FAA registry', `https://registry.faa.gov/AircraftInquiry/Search/NNumberResult?nNumberTxt=${encodeURIComponent(reg.slice(1))}`], flightaware]
+      : [flightaware];
+  }
+
+  function outLink(text, href, title) {
+    const link = document.createElement('a');
+    link.href = href;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';  // the other site isn't told this page's address
+    link.textContent = text;
+    if (title) link.title = title;
+    return link;
+  }
+
   // Remote data is only ever placed with textContent, never parsed as HTML.
   function popup(item) {
     const node = document.createElement('div');
     const lines = kind === 'adsb'
-      ? [label(item), item.registration ? `Registration ${item.registration}` : null, `Hex ${item.hex}`, item.alt_baro != null ? `Altitude ${item.alt_baro} ft` : null, item.gs != null ? `Speed ${Math.round(item.gs)} kt` : null]
+      ? [label(item), item.registration ? { registration: item.registration } : null, `Hex ${item.hex}`, item.alt_baro != null ? `Altitude ${item.alt_baro} ft` : null, item.gs != null ? `Speed ${Math.round(item.gs)} kt` : null]
       : [label(item), `MMSI ${item.mmsi}`, item.speed != null ? `Speed ${item.speed} kt` : null, item.destination ? `To ${item.destination}` : null];
     if (item.emergency) lines.unshift(`EMERGENCY: ${item.emergency}`);
     for (const line of lines.filter(Boolean)) {
       const row = document.createElement('div');
-      row.textContent = String(line);
+      if (line.registration) {
+        // The registration opens its record; FlightAware is offered too, beside the FAA.
+        const [first, ...more] = registryLinks(line.registration);
+        row.append('Registration ');
+        row.append(first ? outLink(line.registration, first[1], `Look it up on ${first[0]}`) : line.registration);
+        for (const [name, href] of more) row.append(' (', outLink(name, href), ')');
+      } else {
+        row.textContent = String(line);
+      }
       node.append(row);
     }
     if (kind === 'adsb' && item.acars_count) {
