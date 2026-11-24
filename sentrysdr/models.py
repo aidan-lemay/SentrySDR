@@ -160,7 +160,10 @@ class Target(Base):
     kind: Mapped[str] = mapped_column(String(8), default="audio")  # audio|adsb|ais
     frequency_hz: Mapped[int] = mapped_column()
     modulation: Mapped[str] = mapped_column(String(12), default="nfm")
-    squelch: Mapped[int] = mapped_column(default=50)  # 0 = continuous recording
+    # Retired: rtl_fm's own squelch scale. Converted to squelch_db on upgrade, then left at 0.
+    squelch: Mapped[int] = mapped_column(default=0)
+    # dB, as the web tuner shows it. None = off: continuous recording.
+    squelch_db: Mapped[float | None] = mapped_column(nullable=True)
     volume_db: Mapped[float | None] = mapped_column(nullable=True)  # applied to the audio
     clearcut_enabled: Mapped[bool] = mapped_column(default=False)
     clearcut_system: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -195,9 +198,11 @@ class SdrProfile(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     source_id: Mapped[int] = mapped_column(ForeignKey("sources.id", ondelete="CASCADE"), index=True)
     target_id: Mapped[int] = mapped_column(ForeignKey("targets.id", ondelete="CASCADE"), index=True)
-    squelch: Mapped[int] = mapped_column()
+    squelch: Mapped[int] = mapped_column(default=0)  # retired, as Target.squelch
+    squelch_db: Mapped[float | None] = mapped_column(nullable=True)  # None = off
     gain_db: Mapped[float | None] = mapped_column(nullable=True)  # None = tuner AGC
-    noise_level: Mapped[float | None] = mapped_column(nullable=True)
+    noise_level: Mapped[float | None] = mapped_column(nullable=True)  # retired: rtl_fm's scale
+    noise_db: Mapped[float | None] = mapped_column(nullable=True)  # typical noise when measured
     measured_at: Mapped[float | None] = mapped_column(nullable=True)
     updated_by: Mapped[str] = mapped_column(String(320), default="")
     __table_args__ = (Index("uq_profile_source_target", "source_id", "target_id", unique=True),)
@@ -452,6 +457,29 @@ def _convert_source_antennas(engine) -> None:
             )
 
 
+def _convert_squelch_to_db(engine) -> None:
+    """Squelch and noise used to be on rtl_fm's own scale, which differs between modes. Make them dB.
+
+    Each converted row has its old value set to 0 (or NULL), so this runs once per row.
+    """
+    from .pipelines import level_to_db, measure_rate
+    with engine.begin() as connection:
+        rows = connection.execute(text("SELECT id, kind, modulation, squelch FROM targets WHERE squelch != 0")).all()
+        for target_id, kind, modulation, squelch in rows:
+            db = level_to_db(squelch, measure_rate(modulation)) if kind == "audio" else None
+            connection.execute(text("UPDATE targets SET squelch_db = :d, squelch = 0 WHERE id = :t"), {"d": db, "t": target_id})
+        rows = connection.execute(text(
+            "SELECT p.id, t.modulation, p.squelch, p.noise_level FROM sdr_profiles p JOIN targets t ON t.id = p.target_id "
+            "WHERE p.squelch != 0 OR p.noise_level IS NOT NULL"
+        )).all()
+        for profile_id, modulation, squelch, noise in rows:
+            rate = measure_rate(modulation)
+            connection.execute(
+                text("UPDATE sdr_profiles SET squelch_db = :d, noise_db = :n, squelch = 0, noise_level = NULL WHERE id = :p"),
+                {"d": level_to_db(squelch, rate) if squelch else None, "n": None if noise is None else level_to_db(noise, rate), "p": profile_id},
+            )
+
+
 def _drop_retired_uses(engine) -> None:
     """Some stick uses were removed from the app. Take them off sticks that had them."""
     from .capabilities import RETIRED_USES
@@ -517,6 +545,7 @@ def make_session_factory(db_path: Path):
     _add_missing_columns(engine)
     _retire_lock_passwords(engine)
     _convert_source_antennas(engine)
+    _convert_squelch_to_db(engine)
     _drop_retired_uses(engine)
     _fill_feeder_uuids(engine)
     _fill_rtl_tcp_ports(engine)

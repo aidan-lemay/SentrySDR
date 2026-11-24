@@ -44,7 +44,8 @@ export async function api(path, { method = 'GET', body, headers = {} } = {}) {
 }
 
 export const MODULATIONS = [
-  { value: 'nfm', label: 'NFM (narrow FM)' },
+  { value: 'nfm', label: 'NFM, narrowband (12.5 kHz channels)' },
+  { value: 'fm', label: 'FM, wideband (25 kHz channels)' },
   { value: 'am', label: 'AM (airband)' },
   { value: 'wfm', label: 'WFM (broadcast)' },
   { value: 'p25p1', label: 'P25 Phase 1' },
@@ -125,7 +126,7 @@ export const STATE_LABELS = {
 // What a stick can do. Keep in step with sentrysdr/capabilities.py.
 export const RECORDED_USES = [['voice', 'Analog voice'], ['digital', 'Digital voice'], ['adsb', 'ADS-B'], ['ais', 'AIS'], ['acars', 'ACARS']];
 export const OTHER_USES = [['broadcast_fm', 'Broadcast FM']];
-const ANALOG_MODES = ['nfm', 'am', 'wfm'];
+const ANALOG_MODES = ['nfm', 'fm', 'am', 'wfm'];
 export const useLabel = (key) => [...RECORDED_USES, ...OTHER_USES].find(([id]) => id === key)?.[1] ?? key;
 
 // The step the stick will really use when a gain isn't one of its steps, else null.

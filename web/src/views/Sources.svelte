@@ -151,7 +151,7 @@
     const saved = profileFor(source, m.target);
     m.gain = saved ? (saved.gain_db ?? '') : (source.gain_db ?? DEFAULT_GAIN_DB);
     if (!saved && source.gain_db == null) m.gain = nearestStep(source.gain_steps, m.gain) ?? m.gain;  // the default may not be a step
-    m.squelch = saved ? saved.squelch : '';
+    m.squelch = saved?.squelch ?? '';
     m.result = null;
   }
 
@@ -275,7 +275,7 @@
                   <span class="mono nowrap">{formatMHz(source.active_target.frequency_hz)}</span><br />
                   {source.active_target.name} ({MODE_LABELS[source.active_target.modulation] ?? source.active_target.modulation.toUpperCase()})
                   {#if source.active_target.kind === 'audio'}
-                    <br /><span class="small">Squelch {source.active_target.squelch || 'off'}, gain {gainLabel(source.active_target.gain_db)}{source.active_target.from_profile ? ', saved profile' : ''}</span>
+                    <br /><span class="small">Squelch {source.active_target.squelch == null ? 'off' : `${source.active_target.squelch} dB`}, gain {gainLabel(source.active_target.gain_db)}{source.active_target.from_profile ? ', saved profile' : ''}</span>
                   {/if}
                   {#if source.active_is_schedule}<br /><span class="st-warn small">Schedule: {source.active_recorder_name}</span>{/if}
                 {:else}
@@ -381,7 +381,7 @@
                   <p class="small dim form-buttons">Noise differs by stick, frequency and gain. A saved profile sets the squelch and gain for one target on this SDR.</p>
                   {#each source.profiles as saved (saved.target_id)}
                     <div class="small" style="margin:.4rem 0">
-                      <strong>{targetName(saved.target_id)}</strong>: squelch {saved.squelch}, gain {gainLabel(saved.gain_db)}{saved.noise_level !== null ? `, noise ${Math.round(saved.noise_level)} on ${formatTime(saved.measured_at)}` : ''}
+                      <strong>{targetName(saved.target_id)}</strong>: squelch {saved.squelch == null ? 'off' : `${saved.squelch} dB`}, gain {gainLabel(saved.gain_db)}{saved.noise_level !== null ? `, noise ${saved.noise_level} dB on ${formatTime(saved.measured_at)}` : ''}
                       <div class="buttons" style="margin:.2rem 0"><button onclick={() => removeProfile(source, saved.target_id)}>Remove</button></div>
                     </div>
                   {/each}
@@ -402,12 +402,13 @@
                   <div class="buttons form-buttons"><button disabled={m.target === '' || m.busy} onclick={() => measure(source)}>{m.busy ? 'Measuring, about 10 seconds...' : 'Measure noise'}</button></div>
                   {#if m.result}
                     <div class="msg" role="status">
-                      Noise: lowest {m.result.low}, typical {m.result.typical}, highest {m.result.high}. Suggested squelch: <strong>{m.result.suggested}</strong>.
+                      Noise: lowest {m.result.low} dB, typical {m.result.typical} dB, highest {m.result.high} dB. Suggested squelch: <strong>{m.result.suggested} dB</strong>.
                       {#if m.result.moved}<br />The level moved a lot, so something may have transmitted. Measure again if this looks wrong.{/if}
                     </div>
                   {/if}
-                  <label class="field"><span>Squelch</span>
-                    <input class="mono" type="number" inputmode="numeric" min="0" max="100000" bind:value={m.squelch} />
+                  <label class="field"><span>Squelch (dB)</span>
+                    <input class="mono" type="number" min="-130" max="0" step="0.1" bind:value={m.squelch} />
+                    <span class="hint">The same scale as the web tuner's signal meter and squelch.</span>
                   </label>
                   <div class="buttons form-buttons"><button class="main" disabled={m.target === '' || m.squelch === '' || m.squelch === null} onclick={() => saveProfile(source)}>Save profile</button></div>
                 </details>

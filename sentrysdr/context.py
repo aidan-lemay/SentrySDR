@@ -376,7 +376,7 @@ class Context:
                         "target_id": target.id, "target_name": target.name,
                         "kind": target.kind, "frequency_hz": target.frequency_hz,
                         "modulation": target.modulation,
-                        "squelch": profile.squelch if profile else target.squelch,
+                        "squelch": profile.squelch_db if profile else target.squelch_db,
                         "gain_db": profile.gain_db if profile else source.gain_db,
                         "ppm": source.ppm, "volume_db": target.volume_db or 0,
                         "channels": target.acars_channels or [] if target.kind == "acars" else [],

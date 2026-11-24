@@ -59,7 +59,7 @@ except OSError:
 
 
 def tuner_spec(**overrides):
-    return spec(kind="tuner", modulation="tuner", frequency_hz=145_000_000, squelch=0, **overrides)
+    return spec(kind="tuner", modulation="tuner", frequency_hz=145_000_000, squelch=None, **overrides)
 
 
 @pytest.fixture

@@ -55,7 +55,7 @@ def install_tool(directory, name, source):
 def spec(**overrides):
     return pipelines.sanitize_spec({
         "recorder_id": 1, "recorder_name": "r", "source_id": 1, "source_name": "s", "target_id": 1,
-        "target_name": "K1ABC", "frequency_hz": 444_444_000, "modulation": "nfm", "squelch": 50, **overrides,
+        "target_name": "K1ABC", "frequency_hz": 444_444_000, "modulation": "nfm", "squelch": -41.1, **overrides,
     })
 
 
@@ -658,13 +658,13 @@ async def run_stuck(tmp_path, monkeypatch, **spec_overrides):
 
 
 async def test_warns_when_squelch_stays_open_then_clears(tmp_path, monkeypatch):
-    history = await run_stuck(tmp_path, monkeypatch, squelch=60)
+    history = await run_stuck(tmp_path, monkeypatch, squelch=-39.6)
     assert engine.SQUELCH_STUCK_WARNING in history
     assert history[-1] == ""
 
 
 async def test_no_warning_for_continuous_recording(tmp_path, monkeypatch):
-    assert engine.SQUELCH_STUCK_WARNING not in await run_stuck(tmp_path, monkeypatch, squelch=0)
+    assert engine.SQUELCH_STUCK_WARNING not in await run_stuck(tmp_path, monkeypatch, squelch=None)
 
 
 # --- the measure command -------------------------------------------------------
@@ -687,7 +687,7 @@ def test_measure_prints_a_suggestion(tmp_path, monkeypatch, capsys):
     cfg = measure_cfg(tmp_path, FAKE_RAW)
     assert cmd_measure(cfg, "SER1", 444.85, "nfm", None, 0, 1.0) == 0
     out = capsys.readouterr().out
-    assert "typical 64" in out and "Suggested squelch: 128" in out
+    assert "typical -39 dB" in out and "Suggested squelch: -33 dB" in out
 
 
 def test_measure_refuses_an_unlisted_sdr(tmp_path, capsys):
@@ -733,7 +733,7 @@ async def test_measure_saves_the_call_then_resumes_the_assignment(tmp_path, monk
         assert await wait_for(lambda: statuses.get("SER1") and statuses["SER1"][-1]["in_call"])
         await asyncio.sleep(0.8)
         result = await sup.measure("SER1", **MEASURE)
-        assert result["typical"] == 64 and result["suggested"] == 128 and result["moved"] is False
+        assert result["typical"] == -39.0 and result["suggested"] == -33.0 and result["moved"] is False
         assert "measuring" in [s["state"] for s in statuses["SER1"]]
         assert len(calls) == 1  # the interrupted call was kept
         assert await wait_for(lambda: statuses["SER1"][-1]["state"] == "listening" and statuses["SER1"][-1]["in_call"])
@@ -786,7 +786,7 @@ if not os.path.exists({str(marker)!r}):
 if "raw" in sys.argv:""")
     sup, _, _ = measuring_sup(tmp_path, monkeypatch, tool)
     try:
-        assert (await sup.measure("SER1", **MEASURE))["typical"] == 64
+        assert (await sup.measure("SER1", **MEASURE))["typical"] == -39.0
     finally:
         await sup.shutdown()
 
@@ -821,7 +821,7 @@ async def test_slave_answers_a_measure_request_and_rejects_bad_ones(tmp_path, mo
     try:
         await slave.handle_message({"t": "measure", "id": "a1", "serial": "FIELD1", **MEASURE})
         reply = json.loads(await asyncio.wait_for(slave.outgoing.get(), 15))
-        assert reply["t"] == "measure_result" and reply["id"] == "a1" and reply["ok"] and reply["result"]["typical"] == 64
+        assert reply["t"] == "measure_result" and reply["id"] == "a1" and reply["ok"] and reply["result"]["typical"] == -39.0
         for bad in ({"serial": "OTHER", **MEASURE}, {"serial": "FIELD1", **MEASURE, "modulation": "x; rm"}):
             await slave.handle_message({"t": "measure", "id": "a2", **bad})
             reply = json.loads(await asyncio.wait_for(slave.outgoing.get(), 15))
@@ -1104,7 +1104,7 @@ async def test_acars_worker_passes_messages_on(tmp_path):
     got = []
     sup = supervisor(make_config(tmp_path, bin_dirs=[bins]), [], tracks=lambda kind, serial, data: got.append((kind, serial, data)))
     try:
-        await sup.apply({"SER1": spec(kind="acars", modulation="acars", frequency_hz=130_025_000, squelch=0,
+        await sup.apply({"SER1": spec(kind="acars", modulation="acars", frequency_hz=130_025_000, squelch=None,
                                       channels=[130_025_000, 131_550_000], gain_db=40.2)})
         assert await wait_for(lambda: got)
         await asyncio.sleep(0.3)
@@ -1231,7 +1231,7 @@ async def test_rtl_tcp_worker_reports_clients(tmp_path, monkeypatch):
     sup = supervisor(cfg, [])
     worker = sup.workers["SER1"]
     try:
-        await sup.apply({"SER1": spec(kind="rtltcp", modulation="rtltcp", frequency_hz=162_550_000, squelch=0, rtl_tcp_port=port)})
+        await sup.apply({"SER1": spec(kind="rtltcp", modulation="rtltcp", frequency_hz=162_550_000, squelch=None, rtl_tcp_port=port)})
         assert await wait_for(lambda: worker.state == "listening")
         assert worker.rtl_tcp == {"address": f"127.0.0.1:{port}", "client": False}
         await asyncio.sleep(0.5)
@@ -1251,7 +1251,7 @@ async def test_going_idle_clears_old_feed_and_rtl_tcp_status(tmp_path):
     sup = supervisor(make_config(tmp_path, bin_dirs=[bins]), [])
     worker = sup.workers["SER1"]
     try:
-        await sup.apply({"SER1": spec(kind="rtltcp", modulation="rtltcp", frequency_hz=162_550_000, squelch=0, rtl_tcp_port=31251)})
+        await sup.apply({"SER1": spec(kind="rtltcp", modulation="rtltcp", frequency_hz=162_550_000, squelch=None, rtl_tcp_port=31251)})
         assert await wait_for(lambda: worker.rtl_tcp)
         worker.feed_status = {"aggregators": {"adsbx": False}}
         await sup.apply({"SER1": None})

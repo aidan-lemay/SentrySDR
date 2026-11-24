@@ -213,7 +213,7 @@ def _source_view(ctx: Context, db, source: Source, winners: dict, recorders: lis
         "active_target": {
             "id": target.id, "name": target.name, "frequency_hz": target.frequency_hz,
             "modulation": target.modulation, "kind": target.kind,
-            "squelch": profile.squelch if profile else target.squelch,
+            "squelch": profile.squelch_db if profile else target.squelch_db,
             "gain_db": profile.gain_db if profile else source.gain_db,
             "from_profile": profile is not None,
         } if target else None,
@@ -223,8 +223,8 @@ def _source_view(ctx: Context, db, source: Source, winners: dict, recorders: lis
 
 def _profile_view(profile: SdrProfile) -> dict:
     return {
-        "target_id": profile.target_id, "squelch": profile.squelch, "gain_db": profile.gain_db,
-        "noise_level": profile.noise_level, "measured_at": profile.measured_at,
+        "target_id": profile.target_id, "squelch": profile.squelch_db, "gain_db": profile.gain_db,
+        "noise_level": profile.noise_db, "measured_at": profile.measured_at,
         "updated_by": profile.updated_by,
     }
 
@@ -373,7 +373,7 @@ class TargetBody(BaseModel):
     kind: str = "audio"
     frequency_hz: int = Field(ge=pipelines.FREQ_MIN_HZ, le=pipelines.FREQ_MAX_HZ)
     modulation: str = "nfm"
-    squelch: int = Field(default=50, ge=0, le=100000)
+    squelch: float | None = Field(default=-40.0, ge=pipelines.SQUELCH_DB_MIN, le=pipelines.SQUELCH_DB_MAX)  # dB; None is off
     volume_db: float = Field(default=0, ge=pipelines.VOLUME_MIN_DB, le=pipelines.VOLUME_MAX_DB)
     clearcut_enabled: bool = False
     clearcut_system: str | None = Field(default=None, max_length=64, pattern=r"^[A-Za-z0-9_.-]+$")
@@ -436,8 +436,19 @@ def _same_channel_warning(db, body: TargetBody, target_id: int | None = None) ->
     return None
 
 
+SQUELCH_COLUMNS = {"squelch", "squelch_db"}
+
+
 def _target_view(target: Target) -> dict:
-    return {c.name: getattr(target, c.name) for c in Target.__table__.columns}
+    view = {c.name: getattr(target, c.name) for c in Target.__table__.columns if c.name not in SQUELCH_COLUMNS}
+    view["squelch"] = target.squelch_db  # dB, or None for off
+    return view
+
+
+def _target_values(body: TargetBody) -> dict:
+    values = body.model_dump()
+    values["squelch_db"] = values.pop("squelch")
+    return values
 
 
 @router.get("/broadcastify-systems")
@@ -470,7 +481,7 @@ def create_target(body: TargetBody, request: Request, user: User = Depends(requi
     _refuse_rtl_tcp(user, body)
     _validate_target(body, db)
     warning = _same_channel_warning(db, body)
-    target = Target(**body.model_dump())
+    target = Target(**_target_values(body))
     db.add(target)
     db.commit()
     ctx.audit("target.created", user=user, ip=ip_of(request), target=target.name)
@@ -507,7 +518,7 @@ def update_target(target_id: int, body: TargetBody, request: Request, user: User
     cleared = list(db.scalars(select(SdrProfile).where(SdrProfile.target_id == target_id))) if retuned else []
     for profile in cleared:
         db.delete(profile)
-    for key, value in body.model_dump().items():
+    for key, value in _target_values(body).items():
         setattr(target, key, value)
     db.commit()
     ctx.audit("target.updated", user=user, ip=ip_of(request), target=target.name,
@@ -758,9 +769,10 @@ async def detect_stick(body: DetectBody, request: Request, admin: User = Depends
 
 
 class ProfileBody(BaseModel):
-    squelch: int = Field(ge=0, le=100000)
+    """Squelch and noise in dB. A squelch of None is off."""
+    squelch: float | None = Field(ge=pipelines.SQUELCH_DB_MIN, le=pipelines.SQUELCH_DB_MAX)
     gain_db: float | None = Field(default=None, ge=0, le=60)
-    noise_level: float | None = Field(default=None, ge=0, le=100000)
+    noise_level: float | None = Field(default=None, ge=pipelines.SQUELCH_DB_MIN, le=pipelines.SQUELCH_DB_MAX)
 
 
 @router.put("/sources/{source_id}/profiles/{target_id}")
@@ -773,7 +785,7 @@ def save_profile(source_id: int, target_id: int, body: ProfileBody, request: Req
     if profile is None:
         profile = SdrProfile(source_id=source_id, target_id=target_id)
         db.add(profile)
-    profile.squelch, profile.gain_db, profile.noise_level = body.squelch, body.gain_db, body.noise_level
+    profile.squelch_db, profile.gain_db, profile.noise_db = body.squelch, body.gain_db, body.noise_level
     profile.measured_at = time.time() if body.noise_level is not None else None
     profile.updated_by = user.email
     db.commit()
