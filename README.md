@@ -330,7 +330,7 @@ On the Schedule page, a schedule puts an SDR on a target for a while. It **repea
 - **goes back:** the SDR returns to its normal assignment, or to nothing if it had none. This is the default.
 - **keeps this target:** the schedule's target becomes the SDR's normal assignment, even if it had none before.
 
-Keeping only happens when the time runs out, not when someone turns the schedule off early. It still happens if the service was down at the end time, once it's back. If an administrator has locked the SDR's assignment since, it's left alone and the audit log says so. If two schedules overlap on one SDR, the one created first wins.
+Keeping only happens when the time runs out, not when someone turns the schedule off early. It still happens if the service was down at the end time, once it's back. If an administrator has locked the SDR's assignment since, it's left alone and the audit log says so. If two schedules overlap on one SDR, the one created first wins. On a [multi-channel SDR](#multi-channel-sdrs), a schedule can instead add its target as one more channel for its window.
 
 ## Antennas
 
@@ -446,7 +446,7 @@ On the Sources page, open **Change assignment** and choose **Multi-channel**, th
 - **Measuring.** **Measure noise** on a running channel reads it from the live stream for 10 seconds, at the SDR's gain, without pausing the other channels.
 - **Uploads** are per call, so each channel goes to its own target's Broadcastify Calls, ClearCut and RDIO settings, as if it had its own SDR.
 - **Changing the set** (adding or removing a channel, or the gain) briefly restarts the SDR, so a call in progress on another channel ends and is saved. Changing a channel's squelch or volume doesn't.
-- **Schedules** take a multi-channel SDR over for their window, as on any SDR. A schedule set to keep its target adds it as one more channel when it ends, if it fits; if not, it's skipped and the audit log says why.
+- **Schedules** on a multi-channel SDR either **take over the SDR**, as on any SDR, or **add as a channel**: the target joins its channels for the window while they carry on. One set to add that doesn't fit alongside them at the time takes the SDR over instead, and saving it warns if that's how it stands. After a takeover, every channel comes back. A schedule set to keep its target adds it as one more channel when it ends, if it fits; if not, it's skipped and the audit log says why.
 - **Locks** cover every channel.
 - **Only NFM, FM and AM.** Digital voice, ADS-B, AIS, ACARS, rtl_tcp and the web tuner still take the whole stick.
 

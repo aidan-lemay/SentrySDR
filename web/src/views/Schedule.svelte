@@ -8,7 +8,7 @@
   const canEdit = user.permissions.includes('assign');
   const blank = () => ({
     id: null, name: '', source_id: '', target_id: '', repeat: 'weekly', days: [], start: '22:00', end: '23:00',
-    onceStart: '', onceEnd: '', onEnd: 'return', enabled: true,
+    onceStart: '', onceEnd: '', onEnd: 'return', enabled: true, mode: 'takeover',
   });
 
   let recorders = $state([]);
@@ -44,7 +44,7 @@
     message = '';
     const body = {
       name: form.name, source_id: Number(form.source_id), target_id: Number(form.target_id), enabled: form.enabled,
-      repeat: form.repeat, on_end: form.onEnd,
+      repeat: form.repeat, on_end: form.onEnd, mode: form.mode,
       ...(form.repeat === 'once'
         ? { once_start: form.onceStart, once_end: form.onceEnd }
         : { schedule_days: form.days, schedule_start: form.start, schedule_end: form.end }),
@@ -66,7 +66,7 @@
       id: recorder.id, name: recorder.name, source_id: recorder.source_id, target_id: recorder.target_id,
       repeat: recorder.repeat, days: [...recorder.schedule_days], start: recorder.schedule_start ?? '22:00', end: recorder.schedule_end ?? '23:00',
       onceStart: recorder.once_start ? zonedInputValue(recorder.once_start, tz) : '', onceEnd: recorder.once_end ? zonedInputValue(recorder.once_end, tz) : '',
-      onEnd: recorder.on_end, enabled: recorder.enabled,
+      onEnd: recorder.on_end, enabled: recorder.enabled, mode: recorder.mode ?? 'takeover',
     };
     document.getElementById('schedule-form')?.scrollIntoView();
   }
@@ -88,7 +88,7 @@
 </script>
 
 <h1>Schedule</h1>
-<p class="small">A schedule takes over its source for the times shown. Afterwards the source goes back to what it was doing, unless the schedule keeps its target.{tz ? ` Times are in ${tz}.` : ''}</p>
+<p class="small">A schedule takes over its source for the times shown, or on a multi-channel SDR can add a channel instead. Afterwards the source goes back to what it was doing, unless the schedule keeps its target.{tz ? ` Times are in ${tz}.` : ''}</p>
 
 {#if error}<div class="err" role="alert">{error}</div>{/if}
 {#if message}<Notice ondismiss={() => (message = '')}>{message}</Notice>{/if}
@@ -102,7 +102,7 @@
         <tr>
           <td class="title-cell">{recorder.name}{#if !recorder.enabled}{' '}<span class="st-warn">(off)</span>{:else if recorder.finished}{' '}<span class="dim">(finished)</span>{:else if recorder.running}{' '}<span class="st-ok">(running)</span>{/if}</td>
           <td data-label="Source"><span>{recorder.source_name}</span></td>
-          <td data-label="Target"><span>{recorder.target_name} <span class="mono small nowrap">{formatMHz(recorder.frequency_hz)}</span></span></td>
+          <td data-label="Target"><span>{recorder.target_name} <span class="mono small nowrap">{formatMHz(recorder.frequency_hz)}</span>{#if recorder.mode === 'add'}<br /><span class="small dim">Adds a channel</span>{/if}</span></td>
           <td data-label="When"><span>{formatSchedule(recorder, tz)}</span></td>
           <td data-label="Afterwards"><span class="small">{recorder.on_end === 'keep' ? 'Keeps this target' : 'Goes back'}</span></td>
           <td>
@@ -184,6 +184,17 @@
             {/each}
           </div>
         </div>
+      {/if}
+      {#if chosenSource?.multichannel}
+        <label class="field"><span>While it runs</span>
+          <select bind:value={form.mode}>
+            <option value="takeover">Take over the SDR</option>
+            <option value="add">Add as a channel</option>
+          </select>
+          <span class="hint">{form.mode === 'add'
+            ? `${chosenSource.name} is multi-channel: this target joins its channels for the window, and they carry on. If it doesn't fit alongside them then, it takes the SDR over instead.`
+            : `Only this target runs on ${chosenSource.name} for the window. Its channels come back afterwards.`}</span>
+        </label>
       {/if}
       <label class="field"><span>When it ends</span>
         <select bind:value={form.onEnd}>

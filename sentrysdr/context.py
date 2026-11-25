@@ -379,25 +379,58 @@ class Context:
         with self.db() as session:
             recorders = list(session.scalars(select(Recorder)))
             result: dict[int, dict[str, dict]] = {}
-            for source_id, (active, bases) in schedule.resolve_sets(recorders, local_now).items():
+            for source_id, (actives, bases) in schedule.resolve_sets(recorders, local_now).items():
                 source = session.get(Source, source_id)
                 if source is None:
                     continue
                 try:
-                    if source.multichannel:
-                        # A schedule takes the SDR over: just its own target, still multi-channel if it can be.
-                        spec = self._multi_spec(session, source, [active] if active else bases)
-                        if spec is None and active is not None:
-                            spec = self._single_spec(session, source, active)
-                    else:
-                        recorder = active or (bases[0] if bases else None)
-                        spec = self._single_spec(session, source, recorder) if recorder else None
+                    running, multi, _ = self.running_recorders(session, source, actives, bases)
+                    spec = None
+                    if running and multi:
+                        spec = self._multi_spec(session, source, running)
+                    if running and spec is None:
+                        spec = self._single_spec(session, source, running[0])
                 except pipelines.SpecError as exc:
                     log.error("source %s has an invalid configuration: %s", source.id, exc)
                     continue
                 if spec is not None:
                     result.setdefault(source.node_id, {})[source.serial] = spec
             return result
+
+    def running_recorders(self, session, source: Source, actives: list[Recorder], bases: list[Recorder]) -> tuple[list[Recorder], bool, bool]:
+        """What an SDR runs now, whether as multi-channel, and whether a schedule has taken it over.
+
+        A schedule that takes over wins. Otherwise, on a multi-channel SDR, schedules set to add
+        join its channels; one that doesn't fit takes the SDR over instead. A single-channel SDR
+        runs its first schedule, or its base.
+        """
+        takeover, adding = schedule.split(actives)
+        if not source.multichannel:
+            first = takeover or (adding[0] if adding else None) or (bases[0] if bases else None)
+            return ([first] if first else []), False, first is not None and first.schedule_days is not None
+        if takeover is not None:
+            return [takeover], True, True
+        on, joining = {r.target_id for r in bases}, []
+        for recorder in adding:  # a target that's already a channel needn't be added again
+            if recorder.target_id not in on:
+                on.add(recorder.target_id)
+                joining.append(recorder)
+        adding = joining
+        _, left_out = self.multi_channels(session, source, bases + adding)
+        misfit = next((r for r in adding if r in left_out), None)
+        if misfit is not None:
+            return [misfit], True, True  # doesn't fit alongside the channels: it takes the SDR over
+        return bases + adding, True, False
+
+    def running_schedules(self, session, recorders: list[Recorder], local_now: datetime) -> set[int]:
+        """The ids of schedules running now, taking over or adding a channel."""
+        ids = set()
+        for source_id, (actives, bases) in schedule.resolve_sets(recorders, local_now).items():
+            source = session.get(Source, source_id)
+            if source is not None and actives:
+                running, _, _ = self.running_recorders(session, source, actives, bases)
+                ids |= {r.id for r in running if r.schedule_days is not None}
+        return ids
 
     def _profile(self, session, source: Source, target: Target):
         return session.scalar(select(SdrProfile).where(SdrProfile.source_id == source.id, SdrProfile.target_id == target.id))
@@ -912,7 +945,7 @@ class Context:
         kept, events = [], []
         with self.db() as session:
             recorders = list(session.scalars(select(Recorder)))
-            winners = {r.id for r in schedule.resolve(recorders, local_now).values()}
+            winners = self.running_schedules(session, recorders, local_now)
             for rec in recorders:
                 if rec.schedule_days is None:
                     continue

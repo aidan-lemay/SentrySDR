@@ -226,36 +226,44 @@ def _source_view(ctx: Context, db, source: Source, winners: dict, recorders: lis
 
 
 def _multi_view(ctx: Context, db, source: Source, active: Recorder | None, recorders: list[Recorder], status: dict) -> dict:
-    """A multi-channel SDR's channels, each with its own state. A schedule in control shows as usual."""
+    """A multi-channel SDR's channels, each with its own state, including schedules adding one now.
+
+    A schedule that has taken it over shows as usual, as the one active target.
+    """
     if not source.multichannel:
         return {"multichannel": False, "channels": [], "plan": None, "load": None}
-    bases = sorted((r for r in recorders if r.source_id == source.id and r.schedule_days is None and r.enabled), key=lambda r: r.id)
-    fitting, left_out = ctx.multi_channels(db, source, bases)
+    mine = [r for r in recorders if r.source_id == source.id]
+    actives, bases = schedule.resolve_sets(mine, datetime.now(ctx.cfg.tz)).get(source.id, ([], []))
+    running, _, taken_over = ctx.running_recorders(db, source, actives, bases)
+    fitting, left_out = ctx.multi_channels(db, source, bases if taken_over else running)
+    by_recorder = {r.id: r for r in mine}
     states = status.get("channels") or {}
-    described = {c["target_id"]: (getattr(db.get(Target, c["target_id"]), "description", None) or "") for c in fitting}
-    channels = [{
-        "target_id": c["target_id"], "name": c["target_name"], "frequency_hz": c["frequency_hz"],
-        "modulation": c["modulation"], "squelch": c["squelch"], "fits": True,
-        "description": described[c["target_id"]],
-        "in_call": bool(states.get(str(c["target_id"]), {}).get("in_call")),
-        "last_call_at": states.get(str(c["target_id"]), {}).get("last_call_at"),
-        "level_db": states.get(str(c["target_id"]), {}).get("level_db"),
-    } for c in fitting]
+
+    def view(target_id, name, hz, mode, squelch, fits, recorder_id=None):
+        target = db.get(Target, target_id)
+        recorder = by_recorder.get(recorder_id)
+        state = states.get(str(target_id), {}) if fits and not taken_over else {}
+        return {"target_id": target_id, "name": name, "frequency_hz": hz, "modulation": mode, "squelch": squelch,
+                "fits": fits, "description": (target.description or "") if target else "",
+                "schedule": recorder.name if recorder is not None and recorder.schedule_days is not None else None,
+                "in_call": bool(state.get("in_call")), "last_call_at": state.get("last_call_at"), "level_db": state.get("level_db")}
+
+    channels = [view(c["target_id"], c["target_name"], c["frequency_hz"], c["modulation"], c["squelch"], True, c["recorder_id"])
+                for c in fitting]
     for recorder in left_out:
         target = db.get(Target, recorder.target_id)
         if target is not None:
-            channels.append({"target_id": target.id, "name": target.name, "frequency_hz": target.frequency_hz,
-                             "modulation": target.modulation, "squelch": target.squelch_db, "fits": False,
-                             "description": target.description or "",
-                             "in_call": False, "last_call_at": None, "level_db": None})
+            channels.append(view(target.id, target.name, target.frequency_hz, target.modulation, target.squelch_db, False, recorder.id))
     plan = pipelines.multi_plan([(c["frequency_hz"], c["modulation"]) for c in fitting]) if fitting else None
-    view = {"multichannel": True, "channels": channels, "plan": plan, "load": status.get("load")}
-    if active is None or active.schedule_days is None:
+    result = {"multichannel": True, "channels": channels, "plan": None if taken_over else plan,
+              "load": status.get("load"), "taken_over": taken_over}
+    if not taken_over:
         # The channels are what's running, not one target.
-        view["active_target"] = {"id": None, "name": f"{len(fitting)} channel{'' if len(fitting) == 1 else 's'}",
-                                 "frequency_hz": plan["center_hz"] if plan else None, "modulation": "multi", "kind": "multi",
-                                 "squelch": None, "gain_db": source.gain_db, "from_profile": False} if fitting else None
-    return view
+        result["active_target"] = {"id": None, "name": f"{len(fitting)} channel{'' if len(fitting) == 1 else 's'}",
+                                   "frequency_hz": plan["center_hz"] if plan else None, "modulation": "multi", "kind": "multi",
+                                   "squelch": None, "gain_db": source.gain_db, "from_profile": False,
+                                   "description": ""} if fitting else None
+    return result
 
 
 def _profile_view(profile: SdrProfile) -> dict:
@@ -1006,6 +1014,7 @@ class RecorderBody(BaseModel):
     once_start: str | None = Field(default=None, max_length=16)  # YYYY-MM-DDTHH:MM, in the master's time zone
     once_end: str | None = Field(default=None, max_length=16)
     on_end: str = "return"  # or "keep"
+    mode: str = Field(default="takeover", pattern="^(takeover|add)$")  # on a multi-channel SDR: add as a channel
 
 
 def _local_moment(ctx: Context, text: str | None, label: str) -> float:
@@ -1050,6 +1059,7 @@ def _recorder_view(db, recorder: Recorder) -> dict:
         "schedule_end": recorder.schedule_end, "assigned_by": recorder.assigned_by,
         "repeat": "once" if recorder.once_start is not None else "weekly",
         "once_start": recorder.once_start, "once_end": recorder.once_end, "on_end": recorder.on_end or "return",
+        "mode": recorder.schedule_mode or "takeover",
         "finished": recorder.once_end is not None and recorder.once_end <= time.time(),
         "running": recorder.active_since is not None,
     }
@@ -1085,11 +1095,27 @@ def _save_recorder(ctx, request, user, db, body: RecorderBody, recorder: Recorde
         recorder.schedule_start, recorder.schedule_end = body.schedule_start, body.schedule_end
     recorder.once_start, recorder.once_end = once_start, once_end
     recorder.on_end = body.on_end
+    recorder.schedule_mode = "add" if body.mode == "add" else None
     recorder.assigned_by = user.email
     db.commit()
     ctx.audit("recorder.saved", user=user, ip=ip_of(request), target=recorder.name)
     ctx.kick()
-    return {**_recorder_view(db, recorder), "warning": _warnings(db, source, target)}
+    found = [w for w in (_warnings(db, source, target), _add_warning(db, source, target, body.mode)) if w]
+    return {**_recorder_view(db, recorder), "warning": " ".join(found) or None}
+
+
+def _add_warning(db, source: Source, target: Target, mode: str) -> str | None:
+    """Why a schedule set to add a channel will take its SDR over instead, as things stand."""
+    if mode != "add":
+        return None
+    if not source.multichannel:
+        return f"{source.name} is single channel, so this schedule takes it over."
+    if not _multi_capable(target):
+        return f"Multi-channel records NFM, FM and AM targets only, so {target.name} takes {source.name} over."
+    current = [db.get(Target, r.target_id) for r in _bases_for(db, source.id)]
+    pairs = [(t.frequency_hz, t.modulation) for t in current if t is not None and t.id != target.id]
+    problem = pipelines.multi_problem(pairs + [(target.frequency_hz, target.modulation)], _limit(source))
+    return f"It doesn't fit alongside {source.name}'s channels now, so while it runs it takes the SDR over. {problem}" if problem else None
 
 
 @router.post("/recorders", status_code=201)

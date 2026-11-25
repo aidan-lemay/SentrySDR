@@ -228,6 +228,8 @@ class Recorder(Base):
     once_start: Mapped[float | None] = mapped_column(nullable=True)
     once_end: Mapped[float | None] = mapped_column(nullable=True)
     on_end: Mapped[str | None] = mapped_column(String(8), nullable=True)  # "keep": the target stays assigned afterwards
+    # On a multi-channel SDR: "add" joins its channels for the window if it fits. None takes the SDR over.
+    schedule_mode: Mapped[str | None] = mapped_column(String(8), nullable=True)
     active_since: Mapped[float | None] = mapped_column(nullable=True)  # set while this schedule controls its source
     assigned_by: Mapped[str] = mapped_column(String(254), default="")
     assigned_at: Mapped[float] = mapped_column(default=now)

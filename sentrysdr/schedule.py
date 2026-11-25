@@ -67,21 +67,29 @@ def finished(recorder, local: datetime) -> bool:
     return is_once(recorder) and local.timestamp() >= recorder.once_end
 
 
-def resolve_sets(recorders: Iterable[RecorderLike], local: datetime) -> dict[int, tuple[RecorderLike | None, list[RecorderLike]]]:
-    """{source_id: (the schedule in control or None, every base recorder)}, lowest id first.
-
-    A multi-channel source records all its base recorders at once; a schedule takes it over.
-    """
-    found: dict[int, tuple[RecorderLike | None, list[RecorderLike]]] = {}
+def resolve_sets(recorders: Iterable[RecorderLike], local: datetime) -> dict[int, tuple[list[RecorderLike], list[RecorderLike]]]:
+    """{source_id: (the schedules in their window, every base recorder)}, lowest id first."""
+    found: dict[int, tuple[list[RecorderLike], list[RecorderLike]]] = {}
     for rec in sorted(recorders, key=lambda r: r.id):
         if not rec.enabled:
             continue
-        active, bases = found.setdefault(rec.source_id, (None, []))
+        actives, bases = found.setdefault(rec.source_id, ([], []))
         if not is_scheduled(rec):
             bases.append(rec)
-        elif active is None and window_active(rec, local):
-            found[rec.source_id] = (rec, bases)
+        elif window_active(rec, local):
+            actives.append(rec)
     return found
+
+
+def adds(recorder) -> bool:
+    """A schedule that joins a multi-channel SDR's channels rather than taking it over."""
+    return getattr(recorder, "schedule_mode", None) == "add"
+
+
+def split(actives: list) -> tuple[object | None, list]:
+    """The schedule taking the SDR over (the first that takes over), and those adding a channel."""
+    takeover = next((r for r in actives if not adds(r)), None)
+    return takeover, [r for r in actives if adds(r)]
 
 
 def resolve(recorders: Iterable[RecorderLike], local: datetime) -> dict[int, RecorderLike]:

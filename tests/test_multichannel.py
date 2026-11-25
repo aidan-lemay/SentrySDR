@@ -387,3 +387,78 @@ def test_a_kept_schedule_becomes_one_more_channel(ctx, admin):
     end_now(ctx, keep_far)
     assert ctx.track_schedule_ends() == []  # doesn't fit: skipped, and the audit log says why
     assert [c["target_name"] for c in ctx.assignments()[ctx.local_node_id]["SER1"]["multi"]] == ["Fire", "EMS"]
+
+
+# --- schedules: take over, or add a channel ------------------------------------------------------
+def schedule_on(ctx, source, target, mode=None, name="Window"):
+    with ctx.db() as session:
+        recorder = Recorder(name=name, source_id=source, target_id=target, schedule_days=list(range(7)),
+                            schedule_start="00:00", schedule_end="23:59", schedule_mode=mode)
+        session.add(recorder)
+        session.commit()
+        return recorder.id
+
+
+def running_names(ctx):
+    spec = ctx.assignments(datetime.now(ctx.cfg.tz).replace(hour=12))[ctx.local_node_id]["SER1"]
+    return [c["target_name"] for c in spec["multi"]] if spec["kind"] == "multi" else [spec["target_name"]]
+
+
+def multi_source(admin, *channels):
+    source = make_source(admin)
+    admin.put(f"/api/sources/{source}/channel-mode", json={"multichannel": True}).raise_for_status()
+    for name, mhz in channels:
+        admin.post(f"/api/sources/{source}/channels", json={"target_id": nfm(admin, name, mhz)}).raise_for_status()
+    return source
+
+
+def test_every_channel_comes_back_after_a_takeover(admin, ctx):
+    source = multi_source(admin, ("Fire", 154.43), ("EMS", 155.295))
+    window = schedule_on(ctx, source, nfm(admin, "Weather", 162.55))
+    assert running_names(ctx) == ["Weather"]
+    with ctx.db() as session:
+        session.get(Recorder, window).enabled = False  # its window over, or turned off
+        session.commit()
+    assert running_names(ctx) == ["Fire", "EMS"]
+
+
+def test_a_schedule_can_add_a_channel_while_the_others_carry_on(admin, ctx):
+    source = multi_source(admin, ("Fire", 154.43), ("EMS", 155.295))
+    adding = schedule_on(ctx, source, nfm(admin, "Event", 154.9), mode="add")
+    assert running_names(ctx) == ["Fire", "EMS", "Event"]
+    view = next(s for s in admin.get("/api/sources").json() if s["id"] == source)
+    assert [(c["name"], c["schedule"]) for c in view["channels"]] == [("Fire", None), ("EMS", None), ("Event", "Window")]
+    assert not view["taken_over"] and view["active_target"]["kind"] == "multi"
+    with ctx.db() as session:
+        assert ctx.running_schedules(session, list(session.query(Recorder)), datetime.now(ctx.cfg.tz).replace(hour=12)) == {adding}
+
+
+def test_an_added_channel_that_doesnt_fit_takes_over_instead(admin, ctx):
+    source = multi_source(admin, ("Fire", 154.43))
+    schedule_on(ctx, source, nfm(admin, "Far", 160.0), mode="add")
+    assert running_names(ctx) == ["Far"]
+    view = next(s for s in admin.get("/api/sources").json() if s["id"] == source)
+    assert view["taken_over"]
+
+
+def test_a_takeover_beats_an_add_and_a_single_channel_sdr_is_taken_over_either_way(admin, ctx):
+    source = multi_source(admin, ("Fire", 154.43))
+    schedule_on(ctx, source, nfm(admin, "Event", 154.9), mode="add", name="Add")
+    schedule_on(ctx, source, nfm(admin, "Weather", 162.55), name="Take")
+    assert running_names(ctx) == ["Weather"]
+    single = make_source(admin, "SER2", "Two")
+    admin.post(f"/api/sources/{single}/assign", json={"target_id": nfm(admin, "Usual", 146.94)}).raise_for_status()
+    schedule_on(ctx, single, nfm(admin, "Other", 147.0), mode="add")
+    spec = ctx.assignments(datetime.now(ctx.cfg.tz).replace(hour=12))[ctx.local_node_id]["SER2"]
+    assert spec["kind"] == "audio" and spec["target_name"] == "Other"
+
+
+def test_saving_an_add_schedule_says_when_it_will_take_over(admin, ctx):
+    source = multi_source(admin, ("Fire", 154.43))
+    window = {"name": "W", "source_id": source, "repeat": "weekly", "schedule_days": [0, 1, 2, 3, 4, 5, 6],
+              "schedule_start": "08:00", "schedule_end": "09:00", "mode": "add"}
+    near = admin.post("/api/recorders", json={**window, "target_id": nfm(admin, "Event", 154.9)}).json()
+    assert near["mode"] == "add" and not near.get("warning")
+    far = admin.post("/api/recorders", json={**window, "target_id": nfm(admin, "Far", 160.0)}).json()
+    assert "takes the SDR over" in far["warning"]
+    assert admin.post("/api/recorders", json={**window, "target_id": nfm(admin, "X", 154.2), "mode": "sideways"}).status_code == 422

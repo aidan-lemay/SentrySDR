@@ -326,6 +326,7 @@
                     <div class="channel-line">
                       <span class="mono nowrap">{formatMHz(ch.frequency_hz)}</span> {ch.name}
                       {#if ch.description}<span class="small dim">{ch.description}</span>{/if}
+                      {#if ch.schedule}<span class="st-warn small">Schedule: {ch.schedule}</span>{/if}
                       <span class="small">({MODE_LABELS[ch.modulation] ?? ch.modulation.toUpperCase()}, squelch {ch.squelch == null ? 'off' : `${ch.squelch} dB`}{ch.level_db != null ? `, now ${ch.level_db} dB` : ''})</span>
                       {#if ch.in_call}<span class="st-air small">ON AIR</span>{/if}
                       {#if !ch.fits}<span class="st-warn small">Not recording: it no longer fits with the others</span>{/if}
