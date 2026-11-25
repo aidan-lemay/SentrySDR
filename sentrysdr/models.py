@@ -135,6 +135,9 @@ class Source(Base):
     lon: Mapped[float | None] = mapped_column(nullable=True)
     alt_m: Mapped[float | None] = mapped_column(nullable=True)
     quiet_offline: Mapped[bool | None] = mapped_column(nullable=True)  # no warning while its stick is unplugged
+    # Multi-channel: several voice targets at once, each a base recorder. Otherwise one target, through rtl_fm.
+    multichannel: Mapped[bool | None] = mapped_column(nullable=True)
+    max_channels: Mapped[int | None] = mapped_column(nullable=True)  # None: pipelines.MULTI_DEFAULT_CHANNELS
     __table_args__ = (Index("uq_source_node_serial", "node_id", "serial", unique=True),)
 
 
@@ -160,6 +163,7 @@ class Target(Base):
     kind: Mapped[str] = mapped_column(String(8), default="audio")  # audio|adsb|ais
     frequency_hz: Mapped[int] = mapped_column()
     modulation: Mapped[str] = mapped_column(String(12), default="nfm")
+    description: Mapped[str | None] = mapped_column(String(500), nullable=True)  # what the channel is used for
     # Retired: rtl_fm's own squelch scale. Converted to squelch_db on upgrade, then left at 0.
     squelch: Mapped[int] = mapped_column(default=0)
     # dB, as the web tuner shows it. None = off: continuous recording.
@@ -224,6 +228,8 @@ class Recorder(Base):
     once_start: Mapped[float | None] = mapped_column(nullable=True)
     once_end: Mapped[float | None] = mapped_column(nullable=True)
     on_end: Mapped[str | None] = mapped_column(String(8), nullable=True)  # "keep": the target stays assigned afterwards
+    # On a multi-channel SDR: "add" joins its channels for the window if it fits. None takes the SDR over.
+    schedule_mode: Mapped[str | None] = mapped_column(String(8), nullable=True)
     active_since: Mapped[float | None] = mapped_column(nullable=True)  # set while this schedule controls its source
     assigned_by: Mapped[str] = mapped_column(String(254), default="")
     assigned_at: Mapped[float] = mapped_column(default=now)

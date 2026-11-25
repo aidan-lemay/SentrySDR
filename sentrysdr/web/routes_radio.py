@@ -156,6 +156,8 @@ class SourceBody(BaseModel):
     lon: float | None = Field(default=None, ge=-180, le=180)
     alt_m: float | None = Field(default=None, ge=-500, le=10000)
     quiet_offline: bool = False  # no warning while its stick is unplugged
+    # Multi-channel's limit for this SDR. None is the default; Check this machine suggests a number.
+    max_channels: int | None = Field(default=None, ge=1, le=pipelines.MULTI_MAX_CHANNELS)
 
     @field_validator("gain_steps")
     @classmethod
@@ -212,13 +214,56 @@ def _source_view(ctx: Context, db, source: Source, winners: dict, recorders: lis
         "active_is_schedule": bool(active and active.schedule_days is not None),
         "active_target": {
             "id": target.id, "name": target.name, "frequency_hz": target.frequency_hz,
-            "modulation": target.modulation, "kind": target.kind,
+            "modulation": target.modulation, "kind": target.kind, "description": target.description or "",
             "squelch": profile.squelch_db if profile else target.squelch_db,
             "gain_db": profile.gain_db if profile else source.gain_db,
             "from_profile": profile is not None,
         } if target else None,
         "profiles": [_profile_view(p) for p in profiles],
+        "max_channels": _limit(source),
+        **_multi_view(ctx, db, source, active, recorders, status),
     }
+
+
+def _multi_view(ctx: Context, db, source: Source, active: Recorder | None, recorders: list[Recorder], status: dict) -> dict:
+    """A multi-channel SDR's channels, each with its own state, including schedules adding one now.
+
+    A schedule that has taken it over shows as usual, as the one active target.
+    """
+    if not source.multichannel:
+        return {"multichannel": False, "channels": [], "plan": None, "load": None}
+    mine = [r for r in recorders if r.source_id == source.id]
+    actives, bases = schedule.resolve_sets(mine, datetime.now(ctx.cfg.tz)).get(source.id, ([], []))
+    running, _, taken_over = ctx.running_recorders(db, source, actives, bases)
+    fitting, left_out = ctx.multi_channels(db, source, bases if taken_over else running)
+    by_recorder = {r.id: r for r in mine}
+    states = status.get("channels") or {}
+
+    def view(target_id, name, hz, mode, squelch, fits, recorder_id=None):
+        target = db.get(Target, target_id)
+        recorder = by_recorder.get(recorder_id)
+        state = states.get(str(target_id), {}) if fits and not taken_over else {}
+        return {"target_id": target_id, "name": name, "frequency_hz": hz, "modulation": mode, "squelch": squelch,
+                "fits": fits, "description": (target.description or "") if target else "",
+                "schedule": recorder.name if recorder is not None and recorder.schedule_days is not None else None,
+                "in_call": bool(state.get("in_call")), "last_call_at": state.get("last_call_at"), "level_db": state.get("level_db")}
+
+    channels = [view(c["target_id"], c["target_name"], c["frequency_hz"], c["modulation"], c["squelch"], True, c["recorder_id"])
+                for c in fitting]
+    for recorder in left_out:
+        target = db.get(Target, recorder.target_id)
+        if target is not None:
+            channels.append(view(target.id, target.name, target.frequency_hz, target.modulation, target.squelch_db, False, recorder.id))
+    plan = pipelines.multi_plan([(c["frequency_hz"], c["modulation"]) for c in fitting]) if fitting else None
+    result = {"multichannel": True, "channels": channels, "plan": None if taken_over else plan,
+              "load": status.get("load"), "taken_over": taken_over}
+    if not taken_over:
+        # The channels are what's running, not one target.
+        result["active_target"] = {"id": None, "name": f"{len(fitting)} channel{'' if len(fitting) == 1 else 's'}",
+                                   "frequency_hz": plan["center_hz"] if plan else None, "modulation": "multi", "kind": "multi",
+                                   "squelch": None, "gain_db": source.gain_db, "from_profile": False,
+                                   "description": ""} if fitting else None
+    return result
 
 
 def _profile_view(profile: SdrProfile) -> dict:
@@ -370,6 +415,7 @@ def delete_source(source_id: int, request: Request, admin: User = Depends(admin_
 # --- targets ---------------------------------------------------------------
 class TargetBody(BaseModel):
     name: str = Field(min_length=1, max_length=120)
+    description: str = Field(default="", max_length=500)  # what it's used for, shown under its name
     kind: str = "audio"
     frequency_hz: int = Field(ge=pipelines.FREQ_MIN_HZ, le=pipelines.FREQ_MAX_HZ)
     modulation: str = "nfm"
@@ -557,10 +603,14 @@ def _check_lock(ctx: Context, request: Request, user: User, recorder: Recorder |
 
 
 def _base_for(db, source_id: int) -> Recorder | None:
-    for recorder in db.scalars(select(Recorder).where(Recorder.source_id == source_id)):
-        if recorder.schedule_days is None:
-            return recorder
-    return None
+    """The source's base recorder; on a multi-channel SDR, a locked one first, so a lock covers them all."""
+    bases = _bases_for(db, source_id)
+    return next((r for r in bases if r.locked), bases[0] if bases else None)
+
+
+def _bases_for(db, source_id: int) -> list[Recorder]:
+    return list(db.scalars(select(Recorder).where(Recorder.source_id == source_id, Recorder.schedule_days.is_(None))
+                           .order_by(Recorder.id)))
 
 
 def _range_warning(db, source: Source, target: Target) -> str | None:
@@ -619,9 +669,11 @@ def assign(source_id: int, body: AssignBody, request: Request, user: User = Depe
     base = _base_for(db, source_id)
     _check_lock(ctx, request, user, base)
     warning = None
+    if source.multichannel and body.target_id is not None:
+        raise HTTPException(409, "This SDR is multi-channel: add or remove its channels instead.")
     if body.target_id is None:
-        if base:
-            db.delete(base)
+        for recorder in _bases_for(db, source_id):  # every channel, on a multi-channel SDR
+            db.delete(recorder)
         target_name = None
     else:
         target = db.get(Target, body.target_id)
@@ -648,7 +700,8 @@ def lock_source(source_id: int, request: Request, admin: User = Depends(admin_us
     base = _base_for(db, source_id)
     if source is None or base is None:
         raise HTTPException(409, "Assign a target before locking this source")
-    base.locked = True
+    for recorder in _bases_for(db, source_id):
+        recorder.locked = True
     db.commit()
     ctx.audit("source.locked", user=admin, ip=ip_of(request), target=source.name)
     return {"detail": "Locked"}
@@ -657,12 +710,125 @@ def lock_source(source_id: int, request: Request, admin: User = Depends(admin_us
 @router.delete("/sources/{source_id}/lock")
 def unlock_source(source_id: int, request: Request, admin: User = Depends(admin_user), db=Depends(get_db)):
     ctx = ctx_of(request)
-    base = _base_for(db, source_id)
-    if base is not None:
-        base.locked = False
-        db.commit()
+    for recorder in _bases_for(db, source_id):
+        recorder.locked = False
+    db.commit()
     ctx.audit("source.unlocked", user=admin, ip=ip_of(request), target=str(source_id))
     return {"detail": "Unlocked"}
+
+
+# --- multi-channel: several voice targets on one SDR ---------------------------------------
+class ChannelModeBody(BaseModel):
+    multichannel: bool
+
+
+def _limit(source: Source) -> int:
+    return source.max_channels or pipelines.MULTI_DEFAULT_CHANNELS
+
+
+def _multi_capable(target: Target | None) -> bool:
+    return target is not None and target.kind == "audio" and target.modulation in pipelines.MULTI_MODES
+
+
+@router.put("/sources/{source_id}/channel-mode")
+def set_channel_mode(source_id: int, body: ChannelModeBody, request: Request, user: User = Depends(require("assign")), db=Depends(get_db)):
+    """Single channel (rtl_fm) or multi-channel. Back to single keeps only the first channel."""
+    ctx = ctx_of(request)
+    source = db.get(Source, source_id)
+    if source is None:
+        raise HTTPException(404, "Source not found")
+    _check_lock(ctx, request, user, _base_for(db, source_id))
+    bases = _bases_for(db, source_id)
+    removed = []
+    if body.multichannel:
+        odd = [db.get(Target, r.target_id) for r in bases if not _multi_capable(db.get(Target, r.target_id))]
+        if odd:
+            raise HTTPException(409, f"Multi-channel records NFM, FM and AM targets only, and this SDR has {odd[0].name if odd[0] else 'another target'}. Clear its assignment first.")
+    else:
+        for recorder in bases[1:]:
+            removed.append(recorder.name)
+            db.delete(recorder)
+    source.multichannel = body.multichannel or None
+    db.commit()
+    ctx.audit("source.channel_mode", user=user, ip=ip_of(request), target=source.name,
+              details={"multichannel": body.multichannel, "removed": removed or None})
+    ctx.kick()
+    return {"detail": "Multi-channel" if body.multichannel else "Single channel", "removed": removed}
+
+
+class ChannelBody(BaseModel):
+    target_id: int
+
+
+@router.post("/sources/{source_id}/channels")
+def add_channel(source_id: int, body: ChannelBody, request: Request, user: User = Depends(require("assign")), db=Depends(get_db)):
+    ctx = ctx_of(request)
+    source, target = db.get(Source, source_id), db.get(Target, body.target_id)
+    if source is None or target is None:
+        raise HTTPException(404, "Source or target not found")
+    if not source.multichannel:
+        raise HTTPException(409, "Switch this SDR to multi-channel first.")
+    _check_lock(ctx, request, user, _base_for(db, source_id))
+    if not _multi_capable(target):
+        raise HTTPException(422, "Multi-channel records NFM, FM and AM targets only.")
+    bases = _bases_for(db, source_id)
+    if any(r.target_id == target.id for r in bases):
+        raise HTTPException(409, f"{target.name} is already a channel on {source.name}.")
+    targets = [db.get(Target, r.target_id) for r in bases] + [target]
+    problem = pipelines.multi_problem([(t.frequency_hz, t.modulation) for t in targets if t is not None], _limit(source))
+    if problem:
+        raise HTTPException(422, problem)
+    db.add(Recorder(name=f"{source.name}: {target.name}", source_id=source.id, target_id=target.id,
+                    assigned_by=user.email, assigned_at=now(), locked=any(r.locked for r in bases) or None))
+    db.commit()
+    ctx.audit("source.channel_added", user=user, ip=ip_of(request), target=source.name, details={"target": target.name})
+    ctx.kick()
+    return {"detail": "Channel added", "warning": _warnings(db, source, target)}
+
+
+@router.get("/sources/{source_id}/channel-suggestions")
+def channel_suggestions(source_id: int, user: User = Depends(require("assign")), db=Depends(get_db)):
+    """Voice targets that would fit alongside this SDR's channels, nearest the middle first."""
+    source = db.get(Source, source_id)
+    if source is None:
+        raise HTTPException(404, "Source not found")
+    if not source.multichannel:
+        return []
+    current = [db.get(Target, r.target_id) for r in _bases_for(db, source_id)]
+    current = [t for t in current if t is not None]
+    taken = {t.id for t in current}
+    pairs = [(t.frequency_hz, t.modulation) for t in current]
+    middle = (sum(hz for hz, _ in pairs) / len(pairs)) if pairs else None
+    found = []
+    for target in db.scalars(select(Target).where(Target.kind == "audio")):
+        if target.id in taken or not _multi_capable(target):
+            continue
+        if pairs and pipelines.multi_problem(pairs + [(target.frequency_hz, target.modulation)], _limit(source)):
+            continue
+        found.append(target)
+    if middle is None:
+        return []  # with no channels yet, everything fits: nothing to suggest
+    found.sort(key=lambda t: abs(t.frequency_hz - middle))
+    return [{"id": t.id, "name": t.name, "frequency_hz": t.frequency_hz, "modulation": t.modulation,
+             "warning": _warnings(db, source, t)} for t in found[:20]]
+
+
+@router.delete("/sources/{source_id}/channels/{target_id}")
+def remove_channel(source_id: int, target_id: int, request: Request, user: User = Depends(require("assign")), db=Depends(get_db)):
+    ctx = ctx_of(request)
+    source = db.get(Source, source_id)
+    if source is None:
+        raise HTTPException(404, "Source not found")
+    _check_lock(ctx, request, user, _base_for(db, source_id))
+    found = [r for r in _bases_for(db, source_id) if r.target_id == target_id]
+    if not found:
+        raise HTTPException(404, "That target isn't a channel on this SDR.")
+    for recorder in found:
+        db.delete(recorder)
+    db.commit()
+    ctx.audit("source.channel_removed", user=user, ip=ip_of(request), target=source.name, details={"target": found[0].name})
+    ctx.kick()
+    return {"detail": "Channel removed"}
 
 
 # --- noise measurement and saved profiles -----------------------------------
@@ -768,6 +934,27 @@ async def detect_stick(body: DetectBody, request: Request, admin: User = Depends
         raise HTTPException(409, str(exc)) from None
 
 
+@router.post("/sources/benchmark")
+async def benchmark_machine(body: DetectBody, request: Request, admin: User = Depends(admin_user), db=Depends(get_db)):
+    """How many multi-channel channels the machine an SDR is plugged into can handle. Nothing pauses."""
+    ctx = ctx_of(request)
+    node = db.get(Node, body.node_id or ctx.local_node_id)
+    if node is None or node.status != "active" or body.serial not in (node.serials or []):
+        raise HTTPException(404, "That SDR isn't configured on that node")
+    if not ctx.node_online(node):
+        raise HTTPException(409, "That node is offline.")
+    key = f"measure:{admin.id}"
+    if ctx.limiter.blocked(key, MEASURE_LIMIT, MEASURE_WINDOW):
+        raise HTTPException(429, "Too many measurements. Try again later.")
+    ctx.limiter.hit(key, MEASURE_WINDOW)
+    db.commit()  # ends the read transaction: the check takes a second or two
+    ctx.audit("node.benchmarked", user=admin, ip=ip_of(request), target=node.name)
+    try:
+        return {**await ctx.measure(node, body.serial, {"op": "benchmark"}), "node_name": node.name}
+    except MeasureError as exc:
+        raise HTTPException(409, str(exc)) from None
+
+
 class ProfileBody(BaseModel):
     """Squelch and noise in dB. A squelch of None is off."""
     squelch: float | None = Field(ge=pipelines.SQUELCH_DB_MIN, le=pipelines.SQUELCH_DB_MAX)
@@ -827,6 +1014,7 @@ class RecorderBody(BaseModel):
     once_start: str | None = Field(default=None, max_length=16)  # YYYY-MM-DDTHH:MM, in the master's time zone
     once_end: str | None = Field(default=None, max_length=16)
     on_end: str = "return"  # or "keep"
+    mode: str = Field(default="takeover", pattern="^(takeover|add)$")  # on a multi-channel SDR: add as a channel
 
 
 def _local_moment(ctx: Context, text: str | None, label: str) -> float:
@@ -871,6 +1059,7 @@ def _recorder_view(db, recorder: Recorder) -> dict:
         "schedule_end": recorder.schedule_end, "assigned_by": recorder.assigned_by,
         "repeat": "once" if recorder.once_start is not None else "weekly",
         "once_start": recorder.once_start, "once_end": recorder.once_end, "on_end": recorder.on_end or "return",
+        "mode": recorder.schedule_mode or "takeover",
         "finished": recorder.once_end is not None and recorder.once_end <= time.time(),
         "running": recorder.active_since is not None,
     }
@@ -906,11 +1095,27 @@ def _save_recorder(ctx, request, user, db, body: RecorderBody, recorder: Recorde
         recorder.schedule_start, recorder.schedule_end = body.schedule_start, body.schedule_end
     recorder.once_start, recorder.once_end = once_start, once_end
     recorder.on_end = body.on_end
+    recorder.schedule_mode = "add" if body.mode == "add" else None
     recorder.assigned_by = user.email
     db.commit()
     ctx.audit("recorder.saved", user=user, ip=ip_of(request), target=recorder.name)
     ctx.kick()
-    return {**_recorder_view(db, recorder), "warning": _warnings(db, source, target)}
+    found = [w for w in (_warnings(db, source, target), _add_warning(db, source, target, body.mode)) if w]
+    return {**_recorder_view(db, recorder), "warning": " ".join(found) or None}
+
+
+def _add_warning(db, source: Source, target: Target, mode: str) -> str | None:
+    """Why a schedule set to add a channel will take its SDR over instead, as things stand."""
+    if mode != "add":
+        return None
+    if not source.multichannel:
+        return f"{source.name} is single channel, so this schedule takes it over."
+    if not _multi_capable(target):
+        return f"Multi-channel records NFM, FM and AM targets only, so {target.name} takes {source.name} over."
+    current = [db.get(Target, r.target_id) for r in _bases_for(db, source.id)]
+    pairs = [(t.frequency_hz, t.modulation) for t in current if t is not None and t.id != target.id]
+    problem = pipelines.multi_problem(pairs + [(target.frequency_hz, target.modulation)], _limit(source))
+    return f"It doesn't fit alongside {source.name}'s channels now, so while it runs it takes the SDR over. {problem}" if problem else None
 
 
 @router.post("/recorders", status_code=201)
@@ -950,12 +1155,16 @@ def delete_recorder(recorder_id: int, request: Request,
 
 # --- live audio ------------------------------------------------------------
 @router.get("/live/{source_id}")
-async def live_audio(source_id: int, request: Request, user: User = Depends(require("listen_live")), db=Depends(get_db)):
+async def live_audio(source_id: int, request: Request, target_id: int | None = None,
+                     user: User = Depends(require("listen_live")), db=Depends(get_db)):
+    """One SDR's live audio, or with target_id one channel of a multi-channel SDR."""
     ctx = ctx_of(request)
     source = db.get(Source, source_id)
     if source is None:
         raise HTTPException(404, "Source not found")
-    key = ctx.live_key(source.node_id, source.serial)
+    if target_id is not None and not any(r.target_id == target_id for r in _bases_for(db, source_id)):
+        raise HTTPException(404, "That target isn't a channel on this SDR.")
+    key = ctx.live_key(source.node_id, source.serial, target_id)
     db.close()  # don't pin a database connection for the length of the stream
     if sum(_live_counts.values()) >= LIVE_MAX_TOTAL or _live_counts.get(user.id, 0) >= LIVE_MAX_PER_USER:
         raise HTTPException(429, "Too many live streams open")

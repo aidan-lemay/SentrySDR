@@ -126,6 +126,24 @@ def setup_logging(cfg: Config) -> None:
     root.addHandler(stream)
 
 
+def clean_benchmark(raw: dict) -> dict:
+    """A node's machine check, as it reports it."""
+    def share(value) -> float:
+        value = float(value)
+        if not math.isfinite(value) or not 0 <= value <= 100:
+            raise ValueError("out of range")
+        return round(value, 4)
+
+    def span(part: dict) -> dict:
+        recommended = int(part["recommended"])
+        if not 0 <= recommended <= pipelines.MULTI_MAX_CHANNELS or int(part["rate"]) not in pipelines.MULTI_RATES:
+            raise ValueError("out of range")
+        return {"rate": int(part["rate"]), "fixed": share(part["fixed"]), "per_channel": share(part["per_channel"]),
+                "recommended": recommended}
+    return {"typical": span(raw["typical"]), "widest": span(raw["widest"]),
+            "target_load": share(raw["target_load"]), "overhead": share(raw["overhead"])}
+
+
 class Context:
     def __init__(self, cfg: Config, enumerate_fn=enumerate_serials):
         self.cfg = cfg
@@ -242,8 +260,9 @@ class Context:
             return True
         return node.id in self.node_links
 
-    def live_key(self, node_id: int, serial: str) -> str:
-        return f"{node_id}:{serial}"
+    def live_key(self, node_id: int, serial: str, channel: int | None = None) -> str:
+        """One SDR's live stream, or one channel's on a multi-channel SDR."""
+        return f"{node_id}:{serial}" if channel is None else f"{node_id}:{serial}#{channel}"
 
     def _live_demand(self, key: str, on: bool) -> None:
         node_id, _, serial = key.partition(":")
@@ -359,36 +378,126 @@ class Context:
         local_now = local_now or datetime.now(self.cfg.tz)
         with self.db() as session:
             recorders = list(session.scalars(select(Recorder)))
-            winners = schedule.resolve(recorders, local_now)
             result: dict[int, dict[str, dict]] = {}
-            for source_id, recorder in winners.items():
+            for source_id, (actives, bases) in schedule.resolve_sets(recorders, local_now).items():
                 source = session.get(Source, source_id)
-                target = session.get(Target, recorder.target_id)
-                if source is None or target is None:
+                if source is None:
                     continue
-                profile = session.scalar(select(SdrProfile).where(
-                    SdrProfile.source_id == source.id, SdrProfile.target_id == target.id,
-                ))
                 try:
-                    spec = pipelines.sanitize_spec({
-                        "recorder_id": recorder.id, "recorder_name": recorder.name,
-                        "source_id": source.id, "source_name": source.name,
-                        "target_id": target.id, "target_name": target.name,
-                        "kind": target.kind, "frequency_hz": target.frequency_hz,
-                        "modulation": target.modulation,
-                        "squelch": profile.squelch_db if profile else target.squelch_db,
-                        "gain_db": profile.gain_db if profile else source.gain_db,
-                        "ppm": source.ppm, "volume_db": target.volume_db or 0,
-                        "channels": target.acars_channels or [] if target.kind == "acars" else [],
-                        "feeds": target.feeds or {} if target.kind in ("adsb", "ais") else {},
-                        "feeder_uuid": source.feeder_uuid,
-                        "rtl_tcp_port": source.rtl_tcp_port if target.kind == "rtltcp" else None,
-                    })
+                    running, multi, _ = self.running_recorders(session, source, actives, bases)
+                    spec = None
+                    if running and multi:
+                        spec = self._multi_spec(session, source, running)
+                    if running and spec is None:
+                        spec = self._single_spec(session, source, running[0])
                 except pipelines.SpecError as exc:
-                    log.error("recorder %s has an invalid configuration: %s", recorder.id, exc)
+                    log.error("source %s has an invalid configuration: %s", source.id, exc)
                     continue
-                result.setdefault(source.node_id, {})[source.serial] = spec
+                if spec is not None:
+                    result.setdefault(source.node_id, {})[source.serial] = spec
             return result
+
+    def running_recorders(self, session, source: Source, actives: list[Recorder], bases: list[Recorder]) -> tuple[list[Recorder], bool, bool]:
+        """What an SDR runs now, whether as multi-channel, and whether a schedule has taken it over.
+
+        A schedule that takes over wins. Otherwise, on a multi-channel SDR, schedules set to add
+        join its channels; one that doesn't fit takes the SDR over instead. A single-channel SDR
+        runs its first schedule, or its base.
+        """
+        takeover, adding = schedule.split(actives)
+        if not source.multichannel:
+            first = takeover or (adding[0] if adding else None) or (bases[0] if bases else None)
+            return ([first] if first else []), False, first is not None and first.schedule_days is not None
+        if takeover is not None:
+            return [takeover], True, True
+        on, joining = {r.target_id for r in bases}, []
+        for recorder in adding:  # a target that's already a channel needn't be added again
+            if recorder.target_id not in on:
+                on.add(recorder.target_id)
+                joining.append(recorder)
+        adding = joining
+        _, left_out = self.multi_channels(session, source, bases + adding)
+        misfit = next((r for r in adding if r in left_out), None)
+        if misfit is not None:
+            return [misfit], True, True  # doesn't fit alongside the channels: it takes the SDR over
+        return bases + adding, True, False
+
+    def running_schedules(self, session, recorders: list[Recorder], local_now: datetime) -> set[int]:
+        """The ids of schedules running now, taking over or adding a channel."""
+        ids = set()
+        for source_id, (actives, bases) in schedule.resolve_sets(recorders, local_now).items():
+            source = session.get(Source, source_id)
+            if source is not None and actives:
+                running, _, _ = self.running_recorders(session, source, actives, bases)
+                ids |= {r.id for r in running if r.schedule_days is not None}
+        return ids
+
+    def _profile(self, session, source: Source, target: Target):
+        return session.scalar(select(SdrProfile).where(SdrProfile.source_id == source.id, SdrProfile.target_id == target.id))
+
+    def _single_spec(self, session, source: Source, recorder: Recorder) -> dict | None:
+        target = session.get(Target, recorder.target_id)
+        if target is None:
+            return None
+        profile = self._profile(session, source, target)
+        return pipelines.sanitize_spec({
+            "recorder_id": recorder.id, "recorder_name": recorder.name,
+            "source_id": source.id, "source_name": source.name,
+            "target_id": target.id, "target_name": target.name,
+            "kind": target.kind, "frequency_hz": target.frequency_hz,
+            "modulation": target.modulation,
+            "squelch": profile.squelch_db if profile else target.squelch_db,
+            "gain_db": profile.gain_db if profile else source.gain_db,
+            "ppm": source.ppm, "volume_db": target.volume_db or 0,
+            "channels": target.acars_channels or [] if target.kind == "acars" else [],
+            "feeds": target.feeds or {} if target.kind in ("adsb", "ais") else {},
+            "feeder_uuid": source.feeder_uuid,
+            "rtl_tcp_port": source.rtl_tcp_port if target.kind == "rtltcp" else None,
+        })
+
+    def multi_channels(self, session, source: Source, recorders: list[Recorder]) -> tuple[list[dict], list[Recorder]]:
+        """The channels that fit together, lowest recorder first, and the recorders left out."""
+        channels, left_out = [], []
+        limit = source.max_channels or pipelines.MULTI_DEFAULT_CHANNELS
+        for recorder in recorders:
+            if len(channels) >= limit:
+                left_out.append(recorder)  # the SDR's limit was lowered since
+                continue
+            target = session.get(Target, recorder.target_id)
+            if target is None or target.kind != "audio" or target.modulation not in pipelines.MULTI_MODES:
+                left_out.append(recorder)
+                continue
+            profile = self._profile(session, source, target)
+            channel = {
+                "recorder_id": recorder.id, "recorder_name": recorder.name,
+                "target_id": target.id, "target_name": target.name,
+                "frequency_hz": target.frequency_hz, "modulation": target.modulation,
+                "squelch": profile.squelch_db if profile else target.squelch_db,
+                "volume_db": target.volume_db or 0,
+            }
+            if pipelines.multi_plan([(c["frequency_hz"], c["modulation"]) for c in channels + [channel]]) is None:
+                left_out.append(recorder)  # it was edited since, and no longer fits
+                continue
+            channels.append(channel)
+        return channels, left_out
+
+    def _multi_spec(self, session, source: Source, recorders: list[Recorder]) -> dict | None:
+        channels, left_out = self.multi_channels(session, source, recorders)
+        if left_out:
+            log.warning("[%s] %d channel(s) left out: not NFM, FM or AM, or they don't fit", source.serial, len(left_out))
+        if not channels:
+            return None
+        plan = pipelines.multi_plan([(c["frequency_hz"], c["modulation"]) for c in channels])
+        first = channels[0]
+        # One gain for the whole SDR: the source's. Profiles' squelch still applies per channel.
+        return pipelines.sanitize_spec({
+            "recorder_id": first["recorder_id"], "recorder_name": source.name,
+            "source_id": source.id, "source_name": source.name,
+            "target_id": first["target_id"], "target_name": f"{len(channels)} channels",
+            "kind": "multi", "modulation": "multi", "frequency_hz": plan["center_hz"], "rate": plan["rate"],
+            "squelch": None, "gain_db": source.gain_db, "ppm": source.ppm,
+            "feeder_uuid": source.feeder_uuid, "multi": channels,
+        })
 
     def _tuner_send(self, node_id: int, serial: str, command: dict) -> bool:
         """A command for a web tuner, wherever its SDR is plugged in."""
@@ -456,9 +565,20 @@ class Context:
             if op == "detect":
                 future.set_result(capabilities.clean_detected(result))
                 return
+            if op == "benchmark":
+                future.set_result(clean_benchmark(result))
+                return
+            def db(value) -> float:
+                value = float(value)
+                if not math.isfinite(value) or not pipelines.SQUELCH_DB_MIN <= value <= pipelines.SQUELCH_DB_MAX:
+                    raise ValueError("out of range")
+                return round(value, 1)
+            gain = result.get("gain_db")
             future.set_result({
-                "low": int(result["low"]), "typical": int(result["typical"]), "high": int(result["high"]),
-                "suggested": int(result["suggested"]), "moved": bool(result["moved"]),
+                "low": db(result["low"]), "typical": db(result["typical"]), "high": db(result["high"]),
+                "suggested": db(result["suggested"]), "moved": bool(result["moved"]),
+                "live": bool(result.get("live")),  # read from a running multi-channel SDR, without pausing it
+                "gain_db": round(float(gain), 1) if isinstance(gain, (int, float)) and 0 <= gain <= 60 else None,
             })
         except (AttributeError, KeyError, TypeError, ValueError):
             future.set_exception(MeasureError("The node sent an unreadable result."))
@@ -825,7 +945,7 @@ class Context:
         kept, events = [], []
         with self.db() as session:
             recorders = list(session.scalars(select(Recorder)))
-            winners = {r.id for r in schedule.resolve(recorders, local_now).values()}
+            winners = self.running_schedules(session, recorders, local_now)
             for rec in recorders:
                 if rec.schedule_days is None:
                     continue
@@ -847,12 +967,28 @@ class Context:
         source, target = session.get(Source, rec.source_id), session.get(Target, rec.target_id)
         if source is None or target is None:
             return None
-        base = next((r for r in session.scalars(select(Recorder).where(Recorder.source_id == rec.source_id))
-                     if r.schedule_days is None), None)
-        if base is not None and base.locked:
+        bases = [r for r in session.scalars(select(Recorder).where(Recorder.source_id == rec.source_id).order_by(Recorder.id))
+                 if r.schedule_days is None]
+        base = bases[0] if bases else None
+        if any(r.locked for r in bases):
             events.append(("schedule.keep_skipped", rec.name, {"reason": "the assignment is locked"}))
             return None
         label = f"{source.name}: {target.name}"
+        if source.multichannel:
+            # Kept as one more channel, if it can be: a multi-channel SDR's other channels stay.
+            if any(r.target_id == target.id for r in bases):
+                return None
+            current = [session.get(Target, r.target_id) for r in bases]
+            pairs = [(t.frequency_hz, t.modulation) for t in current if t is not None] + [(target.frequency_hz, target.modulation)]
+            problem = ("it isn't an NFM, FM or AM target" if target.kind != "audio" or target.modulation not in pipelines.MULTI_MODES
+                       else pipelines.multi_problem(pairs, source.max_channels or pipelines.MULTI_DEFAULT_CHANNELS))
+            if problem:
+                events.append(("schedule.keep_skipped", rec.name, {"reason": problem}))
+                return None
+            session.add(Recorder(name=label, source_id=source.id, target_id=target.id,
+                                 assigned_by=f"schedule: {rec.name}"[:254], assigned_at=time.time()))
+            events.append(("schedule.kept", rec.name, {"source": source.name, "target": target.name, "as": "channel"}))
+            return label
         if base is None:
             session.add(Recorder(name=label, source_id=source.id, target_id=target.id,
                                  assigned_by=f"schedule: {rec.name}"[:254], assigned_at=time.time()))

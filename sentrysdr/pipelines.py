@@ -18,7 +18,14 @@ ANALOG = {"nfm", "fm", "am", "wfm"}  # nfm: 12.5 kHz channels; fm: 25 kHz (5 kHz
 DIGITAL = {"p25p1": "-f1", "p25p2": "-f2", "dmr": "-fs", "nxdn48": "-fi", "nxdn96": "-fn", "dstar": "-fd", "ysf": "-fy"}
 # DSD-FME writes one channel per time slot for these modes, and mono for the rest.
 TWO_SLOT = {"p25p2", "dmr"}
-MODULATIONS = ANALOG | set(DIGITAL) | {"adsb", "ais", "acars", "rtltcp", "tuner"}
+MODULATIONS = ANALOG | set(DIGITAL) | {"adsb", "ais", "acars", "rtltcp", "tuner", "multi"}
+# Multi-channel: one SDR records several voice targets inside its span, with the web tuner's DSP.
+MULTI_MODES = {"nfm": 12_500, "fm": 16_000, "am": 10_000}  # each mode's channel width, Hz
+MULTI_MAX_CHANNELS = 16  # the most any SDR can be set to, under Admin > SDR sources
+MULTI_DEFAULT_CHANNELS = 8  # an SDR's limit until an administrator changes it: check its machine first
+MULTI_RATES = (250_000, 1_024_000, 1_536_000, 1_800_000, 2_048_000, 2_400_000)  # the lowest that fits is used
+MULTI_USABLE = 0.84  # of the span: the stick's response falls off toward the edges
+MULTI_CENTER_GUARD_HZ = 10_000  # kept clear of the centre spike, beyond each channel's own width
 RTL_TCP_MIN_PORT = 1024
 # ACARS: one stick decodes several channels, so they must fit in what it can sample.
 ACARS_MIN_HZ = 118_000_000
@@ -48,6 +55,66 @@ class SpecError(ValueError):
     pass
 
 
+# --- multi-channel ---------------------------------------------------------------------
+def multi_plan(channels: list[tuple[int, str]]) -> dict | None:
+    """Where to tune for these (frequency, mode) channels: {"center_hz", "rate"}, or None if they don't fit.
+
+    The lowest rate that fits, to keep CPU down. Every channel must sit inside the usable part of
+    the span and clear of the centre spike.
+    """
+    if not channels or len(channels) > MULTI_MAX_CHANNELS:
+        return None
+    if any(mode not in MULTI_MODES for _, mode in channels):
+        return None
+    spread = [(hz, MULTI_MODES[mode] / 2) for hz, mode in channels]
+    low, high = min(hz - half for hz, half in spread), max(hz + half for hz, half in spread)
+    edges = sorted({e for hz, half in spread for e in (hz - half, hz + half)})
+    guard = MULTI_CENTER_GUARD_HZ
+    # Candidates: the middle, each gap between channels, and just outside either end.
+    candidates = [(low + high) / 2] + [(a + b) / 2 for a, b in zip(edges, edges[1:])]
+    candidates += [low - guard - 1_000, high + guard + 1_000]
+    candidates.sort(key=lambda c: abs(c - (low + high) / 2))
+    for rate in MULTI_RATES:
+        reach = MULTI_USABLE * rate / 2
+        for center in candidates:
+            center = round(center / 100) * 100
+            if all(abs(hz - center) + half <= reach and abs(hz - center) - half >= guard for hz, half in spread):
+                return {"center_hz": int(center), "rate": rate}
+    return None
+
+
+def multi_problem(channels: list[tuple[int, str]], limit: int = MULTI_DEFAULT_CHANNELS) -> str | None:
+    """Why these channels can't share one SDR, or None. `limit` is that SDR's maximum."""
+    if len(channels) > limit:
+        return (f"This SDR is set to record at most {limit} channels. An administrator can change that under "
+                f"Admin > SDR sources, where Check this machine shows how many it can handle.")
+    if any(mode not in MULTI_MODES for _, mode in channels):
+        return "Multi-channel records NFM, FM and AM targets only."
+    if multi_plan(channels) is None:
+        span = (max(hz for hz, _ in channels) - min(hz for hz, _ in channels)) / 1e6
+        reach = MULTI_USABLE * MULTI_RATES[-1] / 1e6
+        return (f"Those channels span {span:.3f} MHz, but one SDR covers about {reach:.1f} MHz. "
+                "Use another SDR for the farthest one.")
+    return None
+
+
+def _clean_channel(raw: dict) -> dict:
+    channel = {
+        "recorder_id": int(raw["recorder_id"]), "recorder_name": str(raw.get("recorder_name", ""))[:120],
+        "target_id": int(raw["target_id"]), "target_name": str(raw.get("target_name", ""))[:120],
+        "frequency_hz": int(raw["frequency_hz"]), "modulation": str(raw["modulation"]),
+        "squelch": None if raw.get("squelch") is None else round(float(raw["squelch"]), 1),
+        "volume_db": float(raw.get("volume_db") or 0),
+    }
+    if channel["modulation"] not in MULTI_MODES:
+        raise SpecError("bad channel modulation")
+    if channel["squelch"] is not None and not SQUELCH_DB_MIN <= channel["squelch"] <= SQUELCH_DB_MAX:
+        raise SpecError("channel squelch out of range")
+    if not VOLUME_MIN_DB <= channel["volume_db"] <= VOLUME_MAX_DB:
+        raise SpecError("channel volume out of range")
+    return channel
+
+
 def sanitize_spec(spec: dict) -> dict:
     """Validate an assignment. Raises SpecError on anything unexpected."""
     try:
@@ -69,13 +136,26 @@ def sanitize_spec(spec: dict) -> dict:
             "feeds": spec.get("feeds") or {},
             "feeder_uuid": feeds.valid_uuid(spec.get("feeder_uuid")),
             "rtl_tcp_port": int(spec["rtl_tcp_port"]) if spec.get("rtl_tcp_port") is not None else None,
+            "multi": [_clean_channel(c) for c in spec.get("multi") or []],
+            "rate": int(spec["rate"]) if spec.get("rate") is not None else None,
         }
     except (KeyError, TypeError, ValueError) as exc:
         raise SpecError(f"bad assignment: {exc}") from exc
     if not VOLUME_MIN_DB <= clean["volume_db"] <= VOLUME_MAX_DB:
         raise SpecError("volume out of range")
-    if clean["kind"] not in ("audio", "adsb", "ais", "acars", "rtltcp", "tuner"):
+    if clean["kind"] not in ("audio", "adsb", "ais", "acars", "rtltcp", "tuner", "multi"):
         raise SpecError("bad kind")
+    if clean["kind"] == "multi":
+        # frequency_hz is the SDR's centre; each channel must be inside the rate it reads at.
+        if clean["rate"] not in MULTI_RATES or not 1 <= len(clean["multi"]) <= MULTI_MAX_CHANNELS:
+            raise SpecError("bad multi-channel assignment")
+        if len({c["target_id"] for c in clean["multi"]}) != len(clean["multi"]):
+            raise SpecError("a channel appears twice")
+        for channel in clean["multi"]:
+            if abs(channel["frequency_hz"] - clean["frequency_hz"]) + MULTI_MODES[channel["modulation"]] / 2 > clean["rate"] / 2:
+                raise SpecError("a channel is outside the span")
+    elif clean["multi"] or clean["rate"] is not None:
+        raise SpecError("only multi-channel uses channels and a rate")
     if clean["kind"] == "rtltcp":
         if clean["rtl_tcp_port"] is None or not RTL_TCP_MIN_PORT <= clean["rtl_tcp_port"] <= 65535:
             raise SpecError("rtl_tcp needs a port from 1024 to 65535")
@@ -208,6 +288,17 @@ def measure_summary(levels: list[float], rate: int) -> dict:
     }
 
 
+def db_summary(levels_db: list[float]) -> dict:
+    """measure_summary's answer from channel levels already in dB, as a multi-channel SDR measures them."""
+    levels = sorted(levels_db)
+    low, typical, high = levels[len(levels) // 10], levels[len(levels) // 2], levels[-1]
+    return {
+        "low": round(low, 1), "typical": round(typical, 1), "high": round(high, 1),
+        "suggested": float(min(SQUELCH_DB_MAX, math.ceil(low + SQUELCH_MARGIN_DB))),
+        "moved": high > low + 6,  # something probably transmitted during the reading
+    }
+
+
 def sanitize_measure(request: dict) -> dict:
     """Validate a measure request. On a slave it arrives over the network."""
     try:
@@ -276,6 +367,18 @@ def rtltcp_args(cfg: Config, index: int, spec: dict) -> list[str]:
     if spec.get("ppm"):
         args += ["-P", str(spec["ppm"])]
     return args
+
+
+def rtl_sdr_args(cfg: Config, index: int, spec: dict) -> list[str]:
+    """Raw 8-bit IQ on stdout, for multi-channel. Blocks of about 50 ms keep live audio prompt."""
+    block = max(16384, round(spec["rate"] * 2 * 0.05 / 16384) * 16384)
+    args = [cfg.binary("rtl_sdr") or "rtl_sdr", "-d", str(index), "-f", str(spec["frequency_hz"]),
+            "-s", str(spec["rate"]), "-b", str(block)]
+    if spec.get("gain_db") is not None:
+        args += ["-g", f"{spec['gain_db']:g}"]
+    if spec.get("ppm"):
+        args += ["-p", str(spec["ppm"])]
+    return args + ["-"]
 
 
 def tuner_args(cfg: Config, index: int, spec: dict, port: int, rate: int, center_hz: int) -> list[str]:

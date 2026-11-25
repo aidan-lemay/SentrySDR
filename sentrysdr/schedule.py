@@ -67,6 +67,31 @@ def finished(recorder, local: datetime) -> bool:
     return is_once(recorder) and local.timestamp() >= recorder.once_end
 
 
+def resolve_sets(recorders: Iterable[RecorderLike], local: datetime) -> dict[int, tuple[list[RecorderLike], list[RecorderLike]]]:
+    """{source_id: (the schedules in their window, every base recorder)}, lowest id first."""
+    found: dict[int, tuple[list[RecorderLike], list[RecorderLike]]] = {}
+    for rec in sorted(recorders, key=lambda r: r.id):
+        if not rec.enabled:
+            continue
+        actives, bases = found.setdefault(rec.source_id, ([], []))
+        if not is_scheduled(rec):
+            bases.append(rec)
+        elif window_active(rec, local):
+            actives.append(rec)
+    return found
+
+
+def adds(recorder) -> bool:
+    """A schedule that joins a multi-channel SDR's channels rather than taking it over."""
+    return getattr(recorder, "schedule_mode", None) == "add"
+
+
+def split(actives: list) -> tuple[object | None, list]:
+    """The schedule taking the SDR over (the first that takes over), and those adding a channel."""
+    takeover = next((r for r in actives if not adds(r)), None)
+    return takeover, [r for r in actives if adds(r)]
+
+
 def resolve(recorders: Iterable[RecorderLike], local: datetime) -> dict[int, RecorderLike]:
     """Return {source_id: the recorder in control}. The lowest id wins a tie."""
     base: dict[int, RecorderLike] = {}

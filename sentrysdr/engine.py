@@ -61,7 +61,88 @@ RESET_SETTLE_SECONDS = 3.0
 START_GAP_SECONDS = 1.5
 RESET_RESTART_GAP = 60.0  # at most one automatic restart a minute, so a stick that always resets can't loop
 # Changing any of these restarts the tool: they are read when it starts. Volume is read live, and names are only labels.
-RADIO_KEYS = ("kind", "frequency_hz", "modulation", "squelch", "gain_db", "ppm", "channels", "feeds", "feeder_uuid", "rtl_tcp_port")
+RADIO_KEYS = ("kind", "frequency_hz", "modulation", "squelch", "gain_db", "ppm", "channels", "feeds", "feeder_uuid", "rtl_tcp_port",
+              "rate", "multi")
+MULTI_STATUS_SECONDS = 1.0  # how often a multi-channel SDR's levels are published
+LOAD_SMOOTHING = 0.05  # each block's share of the processing load figure: a few seconds' average
+MULTI_READ_TIMEOUT = 5.0  # rtl_sdr sends a block every 50 ms or so; this long with nothing means it's stuck
+
+
+def multi_layout(spec: dict | None) -> tuple | None:
+    """What needs a retune on a multi-channel SDR. Squelch, volume and names change without one."""
+    if not spec or spec.get("kind") != "multi":
+        return None
+    return (spec["frequency_hz"], spec["rate"], spec.get("gain_db"), spec.get("ppm"),
+            tuple((c["target_id"], c["frequency_hz"], c["modulation"]) for c in spec["multi"]))
+
+
+class MultiViewer:
+    """The web tuner on a recording multi-channel SDR: listeners pick their own channel in its span.
+
+    Commands come from the tuner hub, on the event loop, and wait here until the recording loop
+    applies them between blocks. Nothing a viewer sends can move the SDR.
+    """
+
+    MAX_LISTENERS = 16
+
+    def __init__(self):
+        self.pending: list[dict] = []
+        self.watching = False
+
+    def command(self, message: dict) -> None:
+        if message.get("op") in ("sync", "listen", "leave") and len(self.pending) < 256:
+            self.pending.append(message)  # centre, rate and gain are ignored: the channels decide those
+
+    def apply(self, dsp, clean_settings) -> None:
+        """Bring the DSP's viewer receivers in line with what the hub asked for. Keys are ("view", listener)."""
+        pending, self.pending = self.pending, []
+        for message in pending:
+            op = message.get("op")
+            if op == "sync":
+                self.watching = bool(message.get("watching"))
+                wanted = {}
+                for key, raw in list((message.get("listeners") or {}).items())[: self.MAX_LISTENERS]:
+                    settings = clean_settings(raw) if isinstance(raw, dict) and str(key).isdigit() else None
+                    if settings is not None:
+                        wanted[("view", int(key))] = settings
+                for key in [k for k in dsp.receivers if isinstance(k, tuple) and k not in wanted]:
+                    dsp.leave(key)
+                for key, settings in wanted.items():
+                    if key not in dsp.receivers or dsp.receivers[key].settings != settings:
+                        dsp.listen(key, settings)
+            elif op == "listen" and isinstance(message.get("listener"), int):
+                settings = clean_settings(message)
+                viewers = sum(1 for k in dsp.receivers if isinstance(k, tuple))
+                key = ("view", message["listener"])
+                if settings is not None and (key in dsp.receivers or viewers < self.MAX_LISTENERS):
+                    dsp.listen(key, settings)
+            elif op == "leave":
+                dsp.leave(("view", message.get("listener")))
+
+
+class Resampler:
+    """Linear interpolation to exactly PCM_RATE: the tuner's channel rates are close to it, not equal."""
+
+    def __init__(self, rate_in: float, rate_out: int = pipelines.PCM_RATE):
+        import numpy as np
+        self.np = np
+        self.step = rate_in / rate_out
+        self.position = 0.0  # where the next output sample falls, counting from the last input sample kept
+        self.last = np.zeros(1, dtype=np.float32)
+
+    def __call__(self, samples):
+        np = self.np
+        joined = np.concatenate((self.last, samples.astype(np.float32, copy=False)))
+        end = len(joined) - 1
+        if end < 1 or self.position > end:
+            self.position -= len(samples)
+            self.last = joined[-1:]
+            return np.zeros(0, dtype=np.float32)
+        positions = np.arange(self.position, end, self.step)
+        out = np.interp(positions, np.arange(len(joined)), joined).astype(np.float32)
+        self.position = positions[-1] + self.step - end if len(positions) else self.position - len(samples)
+        self.last = joined[-1:]
+        return out
 
 CallSink = Callable[[dict, Path], Awaitable[None]]
 PcmSink = Callable[[str, bytes, int], None]
@@ -279,6 +360,9 @@ class Worker:
         self.note = ""  # an informational warning that outlives the error field
         self.feed_status: dict = {}
         self.rtl_tcp: dict = {}  # address and whether a client is connected, while serving rtl_tcp
+        self.channel_status: dict = {}  # multi-channel: {target_id: in_call, call_started, last_call_at, level_db}
+        self.level_watch: dict[int, list[float]] = {}  # multi-channel channels being measured: their levels, as they come
+        self.load: float | None = None  # multi-channel: processing time over radio time, smoothed
         self._saving: set[asyncio.Task] = set()  # finished calls being encoded and stored
         self.note_at: float | None = None
         self._reset_seen = asyncio.Event()
@@ -297,6 +381,8 @@ class Worker:
             "note_at": self.note_at,
             "recorder_id": self.spec["recorder_id"] if self.spec else None,
             "target_id": self.spec["target_id"] if self.spec else None,
+            "channels": {key: dict(value) for key, value in self.channel_status.items()},  # a copy: it changes as calls do
+            "load": round(self.load, 3) if self.load is not None else None,
         }
 
     def _publish(self, state: str | None = None, error: str | None = None) -> None:
@@ -315,13 +401,15 @@ class Worker:
             current is not None and spec is not None
             and all(current.get(k) == spec.get(k) for k in RADIO_KEYS)
         )
-        if same_radio:
-            self.spec = spec  # names changed only: no retune, no dropped audio
+        if same_radio or (multi_layout(current) is not None and multi_layout(current) == multi_layout(spec)):
+            self.spec = spec  # names, or a channel's squelch or volume: no retune, no dropped audio
             return
         if current is None and spec is None:
             return
         await self.stop()
         self.spec = spec
+        self.channel_status = {}
+        self.load = None
         if spec is None:
             self.feed_status, self.rtl_tcp = {}, {}  # nothing is running, so nothing is feeding or listening
             self._publish("idle", "")
@@ -371,10 +459,29 @@ class Worker:
                 self._publish("idle", "")
 
     async def measure(self, frequency_hz: int, modulation: str, gain_db: float | None, ppm: int) -> dict:
-        """Pause this SDR's assignment, read the noise level, then resume."""
+        """Read the noise level. A running multi-channel channel is read live; otherwise pause, read, resume."""
+        spec = self.spec
+        if spec and spec.get("kind") == "multi" and self.task and not self.task.done():
+            channel = next((c for c in spec["multi"] if c["frequency_hz"] == frequency_hz and c["modulation"] == modulation), None)
+            if channel is not None:
+                return await self._measure_live(channel["target_id"], spec.get("gain_db"))
         async with self._paused("measuring") as index:
             args = pipelines.measure_args(self.cfg, index, frequency_hz, modulation, gain_db, ppm)
             return await self._read_levels(args, pipelines.measure_rate(modulation))
+
+    async def _measure_live(self, target_id: int, gain_db: float | None) -> dict:
+        """A multi-channel channel's levels for MEASURE_SECONDS, from the running stream: nothing stops."""
+        if target_id in self.level_watch:
+            raise MeasureError("That channel is already being measured. Try again in a moment.")
+        levels: list[float] = []
+        self.level_watch[target_id] = levels
+        try:
+            await asyncio.sleep(MEASURE_SECONDS)
+        finally:
+            self.level_watch.pop(target_id, None)
+        if len(levels) < 5:
+            raise MeasureError("No samples from the SDR. Check that it's listening.")
+        return {**pipelines.db_summary(levels), "live": True, "gain_db": gain_db}
 
     async def detect(self) -> dict:
         """Pause this SDR's assignment, read its tuner and gain steps, then resume."""
@@ -499,7 +606,7 @@ class Worker:
     async def _run(self, spec: dict) -> None:
         delay = RESTART_MIN
         pipeline = {"adsb": self._run_adsb, "ais": self._run_ais, "acars": self._run_acars,
-                    "rtltcp": self._run_rtltcp, "tuner": self._run_tuner}.get(spec["kind"], self._run_audio)
+                    "rtltcp": self._run_rtltcp, "tuner": self._run_tuner, "multi": self._run_multi}.get(spec["kind"], self._run_audio)
         self._set_note("")  # a new assignment starts with a clean slate
         self.feed_status = {}
         self.rtl_tcp = {}
@@ -629,6 +736,182 @@ class Worker:
             if writer:
                 # Saved in its own task, which stop() waits for, so a retune or shutdown keeps it.
                 self._save(writer)
+
+    async def _run_multi(self, index: int, spec: dict) -> str:
+        """Several voice channels from one SDR: rtl_sdr's samples through the web tuner's DSP.
+
+        Each channel has its own squelch, calls, volume and live stream. A closed squelch gives
+        exact zeros, which is how a channel's call ends, as rtl_fm's silence does for one channel.
+        """
+        try:
+            import numpy as np
+            from . import tuner, tuner_session
+        except ImportError:
+            return "multi-channel needs numpy, which isn't installed (there's none for 32-bit Raspberry Pi OS)"
+        cfg = self.cfg
+        dsp = tuner.Tuner(spec["rate"], spec["frequency_hz"])
+        widths = {"nfm": 12_500, "fm": 16_000, "am": 10_000}
+        states: dict[int, dict] = {}
+        for channel in spec["multi"]:
+            mode = "am" if channel["modulation"] == "am" else "nfm"
+            dsp.listen(channel["target_id"], tuner.Settings(
+                frequency_hz=channel["frequency_hz"], mode=mode, bandwidth_hz=widths[channel["modulation"]],
+                squelch_db=channel["squelch"]))
+            states[channel["target_id"]] = {
+                "resample": Resampler(dsp.receivers[channel["target_id"]].audio_rate), "volume": VolumeControl(),
+                "writer": None, "last_open": 0.0, "open_since": None, "last_call_at": None,
+            }
+        tail = ToolTail()
+        proc = await asyncio.create_subprocess_exec(
+            *pipelines.rtl_sdr_args(cfg, index, spec), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        reader = asyncio.create_task(_log_stderr(self.serial, proc.stderr, tail, self._on_reset))
+        self._publish("listening", "")
+        viewer = MultiViewer()
+        self.tuner = viewer  # the web tuner can open this SDR, view-only
+        center, rate = spec["frequency_hz"], spec["rate"]
+
+        def tuner_state() -> None:
+            channels = [{"frequency_hz": c["frequency_hz"], "name": c["target_name"], "modulation": c["modulation"]}
+                        for c in (self.spec or spec).get("multi", [])]
+            self.sup.tuner_out(self.serial, "json", {"t": "state", "running": True, "center_hz": center, "rate": rate,
+                                                     "gain_db": spec.get("gain_db"), "error": "", "view_only": True,
+                                                     "channels": channels})
+        tuner_state()
+        stated = viewer_status = time.monotonic()
+        leftover = b""
+        published = 0.0
+        try:
+            while True:
+                try:
+                    chunk = await aio.wait_for(proc.stdout.read(262144), MULTI_READ_TIMEOUT)
+                except asyncio.TimeoutError:
+                    return "rtl_sdr stopped sending samples"
+                if not chunk:
+                    break
+                data = leftover + chunk
+                leftover = data[len(data) & ~1:]  # I and Q come in pairs: keep a split pair for next time
+                viewer.apply(dsp, tuner_session.clean_settings)
+                started = time.perf_counter()
+                rows, audio = await asyncio.to_thread(dsp.feed, data[: len(data) & ~1])
+                # Processing time over the length of radio it covered. Over 1 would mean falling behind.
+                block = time.perf_counter() - started
+                radio = (len(data) // 2) / spec["rate"]
+                if radio > 0:
+                    sample = block / radio
+                    self.load = sample if self.load is None else self.load + (sample - self.load) * LOAD_SMOOTHING
+                now_ = time.monotonic()
+                current = {c["target_id"]: c for c in (self.spec or spec).get("multi", [])}
+                if viewer.watching:
+                    for row in rows:
+                        self.sup.tuner_out(self.serial, "frame", tuner_session.waterfall_frame(center, rate, row))
+                for key, pieces in audio.items():
+                    if isinstance(key, tuple) and pieces:  # a tuner viewer's own channel
+                        receiver = dsp.receivers[key]
+                        self.sup.tuner_out(self.serial, "frame", tuner_session.audio_frame(
+                            key[1], receiver.audio_rate, 2 if receiver.settings.mode == "wfm_stereo" else 1,
+                            receiver.level_db, receiver.open, tuner.mulaw(np.concatenate(pieces))))
+                if now_ - viewer_status >= tuner_session.STATUS_SECONDS:
+                    viewer_status = now_
+                    for key, receiver in dsp.receivers.items():
+                        if isinstance(key, tuple):
+                            status = {"t": "rx", "listener": key[1], "level_db": round(receiver.level_db, 1),
+                                      "open": receiver.open, "inside": receiver.inside, "stereo": receiver.stereo}
+                            if receiver.rds is not None:
+                                status["rds"] = receiver.rds.text.view()
+                            if receiver.morse is not None:
+                                status["morse"] = receiver.morse.view()
+                            self.sup.tuner_out(self.serial, "json", status)
+                if now_ - stated >= tuner_session.STATE_SECONDS:
+                    stated = now_
+                    tuner_state()
+                for target_id, pieces in audio.items():
+                    if isinstance(target_id, tuple):
+                        continue
+                    state, channel = states[target_id], current.get(target_id)
+                    receiver = dsp.receivers[target_id]
+                    if channel is not None:
+                        receiver.settings.squelch_db = channel["squelch"]  # a changed squelch applies straight away
+                    if not pieces:
+                        continue
+                    samples = state["resample"](np.concatenate(pieces))
+                    if not len(samples):
+                        continue
+                    if np.any(samples):
+                        pcm = (np.clip(samples, -1, 1) * 32767).astype("<i2").tobytes()
+                        self._channel_audio(spec, channel or {}, target_id, state, pcm, now_)
+                    elif state["writer"] and now_ - state["last_open"] >= cfg.hang_seconds:
+                        self._channel_end(target_id, state)
+                for target_id, levels in self.level_watch.items():
+                    receiver = dsp.receivers.get(target_id)
+                    if receiver is not None:
+                        levels.append(receiver.level_db)
+                if now_ - published >= MULTI_STATUS_SECONDS:
+                    published = now_
+                    self._channel_publish(dsp, states)
+            await proc.wait()
+            await _drained(reader)
+            return exit_message("rtl_sdr", proc.returncode, tail)
+        finally:
+            self.tuner = None
+            self.sup.tuner_out(self.serial, "json", {"t": "state", "running": False})
+            await stop_process(proc)
+            reader.cancel()
+            for target_id, state in states.items():
+                if state["writer"]:
+                    self._channel_end(target_id, state)
+
+    def _channel_audio(self, spec: dict, channel: dict, target_id: int, state: dict, pcm: bytes, now_: float) -> None:
+        cfg = self.cfg
+        pcm = state["volume"](pcm, channel.get("volume_db", 0))
+        if state["writer"] is None:
+            call_spec = {**spec, **{k: channel[k] for k in ("recorder_id", "recorder_name", "target_id", "target_name",
+                                                           "frequency_hz", "modulation") if k in channel}}
+            state["writer"] = CallWriter(cfg, call_spec, self.serial, pipelines.PCM_RATE, self.sup.tmp_dir, self.sup.call_sink)
+            state["shown"] = False
+        state["writer"].write(pcm)
+        if not state["shown"] and state["writer"].duration >= cfg.min_call_seconds:
+            # On air once it's long enough to keep: a blip shorter than that isn't saved, so it isn't shown.
+            state["shown"] = True
+            self.channel_status.setdefault(str(target_id), {}).update(in_call=True, call_started=state["writer"].started_at)
+            self._sync_call_state()
+        state["last_open"] = now_
+        self.sup.pcm(f"{self.serial}#{target_id}", pcm, pipelines.PCM_RATE)
+        state["open_since"] = state["open_since"] or now_
+        if channel.get("squelch") is not None and now_ - state["open_since"] >= SQUELCH_STUCK_SECONDS and not self.error:
+            self._publish(error=f"{channel.get('target_name', 'A channel')}: {SQUELCH_STUCK_WARNING}")
+        if state["writer"].duration >= cfg.max_call_seconds:
+            self._channel_end(target_id, state, still_open=True)
+
+    def _channel_end(self, target_id: int, state: dict, still_open: bool = False) -> None:
+        writer, state["writer"] = state["writer"], None
+        if not still_open:
+            state["open_since"] = None
+        if state.get("shown"):
+            self.channel_status.setdefault(str(target_id), {}).update(in_call=False, call_started=None, last_call_at=time.time())
+            self._sync_call_state()
+        task = asyncio.create_task(self._finish(writer), name=f"save-{writer.id}")
+        self._saving.add(task)
+        task.add_done_callback(self._saving.discard)
+
+    def _sync_call_state(self) -> None:
+        """The SDR is on air while any channel is; its last call is the latest of theirs."""
+        calls = self.channel_status.values()
+        self.in_call = any(c.get("in_call") for c in calls)
+        started = [c["call_started"] for c in calls if c.get("call_started")]
+        self.call_started = min(started) if started else None
+        ended = [c["last_call_at"] for c in calls if c.get("last_call_at")]
+        self.last_call_at = max(ended) if ended else self.last_call_at
+        if self.error and not self.in_call and SQUELCH_STUCK_WARNING in self.error:
+            self.error = ""
+        self._publish()
+
+    def _channel_publish(self, dsp, states: dict) -> None:
+        for target_id in states:
+            receiver = dsp.receivers.get(target_id)
+            if receiver is not None:
+                self.channel_status.setdefault(str(target_id), {})["level_db"] = round(receiver.level_db, 1)
+        self._publish()
 
     def _save(self, writer: CallWriter) -> None:
         """End a call now and save it in the background.
@@ -841,6 +1124,15 @@ def merge_ais_message(vessels: dict[str, dict], line: bytes) -> None:
     vessel["seen_at"] = time.time()
 
 
+async def benchmark_machine() -> dict:
+    """How much multi-channel this machine can do. No stick needed, so nothing pauses."""
+    try:
+        from . import tuner
+    except ImportError:
+        raise MeasureError("Multi-channel needs numpy, which isn't installed on this machine.") from None
+    return await asyncio.to_thread(tuner.benchmark, pipelines.MULTI_MAX_CHANNELS)
+
+
 class Supervisor:
     """Applies desired assignments, and only ever touches configured serials."""
 
@@ -893,6 +1185,8 @@ class Supervisor:
             raise MeasureError("That SDR isn't in sdr.serials on this node.")
         if request.get("op") == "detect":
             return await worker.detect()
+        if request.get("op") == "benchmark":
+            return await benchmark_machine()
         return await worker.measure(**request)
 
     def tuner_command(self, serial: str, message: dict) -> bool:
