@@ -76,6 +76,50 @@ def multi_layout(spec: dict | None) -> tuple | None:
             tuple((c["target_id"], c["frequency_hz"], c["modulation"]) for c in spec["multi"]))
 
 
+class MultiViewer:
+    """The web tuner on a recording multi-channel SDR: listeners pick their own channel in its span.
+
+    Commands come from the tuner hub, on the event loop, and wait here until the recording loop
+    applies them between blocks. Nothing a viewer sends can move the SDR.
+    """
+
+    MAX_LISTENERS = 16
+
+    def __init__(self):
+        self.pending: list[dict] = []
+        self.watching = False
+
+    def command(self, message: dict) -> None:
+        if message.get("op") in ("sync", "listen", "leave") and len(self.pending) < 256:
+            self.pending.append(message)  # centre, rate and gain are ignored: the channels decide those
+
+    def apply(self, dsp, clean_settings) -> None:
+        """Bring the DSP's viewer receivers in line with what the hub asked for. Keys are ("view", listener)."""
+        pending, self.pending = self.pending, []
+        for message in pending:
+            op = message.get("op")
+            if op == "sync":
+                self.watching = bool(message.get("watching"))
+                wanted = {}
+                for key, raw in list((message.get("listeners") or {}).items())[: self.MAX_LISTENERS]:
+                    settings = clean_settings(raw) if isinstance(raw, dict) and str(key).isdigit() else None
+                    if settings is not None:
+                        wanted[("view", int(key))] = settings
+                for key in [k for k in dsp.receivers if isinstance(k, tuple) and k not in wanted]:
+                    dsp.leave(key)
+                for key, settings in wanted.items():
+                    if key not in dsp.receivers or dsp.receivers[key].settings != settings:
+                        dsp.listen(key, settings)
+            elif op == "listen" and isinstance(message.get("listener"), int):
+                settings = clean_settings(message)
+                viewers = sum(1 for k in dsp.receivers if isinstance(k, tuple))
+                key = ("view", message["listener"])
+                if settings is not None and (key in dsp.receivers or viewers < self.MAX_LISTENERS):
+                    dsp.listen(key, settings)
+            elif op == "leave":
+                dsp.leave(("view", message.get("listener")))
+
+
 class Resampler:
     """Linear interpolation to exactly PCM_RATE: the tuner's channel rates are close to it, not equal."""
 
@@ -701,7 +745,7 @@ class Worker:
         """
         try:
             import numpy as np
-            from . import tuner
+            from . import tuner, tuner_session
         except ImportError:
             return "multi-channel needs numpy, which isn't installed (there's none for 32-bit Raspberry Pi OS)"
         cfg = self.cfg
@@ -723,6 +767,18 @@ class Worker:
         )
         reader = asyncio.create_task(_log_stderr(self.serial, proc.stderr, tail, self._on_reset))
         self._publish("listening", "")
+        viewer = MultiViewer()
+        self.tuner = viewer  # the web tuner can open this SDR, view-only
+        center, rate = spec["frequency_hz"], spec["rate"]
+
+        def tuner_state() -> None:
+            channels = [{"frequency_hz": c["frequency_hz"], "name": c["target_name"], "modulation": c["modulation"]}
+                        for c in (self.spec or spec).get("multi", [])]
+            self.sup.tuner_out(self.serial, "json", {"t": "state", "running": True, "center_hz": center, "rate": rate,
+                                                     "gain_db": spec.get("gain_db"), "error": "", "view_only": True,
+                                                     "channels": channels})
+        tuner_state()
+        stated = viewer_status = time.monotonic()
         leftover = b""
         published = 0.0
         try:
@@ -735,8 +791,9 @@ class Worker:
                     break
                 data = leftover + chunk
                 leftover = data[len(data) & ~1:]  # I and Q come in pairs: keep a split pair for next time
+                viewer.apply(dsp, tuner_session.clean_settings)
                 started = time.perf_counter()
-                _, audio = await asyncio.to_thread(dsp.feed, data[: len(data) & ~1])
+                rows, audio = await asyncio.to_thread(dsp.feed, data[: len(data) & ~1])
                 # Processing time over the length of radio it covered. Over 1 would mean falling behind.
                 block = time.perf_counter() - started
                 radio = (len(data) // 2) / spec["rate"]
@@ -745,7 +802,32 @@ class Worker:
                     self.load = sample if self.load is None else self.load + (sample - self.load) * LOAD_SMOOTHING
                 now_ = time.monotonic()
                 current = {c["target_id"]: c for c in (self.spec or spec).get("multi", [])}
+                if viewer.watching:
+                    for row in rows:
+                        self.sup.tuner_out(self.serial, "frame", tuner_session.waterfall_frame(center, rate, row))
+                for key, pieces in audio.items():
+                    if isinstance(key, tuple) and pieces:  # a tuner viewer's own channel
+                        receiver = dsp.receivers[key]
+                        self.sup.tuner_out(self.serial, "frame", tuner_session.audio_frame(
+                            key[1], receiver.audio_rate, 2 if receiver.settings.mode == "wfm_stereo" else 1,
+                            receiver.level_db, receiver.open, tuner.mulaw(np.concatenate(pieces))))
+                if now_ - viewer_status >= tuner_session.STATUS_SECONDS:
+                    viewer_status = now_
+                    for key, receiver in dsp.receivers.items():
+                        if isinstance(key, tuple):
+                            status = {"t": "rx", "listener": key[1], "level_db": round(receiver.level_db, 1),
+                                      "open": receiver.open, "inside": receiver.inside, "stereo": receiver.stereo}
+                            if receiver.rds is not None:
+                                status["rds"] = receiver.rds.text.view()
+                            if receiver.morse is not None:
+                                status["morse"] = receiver.morse.view()
+                            self.sup.tuner_out(self.serial, "json", status)
+                if now_ - stated >= tuner_session.STATE_SECONDS:
+                    stated = now_
+                    tuner_state()
                 for target_id, pieces in audio.items():
+                    if isinstance(target_id, tuple):
+                        continue
                     state, channel = states[target_id], current.get(target_id)
                     receiver = dsp.receivers[target_id]
                     if channel is not None:
@@ -771,6 +853,8 @@ class Worker:
             await _drained(reader)
             return exit_message("rtl_sdr", proc.returncode, tail)
         finally:
+            self.tuner = None
+            self.sup.tuner_out(self.serial, "json", {"t": "state", "running": False})
             await stop_process(proc)
             reader.cancel()
             for target_id, state in states.items():

@@ -396,7 +396,7 @@ Tune around with an SDR from the browser, like GQRX: a spectrum and waterfall, a
 
 1. Under **Targets**, add a target of type **Tuner**. Its frequency is only where the SDR starts.
 2. Assign it to an SDR on the **Sources** page. Nothing is recorded while an SDR is a tuner.
-3. Open it from **Tuner** in the menu, or **Open tuner** next to that SDR on Sources. Each tuner opens in its own tab.
+3. Open it from **Tuner** in the menu, or **Open tuner** next to that SDR on Sources. Each tuner opens in its own tab. A [multi-channel SDR](#multi-channel-sdrs) can be opened too while it records, view only.
 
 A tuner opens in a window of its own, laid out like GQRX for a desktop screen: your channel's frequency across the top, the spectrum and waterfall filling the left, and tabs on the right. It isn't made for a phone held upright.
 
@@ -448,6 +448,7 @@ On the Sources page, open **Change assignment** and choose **Multi-channel**, th
 - **Changing the set** (adding or removing a channel, or the gain) briefly restarts the SDR, so a call in progress on another channel ends and is saved. Changing a channel's squelch or volume doesn't.
 - **Schedules** on a multi-channel SDR either **take over the SDR**, as on any SDR, or **add as a channel**: the target joins its channels for the window while they carry on. One set to add that doesn't fit alongside them at the time takes the SDR over instead, and saving it warns if that's how it stands. After a takeover, every channel comes back. A schedule set to keep its target adds it as one more channel when it ends, if it fits; if not, it's skipped and the audit log says why.
 - **Locks** cover every channel.
+- **The web tuner** can open a multi-channel SDR while it records, with **View in tuner** on the Sources page: its waterfall, with the recorded channels labelled in red, and your own channel anywhere inside its span. It's view only: nobody can take it or move it, and recording carries on. The waterfall only costs CPU while someone has it open.
 - **Only NFM, FM and AM.** Digital voice, ADS-B, AIS, ACARS, rtl_tcp and the web tuner still take the whole stick.
 
 **How many channels.** Each SDR can record up to 8 channels at once, or a number an administrator sets under Admin > SDR sources, up to 16. **Check this machine** there times the DSP on the machine the SDR is plugged into, at a typical span and the widest, allowing about 3 times the DSP's own time for the rest of recording, and recommends how many keep it under half of real time. It needs no stick, so nothing pauses. It's a cursory check: the Sources page shows each multi-channel SDR's real **processing load**, how long its processing takes compared with the radio it covers, and warns past 70%. Over 100% it would fall behind and drop audio. As a guide, 14 channels on one stick took about 14% on a desktop; a Raspberry Pi 4 is roughly 5 to 8 times slower per core.

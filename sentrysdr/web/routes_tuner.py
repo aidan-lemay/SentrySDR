@@ -36,12 +36,12 @@ def tuner_user(user: User = Depends(current_user)) -> User:
 
 
 def _tuner_sources(ctx, db) -> list[tuple[Source, Node]]:
-    """SDRs assigned a tuner target right now."""
+    """SDRs a tuner can open now: tuner targets, and recording multi-channel SDRs, view-only."""
     assigned = ctx.assignments()
     found = []
     for source in db.scalars(select(Source).order_by(Source.name)):
         spec = assigned.get(source.node_id, {}).get(source.serial)
-        if spec and spec["kind"] == "tuner":
+        if spec and spec["kind"] in ("tuner", "multi"):
             node = db.get(Node, source.node_id)
             if node is not None:
                 found.append((source, node))
@@ -58,6 +58,7 @@ def list_tuners(request: Request, _user: User = Depends(tuner_user), db=Depends(
         controller = room.viewers.get(room.controller) if room else None
         status = ctx.status.get((source.node_id, source.serial), {})
         items.append({"source_id": source.id, "name": source.name, "node_name": node.name,
+                      "view_only": bool(room and room.state.get("view_only")) or bool(source.multichannel),
                       "state": status.get("state", ""), "error": status.get("error", ""),
                       "viewers": len(room.viewers) if room else 0, "controller": controller.name if controller else None})
     return items
@@ -77,7 +78,7 @@ def _allowed(ctx, websocket: WebSocket, source_id: int) -> tuple[User, tuple[int
         if source is None:
             return "That SDR doesn't exist."
         if not any(s.id == source_id for s, _ in _tuner_sources(ctx, db)):
-            return f"{source.name} isn't set up as a tuner right now. Assign it a tuner target on the Sources page."
+            return f"{source.name} isn't set up as a tuner right now. Assign it a tuner target, or make it multi-channel, on the Sources page."
         db.expunge(user)
         return user, (source.node_id, source.serial), source.name
 

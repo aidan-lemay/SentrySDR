@@ -132,7 +132,7 @@
     const target = snap ? Math.round(hz / step) * step : Math.round(hz);
     if (span && (target < span.low || target > span.high)) {
       if (!owner) {
-        error = `${mhz(target)} MHz is outside this SDR's span. ${sdr.controller ? `${sdr.controller} owns the tuner and can move it.` : 'Whoever takes the tuner can move it.'}`;
+        error = `${mhz(target)} MHz is outside this SDR's span. ${sdr.view_only ? 'It\'s recording its channels, so it can\'t be moved.' : sdr.controller ? `${sdr.controller} owns the tuner and can move it.` : 'Whoever takes the tuner can move it.'}`;
         return;
       }
       send({ t: 'center', hz: Math.round(target - sdr.rate / 4) });
@@ -420,11 +420,20 @@
 
   // Bookmarks as labels across the top, as in GQRX: a line in the folder's color down to the
   // frequency, the name in ordinary text. Three rows, so near neighbors don't sit on each other.
+  // A recording multi-channel SDR's channels, labelled in red. Clicking one tunes to it, like a bookmark.
+  const RECORDED_WIDTHS = { nfm: 12500, fm: 16000, am: 10000 };
+  function recordedMarks() {
+    return (sdr.view_only ? sdr.channels ?? [] : []).map((c) => ({
+      frequency_hz: c.frequency_hz, name: `● ${c.name}`, color: css('--red') || '#c00000',
+      mode: c.modulation === 'am' ? 'am' : 'nfm', bandwidth_hz: RECORDED_WIDTHS[c.modulation] ?? null,
+    }));
+  }
+
   function drawMarks(context, x, width, plotHeight) {
     markRects = [];
     const rows = [-Infinity, -Infinity, -Infinity];
     context.font = '11px sans-serif';
-    for (const mark of marks) {
+    for (const mark of [...marks, ...recordedMarks()]) {
       if (mark.frequency_hz < span.low || mark.frequency_hz > span.high) continue;
       const px = Math.round(x(mark.frequency_hz)) + 0.5;
       const label = mark.name.length > 18 ? `${mark.name.slice(0, 17)}…` : mark.name;
@@ -585,14 +594,14 @@
 
 {#if !sourceId}
   <h1>Tuner</h1>
-  <p class="small">Tune around with an SDR from here, like GQRX: a waterfall, any frequency the stick reaches, and your own choice of mode. One person at a time owns a tuner and moves it; anyone else on it picks their own channel inside its span. An SDR becomes a tuner when it's assigned a Tuner target on the Sources page. Each opens in its own window.</p>
+  <p class="small">Tune around with an SDR from here, like GQRX: a waterfall, any frequency the stick reaches, and your own choice of mode. One person at a time owns a tuner and moves it; anyone else on it picks their own channel inside its span. An SDR becomes a tuner when it's assigned a Tuner target on the Sources page. A multi-channel SDR can be opened too while it records, view only: listen anywhere inside its span, but it can't be moved. Each opens in its own window.</p>
   {#if listError}<div class="err" role="alert">{listError}</div>{/if}
   <div class="box">
     {#each tuners ?? [] as t (t.source_id)}
       <div class="call">
         <div><strong>{t.name}</strong> <span class="small dim">on {t.node_name}</span></div>
         <div class="small">
-          {#if t.error}<span class="st-bad">{t.error}</span>{:else if t.state === 'listening'}<span class="st-ok">Ready</span>{:else}{t.state || 'Starting'}{/if}
+          {#if t.error}<span class="st-bad">{t.error}</span>{:else if t.state === 'listening'}<span class="st-ok">Ready</span>{:else}{t.state || 'Starting'}{/if}{t.view_only ? ', recording: view only' : ''}
           {#if t.viewers}, {t.viewers} {t.viewers === 1 ? 'person' : 'people'} on it{t.controller ? `, owned by ${t.controller}` : ''}{/if}
         </div>
         <div class="buttons"><a class="button" href={`#/tuner?source=${t.source_id}`} target="_blank" rel="noopener">Open tuner</a></div>
@@ -621,6 +630,7 @@
         <strong>{sourceName || 'Tuner'}:</strong>
         {#if !connected}<span class="st-warn">connecting...</span>
         {:else if !sdr.running}<span class="st-warn">{sdr.error || 'starting, or not running'}</span>
+        {:else if sdr.view_only}<span class="st-warn">recording {sdr.channels?.length ?? 0} channel{sdr.channels?.length === 1 ? '' : 's'}: view only.</span> Listen anywhere inside its span; it can't be moved.
         {:else if owner}you own this tuner.
         {:else if sdr.controller}{sdr.controller} owns this tuner.
         {:else}nobody owns this tuner.{/if}

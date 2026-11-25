@@ -390,6 +390,9 @@
                 {#if can('maps') && source.active_target?.kind === 'acars'}
                   <a class="button" href="#/messages">Messages</a>
                 {/if}
+                {#if (can('tuner') || can('listen_live')) && source.active_target?.kind === 'multi'}
+                  <a class="button" href={`#/tuner?source=${source.id}`} target="_blank" rel="noopener" title="See its span and listen anywhere in it, while it records. It can't be moved from there.">View in tuner</a>
+                {/if}
                 {#if can('tuner') && source.active_target?.kind === 'tuner'}
                   <a class="button" href={`#/tuner?source=${source.id}`} target="_blank" rel="noopener">Open tuner</a>
                 {/if}

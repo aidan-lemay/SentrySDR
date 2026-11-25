@@ -152,6 +152,8 @@ class TunerHub:
             self.send(key[0], key[1], {"op": "listen", "listener": viewer.id, **listen})
             return
         if op == "claim":
+            if room.state.get("view_only"):
+                raise TunerError("This SDR is recording its channels, so nobody can move it. Pick your own frequency inside its span.")
             if not viewer.can_own:
                 raise TunerError("You can listen, but you don't have permission to tune this SDR.")
             if room.controller is not None and room.controller != viewer.id and not viewer.is_admin:
@@ -209,6 +211,13 @@ class TunerHub:
             if data.get("t") == "state":
                 was_running = room.state.get("running")
                 room.state = {key: data.get(key) for key in ("running", "center_hz", "rate", "gain_db", "error")}
+                if data.get("view_only"):
+                    # A recording multi-channel SDR: nobody moves it, and its channels show on the spectrum.
+                    room.state["view_only"] = True
+                    room.state["channels"] = [
+                        {"frequency_hz": int(c["frequency_hz"]), "name": str(c.get("name", ""))[:120], "modulation": str(c.get("modulation", ""))[:8]}
+                        for c in (data.get("channels") or [])[:32] if isinstance(c, dict) and isinstance(c.get("frequency_hz"), int)]
+                    room.controller = None
                 if room.state["running"] and not was_running:
                     self._sync((node_id, serial))  # a fresh session: tell it who's listening
                 self._announce((node_id, serial))
@@ -242,8 +251,8 @@ class TunerHub:
             viewer.put(("text", json.dumps({
                 "t": "state", **room.state, "viewers": len(room.viewers),
                 "controller": controller.name if controller else None, "you_control": mine,
-                "can_claim": viewer.can_own and controller is None,
-                "can_take": viewer.is_admin and controller is not None and not mine,
+                "can_claim": viewer.can_own and controller is None and not room.state.get("view_only"),
+                "can_take": viewer.is_admin and controller is not None and not mine and not room.state.get("view_only"),
                 "handover": others if mine else [],
             })))
 

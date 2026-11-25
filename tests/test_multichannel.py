@@ -462,3 +462,53 @@ def test_saving_an_add_schedule_says_when_it_will_take_over(admin, ctx):
     far = admin.post("/api/recorders", json={**window, "target_id": nfm(admin, "Far", 160.0)}).json()
     assert "takes the SDR over" in far["warning"]
     assert admin.post("/api/recorders", json={**window, "target_id": nfm(admin, "X", 154.2), "mode": "sideways"}).status_code == 422
+
+
+# --- the web tuner on a recording multi-channel SDR, view-only ----------------------------------
+async def test_the_tuner_can_watch_and_listen_while_it_records(tmp_path):
+    import json
+    first, second = 154_430_000, 154_680_000
+    bins = tmp_path / "bin"
+    install_tool(bins, "rtl_sdr", FAKE_RTL_SDR.format(python=sys.executable, first=first, second=second))
+    calls, out = [], []
+    sup = supervisor(make_config(tmp_path, bin_dirs=[bins]), calls, statuses={})
+    sup.tuner_out = lambda serial, kind, data: out.append((kind, data))
+    spec = multi_spec([channel(1, first, "nfm"), channel(2, second, "am")])
+    try:
+        await sup.apply({"SER1": spec})
+        assert await wait_for(lambda: sup.workers["SER1"].tuner is not None)
+        listen = {"frequency_hz": first, "mode": "nfm", "deemphasis_us": 75}
+        assert sup.tuner_command("SER1", {"op": "sync", "watching": True, "listeners": {"5": listen}})
+        sup.tuner_command("SER1", {"op": "center", "hz": 160_000_000})  # ignored: it's recording
+        assert await wait_for(lambda: len(calls) >= 2, timeout=30)
+    finally:
+        await sup.shutdown()
+    frames = [data for kind, data in out if kind == "frame"]
+    assert any(f[:1] == b"W" for f in frames)  # the waterfall
+    audio = [f for f in frames if f[:1] == b"A"]
+    assert audio and all(int.from_bytes(f[1:5], "little") == 5 for f in audio)  # its own channel, to its listener
+    states = [d for kind, d in out if kind == "json" and d.get("t") == "state" and d.get("running")]
+    assert states and states[0]["view_only"] and states[0]["center_hz"] == spec["frequency_hz"]
+    assert [c["name"] for c in states[0]["channels"]] == ["T1", "T2"]
+    assert any(kind == "json" and d.get("t") == "rx" and d.get("listener") == 5 for kind, d in out)
+    assert {meta["target_id"] for meta, _, _ in calls} == {1, 2}  # recording carried on
+    json.dumps([d for kind, d in out if kind == "json"])  # what goes to the master is plain JSON
+
+
+def test_nobody_can_take_a_view_only_tuner():
+    from sentrysdr.tuner_hub import TunerError, TunerHub
+    hub = TunerHub(lambda *_: True)
+    viewer = hub.join((1, "S"), 1, "Ada", is_admin=True, can_own=True)
+    hub.from_node(1, "S", "json", {"t": "state", "running": True, "center_hz": 154_500_000, "rate": 1_024_000,
+                                   "view_only": True, "channels": [{"frequency_hz": 154_430_000, "name": "Fire", "modulation": "nfm"}]})
+    with pytest.raises(TunerError, match="recording"):
+        hub.command((1, "S"), viewer, {"t": "claim"})
+    import json
+    state = json.loads([item for item in list(viewer.queue._queue) if item[0] == "text"][-1][1])
+    assert state["view_only"] and not state["can_claim"] and not state["can_take"] and state["channels"][0]["name"] == "Fire"
+
+
+def test_a_multi_channel_sdr_is_listed_as_a_tuner(admin, ctx):
+    source = multi_source(admin, ("Fire", 154.43))
+    listed = admin.get("/api/tuners").json()
+    assert [t["source_id"] for t in listed] == [source] and listed[0]["view_only"]
