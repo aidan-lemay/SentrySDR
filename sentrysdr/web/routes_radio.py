@@ -214,7 +214,7 @@ def _source_view(ctx: Context, db, source: Source, winners: dict, recorders: lis
         "active_is_schedule": bool(active and active.schedule_days is not None),
         "active_target": {
             "id": target.id, "name": target.name, "frequency_hz": target.frequency_hz,
-            "modulation": target.modulation, "kind": target.kind,
+            "modulation": target.modulation, "kind": target.kind, "description": target.description or "",
             "squelch": profile.squelch_db if profile else target.squelch_db,
             "gain_db": profile.gain_db if profile else source.gain_db,
             "from_profile": profile is not None,
@@ -232,9 +232,11 @@ def _multi_view(ctx: Context, db, source: Source, active: Recorder | None, recor
     bases = sorted((r for r in recorders if r.source_id == source.id and r.schedule_days is None and r.enabled), key=lambda r: r.id)
     fitting, left_out = ctx.multi_channels(db, source, bases)
     states = status.get("channels") or {}
+    described = {c["target_id"]: (getattr(db.get(Target, c["target_id"]), "description", None) or "") for c in fitting}
     channels = [{
         "target_id": c["target_id"], "name": c["target_name"], "frequency_hz": c["frequency_hz"],
         "modulation": c["modulation"], "squelch": c["squelch"], "fits": True,
+        "description": described[c["target_id"]],
         "in_call": bool(states.get(str(c["target_id"]), {}).get("in_call")),
         "last_call_at": states.get(str(c["target_id"]), {}).get("last_call_at"),
         "level_db": states.get(str(c["target_id"]), {}).get("level_db"),
@@ -244,6 +246,7 @@ def _multi_view(ctx: Context, db, source: Source, active: Recorder | None, recor
         if target is not None:
             channels.append({"target_id": target.id, "name": target.name, "frequency_hz": target.frequency_hz,
                              "modulation": target.modulation, "squelch": target.squelch_db, "fits": False,
+                             "description": target.description or "",
                              "in_call": False, "last_call_at": None, "level_db": None})
     plan = pipelines.multi_plan([(c["frequency_hz"], c["modulation"]) for c in fitting]) if fitting else None
     view = {"multichannel": True, "channels": channels, "plan": plan, "load": status.get("load")}
@@ -404,6 +407,7 @@ def delete_source(source_id: int, request: Request, admin: User = Depends(admin_
 # --- targets ---------------------------------------------------------------
 class TargetBody(BaseModel):
     name: str = Field(min_length=1, max_length=120)
+    description: str = Field(default="", max_length=500)  # what it's used for, shown under its name
     kind: str = "audio"
     frequency_hz: int = Field(ge=pipelines.FREQ_MIN_HZ, le=pipelines.FREQ_MAX_HZ)
     modulation: str = "nfm"

@@ -325,6 +325,7 @@
                   {#each source.channels as ch (ch.target_id)}
                     <div class="channel-line">
                       <span class="mono nowrap">{formatMHz(ch.frequency_hz)}</span> {ch.name}
+                      {#if ch.description}<span class="small dim">{ch.description}</span>{/if}
                       <span class="small">({MODE_LABELS[ch.modulation] ?? ch.modulation.toUpperCase()}, squelch {ch.squelch == null ? 'off' : `${ch.squelch} dB`}{ch.level_db != null ? `, now ${ch.level_db} dB` : ''})</span>
                       {#if ch.in_call}<span class="st-air small">ON AIR</span>{/if}
                       {#if !ch.fits}<span class="st-warn small">Not recording: it no longer fits with the others</span>{/if}
@@ -340,6 +341,7 @@
                 {:else if source.active_target}
                   <span class="mono nowrap">{formatMHz(source.active_target.frequency_hz)}</span><br />
                   {source.active_target.name} ({MODE_LABELS[source.active_target.modulation] ?? source.active_target.modulation.toUpperCase()})
+                  {#if source.active_target.description}<br /><span class="small dim">{source.active_target.description}</span>{/if}
                   {#if source.active_target.kind === 'audio'}
                     <br /><span class="small">Squelch {source.active_target.squelch == null ? 'off' : `${source.active_target.squelch} dB`}, gain {gainLabel(source.active_target.gain_db)}{source.active_target.from_profile ? ', saved profile' : ''}</span>
                   {/if}

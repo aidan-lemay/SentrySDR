@@ -2837,3 +2837,17 @@ def test_trails_forget_quiet_aircraft():
     trails.add([{"hex": "b2", "lat": 2, "lon": 2}], now=1000 + coverage.TRAIL_SECONDS + 5)
     assert trails.get("a1", now=1000 + coverage.TRAIL_SECONDS + 5) == [] and "a1" not in trails.points
     assert trails.get("b2", now=1000 + coverage.TRAIL_SECONDS + 5) == [[2, 2]]
+
+
+def test_a_target_can_say_what_its_used_for(admin, ctx):
+    made = admin.post("/api/targets", json={"name": "TN Dispatch", "frequency_hz": 153_125_000, "description": "Fire/EMS dispatch, Lebanon and Hebron"})
+    assert made.status_code == 201 and made.json()["description"] == "Fire/EMS dispatch, Lebanon and Hebron"
+    target = made.json()["id"]
+    assert admin.post("/api/targets", json={"name": "X", "frequency_hz": 153_125_000, "description": "x" * 501}).status_code == 422
+    assert admin.post("/api/targets", json={"name": "Plain", "frequency_hz": 154_000_000}).json()["description"] == ""
+    source = make_source(admin)
+    admin.post(f"/api/sources/{source}/assign", json={"target_id": target}).raise_for_status()
+    assert source_row(admin, source)["active_target"]["description"] == "Fire/EMS dispatch, Lebanon and Hebron"
+    # On a multi-channel SDR, each channel shows its own.
+    admin.put(f"/api/sources/{source}/channel-mode", json={"multichannel": True}).raise_for_status()
+    assert source_row(admin, source)["channels"][0]["description"] == "Fire/EMS dispatch, Lebanon and Hebron"

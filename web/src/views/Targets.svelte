@@ -7,7 +7,7 @@
   import { clearAfter } from '../notice.svelte.js';
 
   const blank = () => ({
-    id: null, name: '', kind: 'audio', mhz: '', modulation: 'nfm', squelch: -40, volume_db: 0,
+    id: null, name: '', description: '', kind: 'audio', mhz: '', modulation: 'nfm', squelch: -40, volume_db: 0,
     clearcut_enabled: false, clearcut_system: '', clearcut_id: '', rdio_enabled: false, rdio_system: '', rdio_talkgroup: '',
     broadcastify_enabled: false, broadcastify_system_ref: '', broadcastify_slot: '',
     channels: [], newChannel: '', airframes_enabled: false, feeds: blankFeeds(),
@@ -107,7 +107,7 @@
     }
     const channelsHz = form.kind === 'acars' ? sortedChannels.map((mhz) => Math.round(mhz * 1e6)) : [];
     const body = {
-      name: form.name, kind: form.kind,
+      name: form.name, description: (form.description ?? '').trim(), kind: form.kind,
       frequency_hz: form.kind === 'acars' ? channelsHz[0] : Math.round(Number(fixed ? fixed.mhz : form.mhz) * 1e6),
       modulation: form.kind === 'acars' ? 'acars' : ['rtltcp', 'tuner'].includes(form.kind) ? form.kind : fixed ? fixed.modulation : form.modulation,
       acars_channels: channelsHz, airframes_enabled: form.kind === 'acars' && form.airframes_enabled,
@@ -164,7 +164,10 @@
     <tbody>
       {#each targets as target (target.id)}
         <tr>
-          <td class="title-cell">{target.name}</td>
+          <td class="title-cell">
+            {target.name}
+            {#if target.description}<div class="small dim" style="font-weight:normal">{target.description}</div>{/if}
+          </td>
           <td data-label="Frequency"><span class="mono">{target.kind === 'acars' ? (target.acars_channels ?? []).map((hz) => +(hz / 1e6).toFixed(4)).join(', ') + ' MHz' : formatMHz(target.frequency_hz)}</span></td>
           <td data-label="Mode"><span>{MODE_NAMES[target.modulation] ?? target.modulation.toUpperCase()}</span></td>
           {#if target.kind === 'audio'}<td data-label="Squelch"><span class="mono">{target.squelch == null ? 'Off' : `${target.squelch} dB`}</span></td>{:else}<td class="wide-only"></td>{/if}
@@ -191,6 +194,10 @@
   <fieldset>
     <legend>{form.id ? 'Edit target' : 'Add a target'}</legend>
     <label class="field"><span>Name / alpha tag</span><input bind:value={form.name} required maxlength="120" /></label>
+    <label class="field"><span>Description</span>
+      <input bind:value={form.description} maxlength="500" placeholder="Optional" />
+      <span class="hint">What it's used for, such as "Fire dispatch, county-wide". Shown under its name here and on the Sources page.</span>
+    </label>
     <label class="field"><span>Type</span>
       <select bind:value={form.kind}>
         <option value="audio">Voice calls</option>

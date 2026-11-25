@@ -163,6 +163,7 @@ class Target(Base):
     kind: Mapped[str] = mapped_column(String(8), default="audio")  # audio|adsb|ais
     frequency_hz: Mapped[int] = mapped_column()
     modulation: Mapped[str] = mapped_column(String(12), default="nfm")
+    description: Mapped[str | None] = mapped_column(String(500), nullable=True)  # what the channel is used for
     # Retired: rtl_fm's own squelch scale. Converted to squelch_db on upgrade, then left at 0.
     squelch: Mapped[int] = mapped_column(default=0)
     # dB, as the web tuner shows it. None = off: continuous recording.
