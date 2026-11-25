@@ -35,7 +35,8 @@ CW_PITCH_HZ = 700
 SSB_LOW_HZ = 300  # SSB audio starts here, so the carrier's hum is left out
 WATERFALL_BINS = (512, 1024, 2048)
 WATERFALL_FPS = 12
-DB_FLOOR = -130.0  # waterfall values are sent as bytes, in half-dB steps up from here
+DB_FLOOR = -130.0
+SQUELCH_HYSTERESIS_DB = 2.0  # an open squelch closes this far below its level, so noise at the line doesn't flicker it  # waterfall values are sent as bytes, in half-dB steps up from here
 
 
 def block_size(rate: int) -> int:
@@ -385,7 +386,7 @@ class Receiver:
         if self.morse is not None:  # before the squelch, so a squelch set too high doesn't stop it
             self.morse.push(y if self.settings.mode == "cw" else audio)
         squelch = self.settings.squelch_db
-        self.open = squelch is None or self.level_db >= squelch
+        self.open = squelch is None or self.level_db >= (squelch - SQUELCH_HYSTERESIS_DB if self.open else squelch)
         return audio if self.open else np.zeros_like(audio)
 
     def _demodulate(self, y: np.ndarray) -> np.ndarray:
@@ -524,3 +525,45 @@ class Tuner:
                 audio[listener].append(receiver.process(spectrum))
             self.buffer = self.buffer[self.hop:]
         return rows, audio
+
+
+# --- how much this machine can do ---------------------------------------------------------------
+BENCHMARK_RATES = {"typical": 1_024_000, "widest": 2_400_000}  # channels within about 860 kHz, and the widest span
+BENCHMARK_TARGET_LOAD = 0.5  # recommend what keeps it under half of real time, for headroom
+# Recording costs more than the DSP alone: each channel's audio, calls and live stream, and the
+# event loop around it. Measured at about 3 times, with 14 channels on a real stick.
+BENCHMARK_OVERHEAD = 3.0
+
+
+def benchmark(max_channels: int, seconds: float = 0.5) -> dict:
+    """Time the DSP on made-up samples, with 1 channel and with 8, at a typical span and the widest.
+
+    Load is processing time over the length of radio processed: 0.1 means a second of radio
+    takes a tenth of a second. For each span: the fixed cost, the cost of each channel (both
+    with recording's overhead allowed for), and the most channels, up to max_channels, that
+    stay under BENCHMARK_TARGET_LOAD.
+    """
+    import time
+    rng = np.random.default_rng(0)
+    found = {}
+    for span, rate in BENCHMARK_RATES.items():
+        raw = rng.integers(0, 256, int(rate * seconds) * 2, dtype=np.uint8).tobytes()
+        block = int(rate * 0.05) * 2  # 50 ms, as rtl_sdr delivers them
+
+        def load(channels: int) -> float:
+            dsp = Tuner(rate, 100_000_000)
+            for i in range(channels):
+                dsp.listen(i, Settings(100_000_000 + 25_000 * (i + 1), "nfm", bandwidth_hz=12_500, squelch_db=None))
+            dsp.feed(raw[:block])  # warm up: the first FFTs plan and allocate
+            start = time.perf_counter()
+            for offset in range(0, len(raw), block):
+                dsp.feed(raw[offset:offset + block])
+            return (time.perf_counter() - start) / seconds * BENCHMARK_OVERHEAD
+
+        one, eight = load(1), load(8)
+        per_channel = max(0.0, (eight - one) / 7)
+        fixed = max(0.0, one - per_channel)
+        fits = [n for n in range(1, max_channels + 1) if fixed + n * per_channel <= BENCHMARK_TARGET_LOAD]
+        found[span] = {"rate": rate, "fixed": round(fixed, 4), "per_channel": round(per_channel, 4),
+                       "recommended": fits[-1] if fits else 0}
+    return {**found, "target_load": BENCHMARK_TARGET_LOAD, "overhead": BENCHMARK_OVERHEAD}

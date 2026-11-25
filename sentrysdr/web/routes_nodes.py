@@ -302,8 +302,38 @@ def decode_tuner_frame(frame: bytes) -> tuple[str, bytes] | None:
     return serial, frame[2 + frame[1]:]
 
 
+LIVE_CHANNEL_RE = re.compile(r"^#[0-9]{1,9}$")
+
+
+def live_serial(key: str) -> str | None:
+    """A live stream's SDR: the key is its serial, or serial#target for one channel of a multi-channel SDR."""
+    serial, mark, channel = key.partition("#")
+    if not SERIAL_RE.match(serial) or (mark and not LIVE_CHANNEL_RE.match(mark + channel)):
+        return None
+    return serial
+
+
+def clean_channel_status(raw) -> dict:
+    """A multi-channel SDR's per-channel state, as a slave reports it."""
+    clean = {}
+    for key, value in list((raw or {}).items())[:16] if isinstance(raw, dict) else []:
+        if not str(key).isdigit() or not isinstance(value, dict):
+            continue
+        level = value.get("level_db")
+        clean[str(key)] = {
+            "in_call": bool(value.get("in_call")), "call_started": _epoch(value.get("call_started")),
+            "last_call_at": _epoch(value.get("last_call_at")),
+            "level_db": round(float(level), 1) if isinstance(level, (int, float)) and math.isfinite(level) else None,
+        }
+    return clean
+
+
+def _load(value) -> float | None:
+    return round(float(value), 3) if isinstance(value, (int, float)) and math.isfinite(value) and 0 <= value <= 100 else None
+
+
 def decode_live_frame(frame: bytes) -> tuple[str, int, bytes] | None:
-    """Frame layout: 1 byte serial length, serial, 4 byte big-endian rate, PCM."""
+    """Frame layout: 1 byte key length, key (a serial, or serial#target), 4 byte big-endian rate, PCM."""
     if len(frame) < 6 or frame[0] == 0 or frame[0] > MAX_FRAME_SERIAL or len(frame) < 5 + frame[0]:
         return None
     length = frame[0]
@@ -311,7 +341,7 @@ def decode_live_frame(frame: bytes) -> tuple[str, int, bytes] | None:
         serial = frame[1:1 + length].decode()
     except UnicodeDecodeError:
         return None
-    if not SERIAL_RE.match(serial):
+    if live_serial(serial) is None:
         return None
     rate = int.from_bytes(frame[1 + length:5 + length], "big")
     if rate not in (8000, 16000):
@@ -378,6 +408,8 @@ def handle_agent_message(ctx: Context, node_id: int, allowed: list[str], message
                     "last_call_at": _epoch(status.get("last_call_at")),
                     "note": str(status.get("note") or "")[:300], "feeds": clean_feed_status(status.get("feeds")),
                     "rtl_tcp": clean_rtl_tcp_status(status.get("rtl_tcp")),
+                    "channels": clean_channel_status(status.get("channels")),
+                    "load": _load(status.get("load")),
                 })
     elif kind == "measure_result":
         ctx.finish_measure(node_id, message)
@@ -441,7 +473,7 @@ async def agent_socket(websocket: WebSocket):
                     ctx.tuners.from_node(node_id, tuned[0], "frame", tuned[1])
             elif packet.get("bytes") is not None:
                 decoded = decode_live_frame(packet["bytes"])
-                if decoded and decoded[0] in allowed:
+                if decoded and live_serial(decoded[0]) in allowed:
                     ctx.live.feed(ctx.live_key(node_id, decoded[0]), decoded[2], decoded[1])
             elif packet.get("text"):
                 try:

@@ -274,8 +274,9 @@ class Slave:
             await asyncio.to_thread(self.save_assignments, clean)
             await self.supervisor.apply(clean)
         elif kind == "live":
-            serial = message.get("serial")
-            if serial in self.cfg.serials:
+            serial = message.get("serial")  # a serial, or serial#target for one channel
+            base, mark, channel = str(serial or "").partition("#")
+            if base in self.cfg.serials and (not mark or channel.isdigit()):
                 (self.live_on.add if message.get("on") else self.live_on.discard)(serial)
         elif kind == "tuner":
             serial, command = message.get("serial"), message.get("command")
@@ -304,7 +305,8 @@ class Slave:
     async def _measure(self, message: dict) -> None:
         reply = {"t": "measure_result", "id": str(message.get("id", ""))[:64], "ok": False}
         try:
-            request = {"op": "detect"} if message.get("op") == "detect" else pipelines.sanitize_measure(message)
+            op = message.get("op")
+            request = {"op": op} if op in ("detect", "benchmark") else pipelines.sanitize_measure(message)
             reply["result"] = await self.supervisor.measure(str(message.get("serial", "")), **request)
             reply["ok"] = True
         except (pipelines.SpecError, MeasureError) as exc:

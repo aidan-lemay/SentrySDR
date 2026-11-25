@@ -28,8 +28,11 @@
   let nodes = $state([]);
   const blankSource = () => ({
     id: null, key: '', name: '', description: '', antenna_id: '', gain: DEFAULT_GAIN_DB, ppm: 0,
-    tuner: '', steps: '', capMin: '', capMax: '', uses: [], rtlTcpPort: '', lat: '', lon: '', alt: '', quiet: false,
+    tuner: '', steps: '', capMin: '', capMax: '', uses: [], rtlTcpPort: '', lat: '', lon: '', alt: '', quiet: false, maxChannels: '',
   });
+  const MULTI_DEFAULT_CHANNELS = 8, MULTI_MAX_CHANNELS = 16;  // keep in step with sentrysdr/pipelines.py
+  let benchmarking = $state(false);
+  let benchmark = $state(null);  // the last Check this machine result, for the SDR in the form
   const TUNERS = ['R820T', 'R820T2', 'R828D', 'FC0012', 'FC0013', 'FC2580', 'E4000'];
   let detecting = $state(false);
   let sourceForm = $state(blankSource());
@@ -175,6 +178,7 @@
       rtl_tcp_port: filled(sourceForm.rtlTcpPort) ? Number(sourceForm.rtlTcpPort) : null,
       lat: filled(sourceForm.lat) ? Number(sourceForm.lat) : null, lon: filled(sourceForm.lon) ? Number(sourceForm.lon) : null,
       alt_m: filled(sourceForm.alt) ? Number(sourceForm.alt) : null, quiet_offline: sourceForm.quiet,
+      max_channels: filled(sourceForm.maxChannels) ? Number(sourceForm.maxChannels) : null,
     };
     if (body.gain_steps.some(Number.isNaN)) {
       error = 'Gain steps must be numbers, separated by spaces or commas.';
@@ -198,13 +202,24 @@
       capMin: source.cap_min_hz == null ? '' : plain(source.cap_min_hz), capMax: source.cap_max_hz == null ? '' : plain(source.cap_max_hz),
       uses: [...source.uses], rtlTcpPort: source.rtl_tcp_port ?? '',
       lat: source.lat ?? '', lon: source.lon ?? '', alt: source.alt_m ?? '', quiet: !!source.quiet_offline,
+      maxChannels: source.max_channels === MULTI_DEFAULT_CHANNELS ? '' : source.max_channels,
     };
+    benchmark = null;
     document.getElementById('source-form')?.scrollIntoView();
   }
 
   const parseSteps = (text) => text.split(/[\s,]+/).filter(Boolean).map(Number);
   const formSteps = $derived(parseSteps(sourceForm.steps).filter((n) => !Number.isNaN(n)));
   const formNearest = $derived(nearestStep(formSteps, sourceForm.gain));
+
+  // Times the multi-channel DSP on the machine this SDR is plugged into. Nothing pauses; nothing is saved.
+  async function checkMachine() {
+    const [nodeId, ...serial] = sourceForm.key.split('|');
+    benchmarking = true;
+    benchmark = await run(() => api('sources/benchmark', { method: 'POST', body: { node_id: Number(nodeId), serial: serial.join('|') } }));
+    benchmarking = false;
+  }
+  const percent = (share) => `${(share * 100).toFixed(share < 0.1 ? 1 : 0)}%`;
 
   // Reads the tuner from the stick itself. Fills the form; nothing is saved until Save.
   async function detect() {
@@ -731,6 +746,33 @@
         <label class="tick"><input type="checkbox" bind:checked={sourceForm.quiet} /> Don't warn if its stick is unplugged</label>
         <span class="hint">For everyone. Other faults still warn. The warning still shows under Admin, Warnings.</span>
       </div>
+      <label class="field"><span>Multi-channel: most channels</span>
+        <input class="mono" type="number" inputmode="numeric" min="1" max={MULTI_MAX_CHANNELS} placeholder={String(MULTI_DEFAULT_CHANNELS)} bind:value={sourceForm.maxChannels} />
+        <span class="hint">How many channels this SDR can record at once when it's multi-channel. Each one costs CPU on the machine it's plugged into, so check that machine first. Empty is {MULTI_DEFAULT_CHANNELS}; at most {MULTI_MAX_CHANNELS}.</span>
+      </label>
+      <div class="buttons form-buttons">
+        <button type="button" disabled={!sourceForm.key || benchmarking} onclick={checkMachine}>{benchmarking ? 'Checking...' : 'Check this machine'}</button>
+      </div>
+      {#if benchmark}
+        <div class="msg form-buttons" role="status">
+          On {benchmark.node_name}, about {Math.round(benchmark.overhead)} times the DSP's own time allowed for recording:
+          {#each [['typical', 'Channels within about 860 kHz (1.024 MS/s)'], ['widest', 'The widest span, about 2 MHz (2.4 MS/s)']] as [span, label] (span)}
+            {@const b = benchmark[span]}
+            <div>{label}: {percent(b.fixed)} to start with, {percent(b.per_channel)} for each channel.
+              {#if b.recommended}Up to <strong>{b.recommended}</strong> keeps it under {percent(benchmark.target_load)}.{:else}<span class="st-warn">Too much for this machine.</span>{/if}</div>
+          {/each}
+          {#if benchmark.widest.recommended || benchmark.typical.recommended}
+            <div class="buttons">
+              {#if benchmark.widest.recommended}<button type="button" onclick={() => (sourceForm.maxChannels = benchmark.widest.recommended)}>Use {benchmark.widest.recommended} (safe at any span)</button>{/if}
+              {#if benchmark.typical.recommended > benchmark.widest.recommended}<button type="button" onclick={() => (sourceForm.maxChannels = benchmark.typical.recommended)}>Use {benchmark.typical.recommended} (channels close together)</button>{/if}
+              <span class="small">then Save.</span>
+            </div>
+          {:else}
+            Multi-channel isn't recommended on this machine. Single channel still works.
+          {/if}
+          <span class="small dim">A cursory check: made-up samples, timed. The Sources page shows the real processing load while it runs, which is the figure to trust.</span>
+        </div>
+      {/if}
     </fieldset>
     <fieldset>
       <legend>What this stick can do</legend>

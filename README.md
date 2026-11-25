@@ -9,7 +9,7 @@ It supervises existing tools instead of reimplementing them: `rtl_fm`, `ffmpeg`,
 - **One application, two roles.** `node.role` in the configuration file selects `master` or `slave`.
 - **Master:** holds users, recordings and ACARS messages, serves the web UI, runs schedules, and uploads calls to Broadcastify Calls, RDIO Scanner and ClearCut. By default it listens on loopback only, so publish it through a tunnel or reverse proxy. Direct access by local IP is opt-in.
 - **Slave:** opens no listening ports. It dials out to the master, takes its configuration from the master's UI, and sends everything back. If the link drops, it keeps recording its last assignment and uploads the calls when the link returns.
-- **One target per SDR at a time.** A schedule takes over its source for its window. See [Schedules](#schedules).
+- **One target per SDR at a time,** unless it's [multi-channel](#multi-channel-sdrs), when several voice targets inside its span share it. A schedule takes over its source for its window. See [Schedules](#schedules).
 - **Locks.** An administrator can tick **Lock this assignment** on the Sources page. Other users then can't change that SDR's assignment or schedules, its target, or its squelch profiles, and can't measure it. There's no password. Locks set with a password in an older version stay locked, and their passwords are deleted on upgrade.
 - **Recordings stand alone.** Each keeps its own copy of the source and target names, so it stays searchable after that setup is deleted.
 
@@ -434,6 +434,25 @@ An **rtl_tcp** target hands an SDR to `rtl_tcp`, so a program such as GQRX or SD
 - rtl_tcp serves one program at a time. The program sets the frequency, gain and sample rate itself.
 - The stream is about 2 to 5 MB/s, depending on the sample rate. That's fine on a local network, but slow or costly over a mobile or metered link.
 - A slave's rtl_tcp is reached directly at the slave, not through the master, so the device running GQRX needs a route to the slave, such as being on the same network or Tailscale.
+
+## Multi-channel SDRs
+
+An SDR picks up a slice of radio about 2 MHz wide. Normally it records one channel from it, with `rtl_fm`. **Multi-channel** records several NFM, FM and AM targets from the same slice at once, each as its own channel: its own squelch, calls, uploads and live audio.
+
+On the Sources page, open **Change assignment** and choose **Multi-channel**, then add channels. **Also fits** lists the targets that would fit alongside the ones already there, nearest first; one that doesn't fit is refused, with the reason. **Single channel** goes back to `rtl_fm`, keeping the first channel. It's the tested path, so use it when one channel is all an SDR needs.
+
+- **Fitting.** Every channel must sit within about 2 MHz of the others. SentrySDR picks the centre and the sample rate itself: the lowest rate that fits, to save CPU, with no channel on the stick's centre spike or near the edges of the span. Tuned to shows what it chose.
+- **One gain for the SDR.** All its channels share the SDR's gain, set under Admin > SDR sources. A very strong channel can drown weak ones next to it; lower the gain or move one to another stick. Each channel keeps its own squelch, from its target or a [squelch profile](#tuning-call-detection); a profile's gain only applies on a single-channel SDR.
+- **Measuring.** **Measure noise** on a running channel reads it from the live stream for 10 seconds, at the SDR's gain, without pausing the other channels.
+- **Uploads** are per call, so each channel goes to its own target's Broadcastify Calls, ClearCut and RDIO settings, as if it had its own SDR.
+- **Changing the set** (adding or removing a channel, or the gain) briefly restarts the SDR, so a call in progress on another channel ends and is saved. Changing a channel's squelch or volume doesn't.
+- **Schedules** take a multi-channel SDR over for their window, as on any SDR. A schedule set to keep its target adds it as one more channel when it ends, if it fits; if not, it's skipped and the audit log says why.
+- **Locks** cover every channel.
+- **Only NFM, FM and AM.** Digital voice, ADS-B, AIS, ACARS, rtl_tcp and the web tuner still take the whole stick.
+
+**How many channels.** Each SDR can record up to 8 channels at once, or a number an administrator sets under Admin > SDR sources, up to 16. **Check this machine** there times the DSP on the machine the SDR is plugged into, at a typical span and the widest, allowing about 3 times the DSP's own time for the rest of recording, and recommends how many keep it under half of real time. It needs no stick, so nothing pauses. It's a cursory check: the Sources page shows each multi-channel SDR's real **processing load**, how long its processing takes compared with the radio it covers, and warns past 70%. Over 100% it would fall behind and drop audio. As a guide, 14 channels on one stick took about 14% on a desktop; a Raspberry Pi 4 is roughly 5 to 8 times slower per core.
+
+Multi-channel uses the same DSP as the [web tuner](#web-tuner), so it needs numpy, and isn't available on 32-bit Raspberry Pi OS. Its recordings come from that DSP rather than `rtl_fm`; it has been tested on air with NFM on an R820T.
 
 ## Tuning call detection
 

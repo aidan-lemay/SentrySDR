@@ -135,6 +135,9 @@ class Source(Base):
     lon: Mapped[float | None] = mapped_column(nullable=True)
     alt_m: Mapped[float | None] = mapped_column(nullable=True)
     quiet_offline: Mapped[bool | None] = mapped_column(nullable=True)  # no warning while its stick is unplugged
+    # Multi-channel: several voice targets at once, each a base recorder. Otherwise one target, through rtl_fm.
+    multichannel: Mapped[bool | None] = mapped_column(nullable=True)
+    max_channels: Mapped[int | None] = mapped_column(nullable=True)  # None: pipelines.MULTI_DEFAULT_CHANNELS
     __table_args__ = (Index("uq_source_node_serial", "node_id", "serial", unique=True),)
 
 
