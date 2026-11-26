@@ -759,10 +759,10 @@
           <input class="mono" type="number" inputmode="decimal" step="any" min="-90" max="90" aria-label="Latitude" placeholder="Latitude" bind:value={sourceForm.lat} />
           <input class="mono" type="number" inputmode="decimal" step="any" min="-180" max="180" aria-label="Longitude" placeholder="Longitude" bind:value={sourceForm.lon} />
         </div>
+        <span class="hint">Decimal degrees. Shown to anyone who can see maps.</span>
       </div>
       <label class="field"><span>Antenna height (m)</span>
         <input class="mono" type="number" inputmode="decimal" step="any" min="-500" max="10000" bind:value={sourceForm.alt} />
-        <span class="hint">Decimal degrees. Shown to anyone who can see maps.</span>
       </label>
       <label class="field"><span>rtl_tcp port</span>
         <input class="mono" type="number" inputmode="numeric" min="1024" max="65535" placeholder="Picked for you" bind:value={sourceForm.rtlTcpPort} />

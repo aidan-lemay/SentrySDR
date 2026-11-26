@@ -22,6 +22,8 @@
   let newToneOut = $state('');
   let saving = $state(false);
   let emergency = $state(null);
+  // Only a description that says more than the name: "Downed aircraft" needs no "downed aircraft".
+  const adds = (c) => !c.meaning.toLowerCase().startsWith(c.label.toLowerCase());
   const GROUPS = [['adsb', 'Aircraft (ADS-B)'], ['ais', 'Ships (AIS)']];
 
   const APPLIES = { both: 'calls and messages', calls: 'calls', messages: 'messages' };
@@ -226,7 +228,7 @@
     {#each GROUPS as [group, heading] (group)}
       <div class="small dim" style="margin-top:.4rem">{heading}</div>
       {#each emergency.codes.filter((c) => c.kind === group) as c (c.code)}
-        <label class="tick"><input type="checkbox" checked={c.chosen} onchange={(event) => toggleCode(c.code, event.target.checked)} /> <span><strong>{c.label}</strong> <span class="small dim">{c.meaning}</span></span></label>
+        <label class="tick"><input type="checkbox" checked={c.chosen} onchange={(event) => toggleCode(c.code, event.target.checked)} /> <span><strong>{c.label}</strong>{#if adds(c)} <span class="small dim">{c.meaning}</span>{/if}</span></label>
       {/each}
     {/each}
     <label class="field"><span>How far away</span>

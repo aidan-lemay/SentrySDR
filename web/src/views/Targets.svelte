@@ -279,31 +279,6 @@
         <input class="mono" type="number" min="-130" max="0" step="0.1" placeholder="Off" bind:value={form.squelch} />
         <span class="hint">Same scale as the tuner's meter. An SDR's saved profile overrides it. Empty records all the time.</span>
       </label>
-      <label class="field"><span>Volume (dB)</span>
-        <input class="mono" type="number" inputmode="decimal" min="-20" max="30" step="1" bind:value={form.volume_db} />
-        <span class="hint">Too much boost clips loud voices.</span>
-      </label>
-      {#if ['nfm', 'fm', 'am'].includes(form.modulation)}
-        <div class="field"><span>Tone-outs</span>
-          <label class="tick"><input type="checkbox" bind:checked={form.decode_tone_outs} /> Decode tone-outs (QC2 and long-tone pages)</label>
-          <span class="hint">Named from Admin &gt; Tone-outs.</span>
-        </div>
-      {/if}
-      <div class="field"><span>Call levels</span>
-        <label class="tick"><input type="checkbox" bind:checked={form.level_calls} /> Even out each call's level</label>
-        <span class="hint">Recordings and uploads only.</span>
-      </div>
-      {#if ['nfm', 'fm'].includes(form.modulation)}
-        <label class="field"><span>Filter mode</span>
-          <select bind:value={form.tone_filter}>
-            <option value="off">Off</option>
-            <option value="low">Low (250 Hz)</option>
-            <option value="medium">Medium (300 Hz)</option>
-            <option value="high">High (300 Hz, steep)</option>
-          </select>
-          <span class="hint">Removes the CTCSS hum. Medium can leave a trace of tones above 240 Hz; Off keeps DCS.</span>
-        </label>
-      {/if}
       {#if ['nfm', 'fm'].includes(form.modulation)}
         <label class="field"><span>Tone squelch</span>
           <select bind:value={form.toneMode} onchange={() => (form.toneCode = '')}>
@@ -330,6 +305,31 @@
             <span class="hint">Either polarity matches.</span>
           </label>
         {/if}
+      {/if}
+      {#if ['nfm', 'fm'].includes(form.modulation)}
+        <label class="field"><span>Filter mode</span>
+          <select bind:value={form.tone_filter}>
+            <option value="off">Off</option>
+            <option value="low">Low (250 Hz)</option>
+            <option value="medium">Medium (300 Hz)</option>
+            <option value="high">High (300 Hz, steep)</option>
+          </select>
+          <span class="hint">Removes the CTCSS hum. Medium can leave a trace of tones above 240 Hz; Off keeps DCS.</span>
+        </label>
+      {/if}
+      <label class="field"><span>Volume (dB)</span>
+        <input class="mono" type="number" inputmode="decimal" min="-20" max="30" step="1" bind:value={form.volume_db} />
+        <span class="hint">Too much boost clips loud voices.</span>
+      </label>
+      <div class="field"><span>Call levels</span>
+        <label class="tick"><input type="checkbox" bind:checked={form.level_calls} /> Even out each call's level</label>
+        <span class="hint">Recordings and uploads only.</span>
+      </div>
+      {#if ['nfm', 'fm', 'am'].includes(form.modulation)}
+        <div class="field"><span>Tone-outs</span>
+          <label class="tick"><input type="checkbox" bind:checked={form.decode_tone_outs} /> Decode QC2 and long-tone pages</label>
+          <span class="hint">Named from Admin &gt; Tone-outs.</span>
+        </div>
       {/if}
     {/if}
   </fieldset>
