@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from .morse import MorseReader
-from .pipelines import PCM_RATE, TONE_FILTERS, tone_filter_stages
+from .pipelines import PCM_RATE, audio_stages
 
 # Sample rates an RTL-SDR can do, in Hz, that the tuner offers.
 SAMPLE_RATES = (250_000, 1_024_000, 1_536_000, 1_800_000, 2_048_000, 2_400_000)
@@ -301,6 +301,8 @@ class Settings:
 
 
 MORSE_MODES = ("cw", "nfm", "am")
+WARMUP_SECONDS = 0.08  # a new receiver's audio is muted this long: see Receiver.process
+DC_CUT_HZ = 30.0  # NFM audio below this is taken out, a few FFT bins either side of DC
 
 
 class Receiver:
@@ -323,7 +325,7 @@ class Receiver:
         self.mix_phase = 0.0
         self.bfo_phase = 0.0
         self.dc = 0.0
-        self.last = np.complex64(1)
+        self.last: np.complex64 | None = None
         self.agc = Agc()
         self.level_db = DB_FLOOR
         self.open = True
@@ -346,6 +348,7 @@ class Receiver:
                 # The pilot comes out of its filter n/8 samples late: hold the multiplex back as much.
                 self.delay = np.zeros(self.pilot.delay, dtype=np.float32)
                 self.rds = RdsDecoder(self.if_rate)
+        self.warmup = int(WARMUP_SECONDS * self.audio_rate * (2 if settings.mode == "wfm_stereo" else 1))
         self.morse: MorseReader | None = None
         if settings.morse and settings.mode in MORSE_MODES:
             # CW mode: the filtered channel. NFM and AM: the audio, for a tone.
@@ -354,17 +357,21 @@ class Receiver:
 
     @staticmethod
     def _nfm_audio_shape(tone_filter: str | None):
-        """Voice up to 3.5 kHz, less a CTCSS tone when filtered. Done in the FFT, so it costs nothing."""
-        if tone_filter not in TONE_FILTERS:
-            return lambda f: raised_cosine(f, -3500, 3500, 500)
-        stages = tone_filter_stages(tone_filter, PCM_RATE)  # the audio comes out at about this rate
+        """Voice up to 3.5 kHz, de-emphasised as a two-way radio's, less a CTCSS tone when filtered.
+
+        Done in the FFT, so it costs nothing. DC is taken out too: it's the carrier's frequency
+        error, and de-emphasis would make it five times bigger.
+        """
+        stages = audio_stages("nfm", tone_filter, PCM_RATE)  # the audio comes out at about this rate
 
         def shape(f):
-            z = np.exp(-2j * np.pi * np.asarray(f, dtype=np.float64) / PCM_RATE)  # z^-1
+            f = np.asarray(f, dtype=np.float64)
+            z = np.exp(-2j * np.pi * f / PCM_RATE)  # z^-1
             gain = np.ones(len(z))
             for b0, b1, b2, a1, a2 in stages:  # the magnitude only: the FFT's filters are zero-phase
                 gain *= np.abs((b0 + b1 * z + b2 * z * z) / (1 + a1 * z + a2 * z * z))
-            return raised_cosine(f, -3500, 3500, 500) * gain
+            no_dc = 1 - raised_cosine(f, -DC_CUT_HZ, DC_CUT_HZ, DC_CUT_HZ)
+            return raised_cosine(f, -3500, 3500, 500) * gain * no_dc
         return shape
 
     def set_tone_filter(self, tone_filter: str | None) -> None:
@@ -412,6 +419,13 @@ class Receiver:
             self.mix_phase = float((steps[-1] - 2 * np.pi * self.fine_hz / self.if_rate) % (2 * np.pi))
         y = y.astype(np.complex64)
         audio = self._demodulate(y)
+        if self.warmup > 0 and len(audio):
+            # The shared FFT starts from silence, so a new channel's first few milliseconds are
+            # noise. De-emphasis makes that a loud burst: mute it while the filters settle.
+            muted = min(self.warmup, len(audio))
+            audio = audio.copy()
+            audio[:muted] = 0
+            self.warmup -= muted
         if self.morse is not None:  # before the squelch, so a squelch set too high doesn't stop it
             self.morse.push(y if self.settings.mode == "cw" else audio)
         squelch = self.settings.squelch_db
@@ -421,6 +435,8 @@ class Receiver:
     def _demodulate(self, y: np.ndarray) -> np.ndarray:
         mode = self.settings.mode
         if mode in ("nfm", "wfm", "wfm_stereo"):
+            if self.last is None:  # the first block: start from its own first sample, not a made-up one, or it clicks
+                self.last = y[0] if len(y) else np.complex64(1)
             joined = np.concatenate(([self.last], y))
             self.last = y[-1]
             phase = np.angle(joined[1:] * np.conj(joined[:-1])).astype(np.float32)

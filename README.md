@@ -501,6 +501,10 @@ An NFM or FM target's **Filter mode** takes its CTCSS (PL) tone out of recording
 
 It applies on single- and multi-channel SDRs, and changing it needs no restart. The web tuner doesn't use it.
 
+NFM and FM audio is always **de-emphasised**, as on every two-way radio. Transmitters boost treble by 6 dB an octave across the voice band, and receivers cut it back. Without that cut, recordings sound thin and the hiss between words is louder. SentrySDR uses the usual narrowband value, 750 µs (a corner at 212 Hz), scaled so 700 Hz is unchanged and calls stay about as loud as before. It applies on single- and multi-channel SDRs and in the web tuner, and DC (a carrier's frequency error) is taken out first so it isn't lifted too.
+
+De-emphasis also lifts a CTCSS tone, by about 9 to 11 dB against the voice, so with **Filter mode** off the hum is louder than it used to be. Leave the tone filter on unless you need what's below 300 Hz.
+
 ### Upload systems
 
 Broadcastify Calls, ClearCut and RDIO Scanner are set up the same way:

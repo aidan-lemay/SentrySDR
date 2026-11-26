@@ -10,13 +10,23 @@ import numpy as np
 import pytest
 
 from sentrysdr import pipelines, tuner
-from sentrysdr.engine import ToneFilter
+from sentrysdr.engine import AudioFilter
 from sentrysdr.models import Target
 
 from .test_radio import make_target
 from .test_tuner import CENTER, RATE, run, times, tone_level
 
-PL_HZ = 179.9  # the tone in the call that set off ClearCut's tone decoder
+PL_HZ = 179.9
+
+
+class ToneFilter:
+    """The tone filter alone: an audio filter for a mode without de-emphasis."""
+
+    def __init__(self):
+        self.audio = AudioFilter()
+
+    def __call__(self, chunk: bytes, mode, rate: int) -> bytes:
+        return self.audio(chunk, "raw", mode, rate)  # the tone in the call that set off ClearCut's tone decoder
 
 
 def pcm(*tones: tuple[float, float], seconds: float = 2.0, rate: int = pipelines.PCM_RATE) -> np.ndarray:

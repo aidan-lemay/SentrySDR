@@ -41,6 +41,13 @@ TONE_FILTERS = {"low": (250.0, 3), "medium": (300.0, 5), "high": None}  # (cutof
 TONE_STOP_HZ, TONE_PASS_HZ = 254.5, 300.0  # high: everything up to the top tone, 254.1 Hz, is cut
 TONE_STOP_DB, TONE_PASS_DB = 50.0, 1.0
 TONE_FILTER_MODES = {"nfm", "fm"}  # FM channels are what carry CTCSS
+# Two-way FM radios boost treble before sending (6 dB an octave across the voice band), and every
+# receiver cuts it back. 750 microseconds is the usual narrowband value: a corner at 212 Hz.
+# Scaled so 700 Hz is unchanged: calls come out about as loud as before (1.8 dB quieter on a real one),
+# where 1 kHz made already-hot calls clip.
+DEEMPHASIS_MODES = {"nfm", "fm"}
+NFM_DEEMPHASIS_S = 750e-6
+DEEMPHASIS_REFERENCE_HZ = 700.0
 # Wideband FM needs more than PCM_RATE to fit 5 kHz deviation; rtl_fm resamples it to PCM_RATE.
 FM_WIDE_RATE = 24000
 DIGITAL_INPUT_RATE = 48000
@@ -152,6 +159,38 @@ def _steep_highpass(rate: float) -> list[Biquad]:
     return stages
 
 
+def deemphasis_stage(rate: float) -> Biquad:
+    """A one-pole low-pass with NFM_DEEMPHASIS_S, as a biquad, at unity gain at DEEMPHASIS_REFERENCE_HZ."""
+    pole = math.exp(-1 / (NFM_DEEMPHASIS_S * rate))
+    w = 2 * math.pi * DEEMPHASIS_REFERENCE_HZ / rate
+    at_reference = (1 - pole) / abs(complex(1 - pole * math.cos(w), pole * math.sin(w)))
+    return ((1 - pole) / at_reference, 0.0, 0.0, -pole, 0.0)
+
+
+DC_BLOCK_HZ = 15.0
+
+
+def dc_block_stage(rate: float) -> Biquad:
+    """A one-pole high-pass that takes out DC, a carrier's frequency error, before de-emphasis lifts it."""
+    pole = math.exp(-2 * math.pi * DC_BLOCK_HZ / rate)
+    return (1.0, -1.0, 0.0, -pole, 0.0)
+
+
+def audio_stages(modulation: str, tone_filter: str | None, rate: float) -> list[Biquad]:
+    """Everything done to an analog channel's audio: for FM, DC out and de-emphasis; then its tone filter."""
+    stages = [dc_block_stage(rate), deemphasis_stage(rate)] if modulation in DEEMPHASIS_MODES else []
+    return stages + (tone_filter_stages(tone_filter, rate) if tone_filter in TONE_FILTERS else [])
+
+
+def stages_gain(stages: list[Biquad], freq_hz: float, rate: float = PCM_RATE) -> float:
+    """How much of a frequency some stages pass, as a ratio."""
+    z = complex(math.cos(2 * math.pi * freq_hz / rate), -math.sin(2 * math.pi * freq_hz / rate))  # z^-1
+    total = 1.0
+    for b0, b1, b2, a1, a2 in stages:
+        total *= abs((b0 + b1 * z + b2 * z * z) / (1 + a1 * z + a2 * z * z))
+    return total
+
+
 _STAGES: dict[tuple[str, float], list[Biquad]] = {}
 
 
@@ -169,11 +208,7 @@ def tone_filter_stages(mode: str, rate: float) -> list[Biquad]:
 
 def tone_filter_gain(mode: str, freq_hz: float, rate: float = PCM_RATE) -> float:
     """How much of a frequency a tone filter passes, 0 to 1."""
-    z = complex(math.cos(2 * math.pi * freq_hz / rate), -math.sin(2 * math.pi * freq_hz / rate))  # z^-1
-    total = 1.0
-    for b0, b1, b2, a1, a2 in tone_filter_stages(mode, rate):
-        total *= abs((b0 + b1 * z + b2 * z * z) / (1 + a1 * z + a2 * z * z))
-    return total
+    return stages_gain(tone_filter_stages(mode, rate), freq_hz, rate)
 
 
 def _clean_channel(raw: dict) -> dict:

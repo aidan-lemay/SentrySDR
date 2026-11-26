@@ -287,12 +287,13 @@ class VolumeControl:
         return samples.tobytes()
 
 
-class ToneFilter:
-    """Takes a CTCSS tone out of 16-bit audio: high-pass stages, as pipelines.TONE_FILTERS.
+class AudioFilter:
+    """An analog channel's audio filters, on 16-bit audio: FM de-emphasis and the tone filter
+    (pipelines.audio_stages), worked through without rounding between them.
 
-    The filter is chosen per chunk, so changing a target's needs no restart. Off, the audio
-    passes through untouched. Plain Python: under 10 ms a second of audio on a laptop, and
-    rtl_fm only sends audio while its squelch is open.
+    Chosen per chunk, so changing a target's tone filter needs no restart. With nothing to do,
+    the audio passes through untouched. Plain Python: about 1.3 ms a second of audio a stage on
+    a laptop, and rtl_fm only sends audio while its squelch is open.
     """
 
     def __init__(self):
@@ -300,14 +301,14 @@ class ToneFilter:
         self.stages: list[tuple] = []
         self.state: list[list[float]] = []
 
-    def __call__(self, chunk: bytes, mode: str | None, rate: int) -> bytes:
-        if mode not in pipelines.TONE_FILTERS:
-            self.key = None
-            return chunk
-        if self.key != (mode, rate):
-            self.key = (mode, rate)
-            self.stages = pipelines.tone_filter_stages(mode, rate)
+    def __call__(self, chunk: bytes, modulation: str, tone_filter: str | None, rate: int) -> bytes:
+        key = (modulation, tone_filter, rate)
+        if self.key != key:
+            self.key = key
+            self.stages = pipelines.audio_stages(modulation, tone_filter, rate)
             self.state = [[0.0, 0.0, 0.0, 0.0] for _ in self.stages]
+        if not self.stages:
+            return chunk
         samples = array("h")
         samples.frombytes(chunk)
         if sys.byteorder == "big":
@@ -315,10 +316,15 @@ class ToneFilter:
         values: list = samples.tolist()
         for (b0, b1, b2, a1, a2), state in zip(self.stages, self.state):
             x1, x2, y1, y2 = state
-            for index, x in enumerate(values):
-                y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2
-                x2, x1, y2, y1 = x1, x, y1, y
-                values[index] = y
+            if b1 == b2 == a2 == 0:  # one pole: de-emphasis
+                for index, x in enumerate(values):
+                    y1 = b0 * x - a1 * y1
+                    values[index] = y1
+            else:
+                for index, x in enumerate(values):
+                    y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2
+                    x2, x1, y2, y1 = x1, x, y1, y
+                    values[index] = y
             state[:] = (x1, x2, y1, y2)
         samples = array("h", (32767 if v > 32767 else -32768 if v < -32768 else int(v) for v in values))
         if sys.byteorder == "big":
@@ -700,7 +706,7 @@ class Worker:
         rate = pipelines.pcm_rate(spec)
         framer = PcmFramer(pipelines.pcm_channels(spec))
         volume = VolumeControl()
-        tone_filter = ToneFilter()
+        audio_filter = AudioFilter()
         digital = spec["modulation"] in pipelines.DIGITAL
         tail = ToolTail()
         procs: list[asyncio.subprocess.Process] = []
@@ -753,7 +759,9 @@ class Worker:
                     continue
                 # Read each time: changing a target's volume or tone filter needs no retune.
                 live = self.spec or spec
-                chunk = volume(tone_filter(chunk, live.get("tone_filter"), rate), live.get("volume_db", 0))
+                if not digital:
+                    chunk = audio_filter(chunk, spec["modulation"], live.get("tone_filter"), rate)
+                chunk = volume(chunk, live.get("volume_db", 0))
                 if writer is None:
                     writer = CallWriter(cfg, self.spec or spec, self.serial, rate, self.sup.tmp_dir, self.sup.call_sink)
                     self.in_call, self.call_started = True, writer.started_at
