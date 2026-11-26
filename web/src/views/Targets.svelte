@@ -8,7 +8,7 @@
 
   const blank = () => ({
     id: null, name: '', description: '', kind: 'audio', mhz: '', modulation: 'nfm', squelch: -40, volume_db: 0,
-    clearcut_enabled: false, clearcut_system: '', clearcut_id: '', rdio_enabled: false, rdio_system: '', rdio_talkgroup: '',
+    clearcut_enabled: false, clearcut_system_ref: '', clearcut_id: '', rdio_enabled: false, rdio_system_ref: '', rdio_talkgroup: '',
     broadcastify_enabled: false, broadcastify_system_ref: '', broadcastify_slot: '',
     channels: [], newChannel: '', airframes_enabled: false, feeds: blankFeeds(),
   });
@@ -49,6 +49,15 @@
 
   let targets = $state([]);
   let systems = $state([]);
+  // Each service's systems are added by an administrator. A target picks one, and its slot or talkgroup there.
+  const UPLOADS = [
+    { service: 'broadcastify', name: 'Broadcastify', long: 'Broadcastify Calls', enabled: 'broadcastify_enabled', ref: 'broadcastify_system_ref', tg: 'broadcastify_slot',
+      idWord: 'node', tgLabel: 'Frequency slot', tgHint: "The Slot beside this frequency on Broadcastify's Manage Calls Systems page, under Node Frequencies." },
+    { service: 'clearcut', name: 'ClearCut', long: 'ClearCut', enabled: 'clearcut_enabled', ref: 'clearcut_system_ref', tg: 'clearcut_id',
+      idWord: 'system', tgLabel: 'ClearCut talkgroup', tgHint: 'The talkgroup ID (TGID) this channel is listed under in ClearCut.' },
+    { service: 'rdio', name: 'RDIO', long: 'RDIO Scanner', enabled: 'rdio_enabled', ref: 'rdio_system_ref', tg: 'rdio_talkgroup',
+      idWord: 'system', tgLabel: 'RDIO talkgroup', tgHint: "The talkgroup ID (TGID) under the system in RDIO Scanner's admin." },
+  ];
   let form = $state(blank());
   let error = $state('');
   let message = $state('');
@@ -56,7 +65,7 @@
 
   async function refresh() {
     try {
-      [targets, systems] = await Promise.all([api('targets'), api('broadcastify-systems').catch(() => [])]);
+      [targets, systems] = await Promise.all([api('targets'), api('upload-systems').catch(() => [])]);
     } catch (failure) {
       error = failure.message;
     }
@@ -106,6 +115,7 @@
       }
     }
     const channelsHz = form.kind === 'acars' ? sortedChannels.map((mhz) => Math.round(mhz * 1e6)) : [];
+    const audio = form.kind === 'audio';
     const body = {
       name: form.name, description: (form.description ?? '').trim(), kind: form.kind,
       frequency_hz: form.kind === 'acars' ? channelsHz[0] : Math.round(Number(fixed ? fixed.mhz : form.mhz) * 1e6),
@@ -113,9 +123,9 @@
       acars_channels: channelsHz, airframes_enabled: form.kind === 'acars' && form.airframes_enabled,
       feeds: feedsBody(form.kind, form.feeds),
       squelch: optionalNumber(form.squelch), volume_db: Number(form.volume_db || 0),
-      clearcut_enabled: form.clearcut_enabled, clearcut_system: form.clearcut_system || null, clearcut_id: optionalInt(form.clearcut_id),
-      rdio_enabled: form.rdio_enabled, rdio_system: optionalInt(form.rdio_system), rdio_talkgroup: optionalInt(form.rdio_talkgroup),
-      broadcastify_enabled: Boolean(form.broadcastify_enabled), broadcastify_system_ref: optionalInt(form.broadcastify_system_ref), broadcastify_slot: optionalInt(form.broadcastify_slot),
+      clearcut_enabled: audio && Boolean(form.clearcut_enabled), clearcut_system_ref: optionalInt(form.clearcut_system_ref), clearcut_id: optionalInt(form.clearcut_id),
+      rdio_enabled: audio && Boolean(form.rdio_enabled), rdio_system_ref: optionalInt(form.rdio_system_ref), rdio_talkgroup: optionalInt(form.rdio_talkgroup),
+      broadcastify_enabled: audio && Boolean(form.broadcastify_enabled), broadcastify_system_ref: optionalInt(form.broadcastify_system_ref), broadcastify_slot: optionalInt(form.broadcastify_slot),
     };
     try {
       const saved = form.id ? await api(`targets/${form.id}`, { method: 'PUT', body }) : await api('targets', { method: 'POST', body });
@@ -132,8 +142,8 @@
   function edit(target) {
     form = {
       ...blank(), ...target, mhz: target.frequency_hz / 1e6,
-      clearcut_system: target.clearcut_system ?? '', clearcut_id: target.clearcut_id ?? '',
-      rdio_system: target.rdio_system ?? '', rdio_talkgroup: target.rdio_talkgroup ?? '', volume_db: target.volume_db ?? 0,
+      clearcut_enabled: Boolean(target.clearcut_enabled), clearcut_system_ref: target.clearcut_system_ref ?? '', clearcut_id: target.clearcut_id ?? '',
+      rdio_enabled: Boolean(target.rdio_enabled), rdio_system_ref: target.rdio_system_ref ?? '', rdio_talkgroup: target.rdio_talkgroup ?? '', volume_db: target.volume_db ?? 0,
       broadcastify_enabled: Boolean(target.broadcastify_enabled), broadcastify_system_ref: target.broadcastify_system_ref ?? '', broadcastify_slot: target.broadcastify_slot ?? '',
       channels: (target.acars_channels ?? []).map((hz) => +(hz / 1e6).toFixed(4)), newChannel: '', airframes_enabled: Boolean(target.airframes_enabled),
       feeds: blankFeeds(target.feeds ?? {}),
@@ -315,30 +325,23 @@
   {#if form.kind === 'audio'}
   <fieldset>
     <legend>Uploads</legend>
-      <div class="field"><span>ClearCut</span><label class="tick"><input type="checkbox" bind:checked={form.clearcut_enabled} /> Upload calls to ClearCut</label></div>
-      {#if form.clearcut_enabled}
-        <label class="field"><span>ClearCut system ID</span><input bind:value={form.clearcut_system} required maxlength="64" pattern="[A-Za-z0-9_.\-]+" /></label>
-        <label class="field"><span>ClearCut talkgroup</span><input type="number" inputmode="numeric" bind:value={form.clearcut_id} required /></label>
-      {/if}
-      <div class="field"><span>RDIO</span><label class="tick"><input type="checkbox" bind:checked={form.rdio_enabled} /> Upload calls to RDIO</label></div>
-      {#if form.rdio_enabled}
-        <label class="field"><span>RDIO system</span><input type="number" inputmode="numeric" bind:value={form.rdio_system} required /></label>
-        <label class="field"><span>RDIO talkgroup</span><input type="number" inputmode="numeric" bind:value={form.rdio_talkgroup} required /></label>
-      {/if}
-      <div class="field"><span>Broadcastify</span><label class="tick"><input type="checkbox" bind:checked={form.broadcastify_enabled} /> Upload calls to Broadcastify Calls</label></div>
-      {#if form.broadcastify_enabled}
-        <label class="field"><span>Broadcastify system</span>
-          <select bind:value={form.broadcastify_system_ref} required>
-            <option value="">Choose a system</option>
-            {#each systems as system (system.id)}<option value={system.id}>{system.name} (node {system.system_id})</option>{/each}
-          </select>
-          {#if !systems.length}<span class="hint">An administrator adds systems under Admin &gt; Uploads and feeds.</span>{/if}
-        </label>
-        <label class="field"><span>Frequency slot</span>
-          <input type="number" inputmode="numeric" min="1" bind:value={form.broadcastify_slot} required />
-          <span class="hint">The Slot beside this frequency on Broadcastify's Manage Calls Systems page, under Node Frequencies.</span>
-        </label>
-      {/if}
+      {#each UPLOADS as upload (upload.service)}
+        {@const choices = systems.filter((system) => system.service === upload.service)}
+        <div class="field"><span>{upload.name}</span><label class="tick"><input type="checkbox" bind:checked={form[upload.enabled]} /> Upload calls to {upload.long}</label></div>
+        {#if form[upload.enabled]}
+          <label class="field"><span>{upload.name} system</span>
+            <select bind:value={form[upload.ref]} required>
+              <option value="">Choose a system</option>
+              {#each choices as system (system.id)}<option value={system.id}>{system.name} ({upload.idWord} {system.system_id})</option>{/each}
+            </select>
+            {#if !choices.length}<span class="hint">An administrator adds {upload.name} systems under Admin &gt; Uploads and feeds.</span>{/if}
+          </label>
+          <label class="field"><span>{upload.tgLabel}</span>
+            <input type="number" inputmode="numeric" min={upload.service === 'broadcastify' ? 1 : 0} bind:value={form[upload.tg]} required />
+            <span class="hint">{upload.tgHint}</span>
+          </label>
+        {/if}
+      {/each}
   </fieldset>
   {/if}
     <div class="buttons form-buttons">

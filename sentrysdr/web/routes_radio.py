@@ -17,7 +17,7 @@ from .. import emergencies, aio, capabilities, coverage, feeds, pipelines, sched
 from ..config import SERIAL_RE
 from ..context import Context
 from ..engine import MeasureError
-from ..models import ANTENNA_UNITS, Antenna, BroadcastifySystem, Node, Recorder, SdrProfile, Source, Target, User, free_rtl_tcp_port, now
+from ..models import ANTENNA_UNITS, Antenna, UploadSystem, Node, Recorder, SdrProfile, Source, Target, User, free_rtl_tcp_port, now
 from .deps import admin_user, ctx_of, current_user, effective_permissions, get_db, ip_of, require
 from .routes_messages import annotate_aircraft
 
@@ -422,17 +422,25 @@ class TargetBody(BaseModel):
     squelch: float | None = Field(default=-40.0, ge=pipelines.SQUELCH_DB_MIN, le=pipelines.SQUELCH_DB_MAX)  # dB; None is off
     volume_db: float = Field(default=0, ge=pipelines.VOLUME_MIN_DB, le=pipelines.VOLUME_MAX_DB)
     clearcut_enabled: bool = False
-    clearcut_system: str | None = Field(default=None, max_length=64, pattern=r"^[A-Za-z0-9_.-]+$")
-    clearcut_id: int | None = None
+    clearcut_system_ref: int | None = None  # an UploadSystem, as for Broadcastify
+    clearcut_id: int | None = Field(default=None, ge=0, le=2**31 - 1)  # talkgroup
     rdio_enabled: bool = False
-    rdio_system: int | None = None
-    rdio_talkgroup: int | None = None
+    rdio_system_ref: int | None = None
+    rdio_talkgroup: int | None = Field(default=None, ge=0, le=2**31 - 1)
     broadcastify_enabled: bool = False
     broadcastify_system_ref: int | None = None
     broadcastify_slot: int | None = Field(default=None, ge=1)
     acars_channels: list[int] | None = Field(default_factory=list, max_length=pipelines.ACARS_MAX_CHANNELS)
     airframes_enabled: bool = False
     feeds: dict | None = None
+
+
+# (service, enabled field, system field, talkgroup field, name), for each upload service.
+UPLOAD_FIELDS = (
+    ("broadcastify", "broadcastify_enabled", "broadcastify_system_ref", "broadcastify_slot", "Broadcastify"),
+    ("clearcut", "clearcut_enabled", "clearcut_system_ref", "clearcut_id", "ClearCut"),
+    ("rdio", "rdio_enabled", "rdio_system_ref", "rdio_talkgroup", "RDIO"),
+)
 
 
 def _validate_target(body: TargetBody, db, target_id: int | None = None) -> None:
@@ -454,17 +462,17 @@ def _validate_target(body: TargetBody, db, target_id: int | None = None) -> None
         body.feeds = feeds.clean(body.kind, body.feeds) or None
     except feeds.FeedError as exc:
         raise HTTPException(422, str(exc)) from None
-    if body.clearcut_enabled and (body.clearcut_id is None or not body.clearcut_system):
-        raise HTTPException(422, "ClearCut upload needs a system ID and a talkgroup")
-    if body.rdio_enabled and (body.rdio_system is None or body.rdio_talkgroup is None):
-        raise HTTPException(422, "RDIO upload needs a system and a talkgroup")
-    if body.broadcastify_enabled:
+    for service, enabled, ref, talkgroup, name in UPLOAD_FIELDS:
+        if not getattr(body, enabled):
+            continue
         if body.kind != "audio":
-            raise HTTPException(422, "Only audio targets can upload to Broadcastify")
-        if body.broadcastify_system_ref is None or body.broadcastify_slot is None:
-            raise HTTPException(422, "Broadcastify upload needs a system and a slot")
-        if db.get(BroadcastifySystem, body.broadcastify_system_ref) is None:
-            raise HTTPException(422, "That Broadcastify system doesn't exist")
+            raise HTTPException(422, f"Only audio targets can upload to {name}")
+        if getattr(body, ref) is None or getattr(body, talkgroup) is None:
+            raise HTTPException(422, f"{name} upload needs a system and a {'slot' if service == 'broadcastify' else 'talkgroup'}")
+        system = db.get(UploadSystem, getattr(body, ref))
+        if system is None or system.kind != service:
+            raise HTTPException(422, f"That {name} system doesn't exist")
+    if body.broadcastify_enabled:
         taken = db.scalar(select(Target).where(
             Target.broadcastify_enabled.is_(True), Target.broadcastify_system_ref == body.broadcastify_system_ref,
             Target.broadcastify_slot == body.broadcastify_slot, Target.id != (target_id or 0),
@@ -483,10 +491,11 @@ def _same_channel_warning(db, body: TargetBody, target_id: int | None = None) ->
 
 
 SQUELCH_COLUMNS = {"squelch", "squelch_db"}
+RETIRED_COLUMNS = SQUELCH_COLUMNS | {"clearcut_system", "rdio_system"}
 
 
 def _target_view(target: Target) -> dict:
-    view = {c.name: getattr(target, c.name) for c in Target.__table__.columns if c.name not in SQUELCH_COLUMNS}
+    view = {c.name: getattr(target, c.name) for c in Target.__table__.columns if c.name not in RETIRED_COLUMNS}
     view["squelch"] = target.squelch_db  # dB, or None for off
     return view
 
@@ -497,17 +506,17 @@ def _target_values(body: TargetBody) -> dict:
     return values
 
 
-@router.get("/broadcastify-systems")
-def broadcastify_choices(_user: User = Depends(require("manage_targets")), db=Depends(get_db)):
+@router.get("/upload-systems")
+def upload_system_choices(_user: User = Depends(require("manage_targets")), db=Depends(get_db)):
     """What a target can upload to. Keys stay with administrators, and on the server."""
-    return [{"id": s.id, "name": s.name, "system_id": s.system_id}
-            for s in db.scalars(select(BroadcastifySystem).order_by(BroadcastifySystem.name))]
+    return [{"id": s.id, "service": s.kind, "name": s.name, "system_id": s.label}
+            for s in db.scalars(select(UploadSystem).order_by(UploadSystem.service, UploadSystem.name))]
 
 
 # Upload IDs and feed addresses (some services' ports identify your station) are only for
 # people who manage targets. Everyone else gets what the pages they can see actually use.
 TARGET_PRIVATE_FIELDS = (
-    "clearcut_system", "clearcut_id", "rdio_system", "rdio_talkgroup", "broadcastify_system_ref", "broadcastify_slot", "feeds",
+    "clearcut_system_ref", "clearcut_id", "rdio_system_ref", "rdio_talkgroup", "broadcastify_system_ref", "broadcastify_slot", "feeds",
 )
 
 

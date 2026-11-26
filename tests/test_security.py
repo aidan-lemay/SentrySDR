@@ -12,7 +12,7 @@ from sqlalchemy import select
 
 from sentrysdr.config import Config, ConfigError, validate
 from sentrysdr.context import Context
-from sentrysdr.models import AuditLog, User, UserSession
+from sentrysdr.models import AuditLog, UploadSystem, User, UserSession
 from sentrysdr.security import client_ip
 from sentrysdr.web import create_app
 
@@ -363,10 +363,12 @@ def test_audit_search_treats_wildcards_literally(admin):
 
 
 def test_api_keys_are_write_only_and_encrypted(ctx, admin):
-    body = admin.patch("/api/admin/settings", json={"rdio_api_key": "super-secret-key"}).json()
-    assert "super-secret-key" not in str(body) and body["rdio_api_key_set"] is True
-    assert "super-secret-key" not in ctx.get_setting("rdio_api_key")
-    assert ctx.get_secret("rdio_api_key") == "super-secret-key"
+    body = admin.post("/api/admin/upload-systems", json={"service": "rdio", "name": "R", "system_id": 3, "api_key": "super-secret-key"}).json()
+    assert "super-secret-key" not in str(body) and body["key_set"] is True
+    assert "super-secret-key" not in admin.get("/api/admin/upload-systems").text
+    with ctx.db() as session:
+        sealed = session.get(UploadSystem, body["id"]).api_key_sealed
+    assert "super-secret-key" not in sealed and ctx.secrets.open(sealed) == "super-secret-key"
 
 
 def test_non_http_upload_url_refused(admin):
@@ -569,8 +571,9 @@ def test_lists_keep_private_details_from_listeners(ctx, admin, listener):
     made = admin.post("/api/targets", json={
         "name": "Ships", "kind": "ais", "modulation": "ais", "frequency_hz": 162_000_000,
         "feeds": {"udp": [{"service": "marinetraffic", "host": "5.9.207.224", "port": 10000}]}}).json()
+    rdio = admin.post("/api/admin/upload-systems", json={"service": "rdio", "name": "R", "system_id": 11, "api_key": "k"}).json()["id"]
     admin.post("/api/targets", json={"name": "Fire", "frequency_hz": 154_430_000, "rdio_enabled": True,
-                                     "rdio_system": 11, "rdio_talkgroup": 5}).raise_for_status()
+                                     "rdio_system_ref": rdio, "rdio_talkgroup": 5}).raise_for_status()
     admin.post("/api/sources/1/assign", json={"target_id": made["id"]}).raise_for_status()
     for target in listener.get("/api/targets").json():
         assert target["feeds"] is None and target["rdio_talkgroup"] is None

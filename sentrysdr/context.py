@@ -26,7 +26,7 @@ from .config import Config
 from .engine import UNPLUGGED, MeasureError, Supervisor
 from .live import LiveHub
 from .tuner_hub import TunerHub
-from .models import AcarsMessage, AuditLog, TrackEmergency, BroadcastifySystem, Node, Recorder, Recording, SdrProfile, Setting, Source, Target, UploadJob, UserSession, make_session_factory
+from .models import AcarsMessage, AuditLog, TrackEmergency, UploadSystem, Node, Recorder, Recording, SdrProfile, Setting, Source, Target, UploadJob, UserSession, make_session_factory
 from .sdr import enumerate_serials
 from .security import RateLimiter, SecretBox
 
@@ -55,7 +55,7 @@ SETTING_DEFAULTS = {
     "smtp_username": "",
     "smtp_from": "",
 }
-SECRET_SETTINGS = {"rdio_api_key", "clearcut_api_key", "smtp_password"}
+SECRET_SETTINGS = {"smtp_password"}  # upload keys are on each UploadSystem
 EMAIL_SECONDS = 30
 ACKNOWLEDGEABLE = {"uploads.failed"}  # warnings about things that happened, rather than a state that clears itself
 EMAIL_RETRY_SECONDS = 300
@@ -615,12 +615,14 @@ class Context:
                 # The recording stays, but a feed should only get one copy of a call.
                 duplicate = self._heard_on_another_sdr(session, recording)
                 extra = {"status": "done", "last_error": DUPLICATE_UPLOAD_NOTE} if duplicate else {}
-                if target.clearcut_enabled and target.clearcut_id is not None:
+                clearcut = session.get(UploadSystem, target.clearcut_system_ref) if target.clearcut_system_ref else None
+                if target.clearcut_enabled and clearcut is not None and target.clearcut_id is not None:
                     session.add(UploadJob(recording_id=call_id, destination="clearcut", **extra))
                     if not duplicate:
-                        recording.clearcut_system = target.clearcut_system
+                        # Kept on the call, for finding its transcript even if the target changes.
+                        recording.clearcut_system = clearcut.code
                         recording.clearcut_talkgroup = target.clearcut_id
-                if target.rdio_enabled and target.rdio_system is not None and target.rdio_talkgroup is not None:
+                if target.rdio_enabled and target.rdio_system_ref is not None and target.rdio_talkgroup is not None:
                     session.add(UploadJob(recording_id=call_id, destination="rdio", **extra))
                 if target.broadcastify_enabled and target.broadcastify_system_ref is not None and target.broadcastify_slot is not None:
                     session.add(UploadJob(recording_id=call_id, destination="broadcastify", **extra))
@@ -784,6 +786,13 @@ class Context:
         else:
             job.next_attempt_at = time.time() + min(30 * 2 ** job.attempts, 3600)
 
+    def _upload_system(self, session, ref: int | None) -> tuple[UploadSystem | None, str]:
+        """A target's system and its key, or (None, "") when it's gone or has no key."""
+        system = session.get(UploadSystem, ref) if ref is not None else None
+        if system is None or not system.api_key_sealed:
+            return system, ""
+        return system, self.secrets.open(system.api_key_sealed)
+
     async def _attempt_upload(self, session, client: httpx.AsyncClient, job: UploadJob) -> None:
         recording = session.get(Recording, job.recording_id)
         audio = self.recording_path(recording) if recording else None
@@ -799,17 +808,17 @@ class Context:
                 if late > BROADCASTIFY_LATE_SECONDS:
                     raise uploaders.UploadRejected(
                         f"Too late for Broadcastify: {late:.0f} seconds after the call started, and it only takes calls within about a minute. Not sent.")
-                system = session.get(BroadcastifySystem, target.broadcastify_system_ref)
-                key = self.secrets.open(system.api_key_sealed) if system else ""
+                system, key = self._upload_system(session, target.broadcastify_system_ref)
                 if not server or not key:
                     raise uploaders.UploadError("broadcastify server or system is not configured")
                 note = await uploaders.send_broadcastify(self.cfg, client, server, system.system_id, key, recording, target, audio)
             else:
-                key = self.get_secret(f"{job.destination}_api_key")
+                ref = target.rdio_system_ref if job.destination == "rdio" else target.clearcut_system_ref
+                system, key = self._upload_system(session, ref)
                 if not server or not key:
-                    raise uploaders.UploadError(f"{job.destination} server or key is not configured")
+                    raise uploaders.UploadError(f"{job.destination} server or system is not configured")
                 if job.destination == "rdio":
-                    await uploaders.send_rdio(client, server, key, recording, target, audio)
+                    await uploaders.send_rdio(client, server, key, system.system_id, recording, target, audio)
                 else:
                     await uploaders.send_clearcut(self.cfg, client, server, key, recording, target, audio)
         except uploaders.UploadRejected as exc:

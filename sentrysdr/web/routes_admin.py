@@ -21,7 +21,7 @@ from sqlalchemy import or_, select
 
 from .. import acars, health, notify, security, uploaders
 from ..context import SECRET_SETTINGS, SETTING_DEFAULTS
-from ..models import AuditLog, Ban, BroadcastifySystem, Target, User, UserSession
+from ..models import AuditLog, Ban, UploadSystem, Target, User, UserSession
 from .deps import ALL_PERMISSIONS, admin_user, ctx_of, effective_permissions, get_db, ip_of
 from .routes_account import check_new_password, confirm_password, normalize_email, revoke_sessions
 
@@ -216,76 +216,119 @@ def remove_ban(ban_id: int, request: Request, admin: User = Depends(admin_user),
     return {"detail": "Removed"}
 
 
-# --- Broadcastify Calls nodes -------------------------------------------------
-def _system_view(system: BroadcastifySystem) -> dict:
-    return {"id": system.id, "name": system.name, "system_id": system.system_id, "key_set": bool(system.api_key_sealed)}
+# --- upload systems: Broadcastify Calls nodes, ClearCut and RDIO Scanner systems ------
+SERVICE_NAMES = {"broadcastify": "Broadcastify", "clearcut": "ClearCut", "rdio": "RDIO"}
+CLEARCUT_SYSTEM_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+# Which target fields point at a system, for each service.
+SYSTEM_REF_FIELDS = {"broadcastify": ("broadcastify_enabled", "broadcastify_system_ref"),
+                     "clearcut": ("clearcut_enabled", "clearcut_system_ref"),
+                     "rdio": ("rdio_enabled", "rdio_system_ref")}
 
 
-class BroadcastifyBody(BaseModel):
+def system_view(system: UploadSystem) -> dict:
+    return {"id": system.id, "service": system.kind, "name": system.name, "system_id": system.label,
+            "key_set": bool(system.api_key_sealed)}
+
+
+class UploadSystemBody(BaseModel):
+    service: str = Field(default="broadcastify", pattern=r"^(broadcastify|clearcut|rdio)$")
     name: str = Field(min_length=1, max_length=120)
-    system_id: int = Field(ge=1)
+    system_id: str | int  # a number, or ClearCut's text ID; checked by _system_number
     api_key: str | None = Field(default=None, max_length=500)  # leave out to keep the saved key
 
 
-@router.get("/broadcastify")
-def list_broadcastify(db=Depends(get_db)):
-    return [_system_view(s) for s in db.scalars(select(BroadcastifySystem).order_by(BroadcastifySystem.name))]
+def _system_number(service: str, value) -> tuple[int, str | None]:
+    """The system ID as stored: (system_id, code). ClearCut's is text, the others' numbers."""
+    text_value = str(value).strip()[:65]  # longer than any ID, so too long is still refused
+    if service == "clearcut":
+        if not CLEARCUT_SYSTEM_RE.match(text_value):
+            raise HTTPException(422, "A ClearCut system ID is letters, numbers, dots, dashes and underscores, like us-ny-monroe")
+        return 0, text_value
+    if not text_value.isascii() or not text_value.isdigit() or int(text_value) < 1 or int(text_value) > 2**31 - 1:
+        raise HTTPException(422, f"A {SERVICE_NAMES[service]} system ID is a whole number")
+    return int(text_value), None
 
 
-@router.post("/broadcastify", status_code=201)
-def create_broadcastify(body: BroadcastifyBody, request: Request, admin: User = Depends(admin_user), db=Depends(get_db)):
+def _refuse_duplicate(db, service: str, number: int, code: str | None, system_ref: int | None = None) -> None:
+    same = db.scalar(select(UploadSystem).where(
+        UploadSystem.service == service, UploadSystem.system_id == number,
+        UploadSystem.code.is_(None) if code is None else UploadSystem.code == code,
+        UploadSystem.id != (system_ref or 0)))
+    if same:
+        raise HTTPException(409, f"{same.name} is already that {SERVICE_NAMES[service]} system")
+
+
+@router.get("/upload-systems")
+def list_upload_systems(db=Depends(get_db)):
+    return [system_view(s) for s in db.scalars(select(UploadSystem).order_by(UploadSystem.service, UploadSystem.name))]
+
+
+@router.post("/upload-systems", status_code=201)
+def create_upload_system(body: UploadSystemBody, request: Request, admin: User = Depends(admin_user), db=Depends(get_db)):
     ctx = ctx_of(request)
+    number, code = _system_number(body.service, body.system_id)
     if not body.api_key:
         raise HTTPException(422, "An API key is required")
-    system = BroadcastifySystem(name=body.name, system_id=body.system_id, api_key_sealed=ctx.secrets.seal(body.api_key))
+    _refuse_duplicate(db, body.service, number, code)
+    system = UploadSystem(service=body.service, name=body.name, system_id=number, code=code,
+                          api_key_sealed=ctx.secrets.seal(body.api_key))
     db.add(system)
     db.commit()
-    ctx.audit("broadcastify.created", user=admin, ip=ip_of(request), target=system.name)
-    return _system_view(system)
+    ctx.audit("upload_system.created", user=admin, ip=ip_of(request), target=system.name, details={"service": body.service})
+    return system_view(system)
 
 
-@router.put("/broadcastify/{system_ref}")
-def update_broadcastify(system_ref: int, body: BroadcastifyBody, request: Request, admin: User = Depends(admin_user), db=Depends(get_db)):
+@router.put("/upload-systems/{system_ref}")
+def update_upload_system(system_ref: int, body: UploadSystemBody, request: Request, admin: User = Depends(admin_user), db=Depends(get_db)):
     ctx = ctx_of(request)
-    system = db.get(BroadcastifySystem, system_ref)
+    system = db.get(UploadSystem, system_ref)
     if system is None:
         raise HTTPException(404, "System not found")
-    system.name, system.system_id = body.name, body.system_id
+    if body.service != system.kind:
+        raise HTTPException(422, "A system can't move to another service. Add a new one instead.")
+    number, code = _system_number(system.kind, body.system_id)
+    _refuse_duplicate(db, system.kind, number, code, system_ref)
+    system.name, system.system_id, system.code = body.name, number, code
     if body.api_key:
         system.api_key_sealed = ctx.secrets.seal(body.api_key)
     db.commit()
-    ctx.audit("broadcastify.updated", user=admin, ip=ip_of(request), target=system.name,
-              details={"key_changed": bool(body.api_key)})
-    return _system_view(system)
+    ctx.audit("upload_system.updated", user=admin, ip=ip_of(request), target=system.name,
+              details={"service": system.kind, "key_changed": bool(body.api_key)})
+    return system_view(system)
 
 
-@router.delete("/broadcastify/{system_ref}")
-def delete_broadcastify(system_ref: int, request: Request, admin: User = Depends(admin_user), db=Depends(get_db)):
+@router.delete("/upload-systems/{system_ref}")
+def delete_upload_system(system_ref: int, request: Request, admin: User = Depends(admin_user), db=Depends(get_db)):
     ctx = ctx_of(request)
-    system = db.get(BroadcastifySystem, system_ref)
+    system = db.get(UploadSystem, system_ref)
     if system is None:
         raise HTTPException(404, "System not found")
-    if db.scalar(select(Target.id).where(Target.broadcastify_system_ref == system_ref, Target.broadcastify_enabled.is_(True))):
-        raise HTTPException(409, "A target still uploads to this system. Change that target first.")
-    name = system.name
+    enabled, ref = SYSTEM_REF_FIELDS[system.kind]
+    user = db.scalar(select(Target.name).where(getattr(Target, ref) == system_ref, getattr(Target, enabled).is_(True)))
+    if user:
+        raise HTTPException(409, f"{user} still uploads to this system. Change that target first.")
+    name, service = system.name, system.kind
     db.delete(system)
     db.commit()
-    ctx.audit("broadcastify.deleted", user=admin, ip=ip_of(request), target=name)
+    ctx.audit("upload_system.deleted", user=admin, ip=ip_of(request), target=name, details={"service": service})
     return {"detail": "Deleted"}
 
 
-@router.post("/broadcastify/{system_ref}/test")
-async def test_broadcastify(system_ref: int, request: Request, admin: User = Depends(admin_user), db=Depends(get_db)):
-    """Check saved credentials with Broadcastify. Sends no call."""
+@router.post("/upload-systems/{system_ref}/test")
+async def test_upload_system(system_ref: int, request: Request, admin: User = Depends(admin_user), db=Depends(get_db)):
+    """Check saved credentials with Broadcastify. Sends no call. The others have no such check."""
     ctx = ctx_of(request)
-    system = db.get(BroadcastifySystem, system_ref)
+    system = db.get(UploadSystem, system_ref)
     if system is None:
         raise HTTPException(404, "System not found")
-    server, key, number, name = ctx.get_setting("broadcastify_server"), ctx.secrets.open(system.api_key_sealed), system.system_id, system.name
+    if system.kind != "broadcastify":
+        raise HTTPException(409, f"{SERVICE_NAMES[system.kind]} has no way to check credentials without sending a call")
+    server, number, name = ctx.get_setting("broadcastify_server"), system.system_id, system.name
+    key = ctx.secrets.open(system.api_key_sealed) if system.api_key_sealed else ""
     db.commit()
     if not server or not key:
         raise HTTPException(409, "The Broadcastify server or this system's key isn't set")
-    ctx.audit("broadcastify.tested", user=admin, ip=ip_of(request), target=name)
+    ctx.audit("upload_system.tested", user=admin, ip=ip_of(request), target=name, details={"service": "broadcastify"})
     try:
         async with httpx.AsyncClient(transport=ctx.http_transport, timeout=uploaders.UPLOAD_TIMEOUT, follow_redirects=False) as client:
             return {"reply": await uploaders.broadcastify_test(client, server, number, key)}
@@ -312,9 +355,7 @@ class SettingsBody(BaseModel):
     recording_retention_gb: float | None = Field(default=None, ge=0, le=1_000_000)
     registration_open: bool | None = None
     rdio_server: str | None = Field(default=None, max_length=500)
-    rdio_api_key: str | None = Field(default=None, max_length=500)
     clearcut_server: str | None = Field(default=None, max_length=500)
-    clearcut_api_key: str | None = Field(default=None, max_length=500)
     clearcut_page_url: str | None = Field(default=None, max_length=500)
     broadcastify_server: str | None = Field(default=None, max_length=500)
     map_tile_url: str | None = Field(default=None, max_length=500)
