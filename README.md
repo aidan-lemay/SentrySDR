@@ -498,7 +498,9 @@ An NFM or FM target's **Filter mode** takes its CTCSS (PL) tone out of recording
 - **High (300 Hz, steep):** as sharp as a radio's filter. Every standard tone, up to 254.1 Hz, is at least 50 dB down, and voice from 300 Hz up is untouched.
 - **Medium (300 Hz):** a gentler slope. About 46 dB off a 179.9 Hz tone and 0.5 dB off the voice, but only about 23 dB off the highest tones (241.8 Hz and up). New targets start with this.
 - **Low (250 Hz):** gentler still, about 20 dB off a 179.9 Hz tone, and little off the highest tones.
-- **Off:** keeps everything, including DCS codes, which also sit below 300 Hz. Targets from before this setting start off.
+- **Off:** keeps everything, including DCS codes, which also sit below 300 Hz.
+
+New NFM and FM targets start on Medium, and so did ones from before the setting existed, since de-emphasis would otherwise make their hum louder.
 
 It applies on single- and multi-channel SDRs, and changing it needs no restart. The web tuner doesn't use it.
 

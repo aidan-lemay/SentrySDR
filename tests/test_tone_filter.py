@@ -180,3 +180,24 @@ def test_the_multi_channel_receiver_takes_out_the_top_tone_on_high():
     cut = 20 * math.log10(tone_level(plain_audio, plain.audio_rate, 254.1) / tone_level(filtered_audio, filtered.audio_rate, 254.1))
     kept = 20 * math.log10(tone_level(plain_audio, plain.audio_rate, 1000) / tone_level(filtered_audio, filtered.audio_rate, 1000))
     assert cut > 40 and abs(kept) < 1.5
+
+
+def test_targets_from_before_get_the_medium_filter_once(tmp_path):
+    import sqlite3
+    from sentrysdr.models import make_session_factory
+    db = tmp_path / "old.db"
+    make_session_factory(db)
+    connection = sqlite3.connect(db)
+    connection.execute("DELETE FROM settings WHERE key = 'tone_filter_defaulted'")  # as from before
+    insert = "INSERT INTO targets (name, kind, frequency_hz, modulation, squelch, clearcut_enabled, rdio_enabled) VALUES (?, ?, ?, ?, 0, 0, 0)"
+    connection.executemany(insert, [("FD", "audio", 453_750_000, "nfm"), ("Tower", "audio", 120_000_000, "am"),
+                                    ("Ham", "audio", 146_940_000, "fm"), ("Planes", "adsb", 1_090_000_000, "adsb")])
+    connection.commit()
+    connection.close()
+    with make_session_factory(db)() as session:
+        filters = {t.name: t.tone_filter for t in session.query(Target)}
+        assert filters == {"FD": "medium", "Tower": None, "Ham": "medium", "Planes": None}
+        session.query(Target).filter_by(name="FD").one().tone_filter = None  # turned off afterwards
+        session.commit()
+    with make_session_factory(db)() as session:
+        assert session.query(Target).filter_by(name="FD").one().tone_filter is None

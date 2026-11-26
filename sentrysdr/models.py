@@ -553,6 +553,19 @@ def _move_upload_keys_to_systems(engine) -> None:
         connection.execute(text("DELETE FROM settings WHERE key IN ('rdio_api_key', 'clearcut_api_key')"))
 
 
+def _default_tone_filter(engine) -> None:
+    """De-emphasis (always on for NFM and FM) lifts a CTCSS tone about 10 dB, so a target without the
+    tone filter would hum louder than before. Targets from before the tone filter existed get Medium,
+    as new ones do. Once only: a marker in settings, so turning it off later sticks.
+    """
+    with engine.begin() as connection:
+        if connection.execute(text("SELECT 1 FROM settings WHERE key = 'tone_filter_defaulted'")).first():
+            return
+        connection.execute(text("UPDATE targets SET tone_filter = 'medium' WHERE tone_filter IS NULL AND kind = 'audio' "
+                                "AND modulation IN ('nfm', 'fm')"))
+        connection.execute(text("INSERT INTO settings (key, value) VALUES ('tone_filter_defaulted', '1')"))
+
+
 def _drop_retired_uses(engine) -> None:
     """Some stick uses were removed from the app. Take them off sticks that had them."""
     from .capabilities import RETIRED_USES
@@ -620,6 +633,7 @@ def make_session_factory(db_path: Path):
     _convert_source_antennas(engine)
     _convert_squelch_to_db(engine)
     _move_upload_keys_to_systems(engine)
+    _default_tone_filter(engine)
     _drop_retired_uses(engine)
     _fill_feeder_uuids(engine)
     _fill_rtl_tcp_ports(engine)
