@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from .morse import MorseReader
+from .pipelines import PCM_RATE, TONE_FILTERS, tone_filter_stages
 
 # Sample rates an RTL-SDR can do, in Hz, that the tuner offers.
 SAMPLE_RATES = (250_000, 1_024_000, 1_536_000, 1_800_000, 2_048_000, 2_400_000)
@@ -84,11 +85,15 @@ class Decimator:
         # trimmed off each. Every Decimator therefore delays by n/8 input samples.
         self.trim = self.m // 8
         self.delay = self.n // 8
-        freqs = np.fft.fftshift(np.fft.fftfreq(self.m, 1 / self.out_rate))
-        self.gain = np.fft.ifftshift(response(freqs).astype(np.complex64)) * np.float32(self.m / self.n)
+        self.set_response(response)
         self.index = np.fft.ifftshift(np.arange(-self.m // 2, self.m // 2)) % self.n
         self.buffer = np.zeros(self.overlap, dtype=np.complex64)
         self.real_output = real_output
+
+    def set_response(self, response) -> None:
+        """A new filter shape. The samples it holds stay, so the audio doesn't skip."""
+        freqs = np.fft.fftshift(np.fft.fftfreq(self.m, 1 / self.out_rate))
+        self.gain = np.fft.ifftshift(response(freqs).astype(np.complex64)) * np.float32(self.m / self.n)
 
     def push(self, samples: np.ndarray) -> np.ndarray:
         self.buffer = np.concatenate((self.buffer, samples.astype(np.complex64, copy=False)))
@@ -292,6 +297,7 @@ class Settings:
     squelch_db: float | None = None  # None: always open
     deemphasis_us: int = 75
     morse: bool = False  # decode Morse: CW, or an ID sent as a tone in NFM or AM
+    tone_filter: str | None = None  # NFM only: take out a CTCSS tone, as pipelines.TONE_FILTERS
 
 
 MORSE_MODES = ("cw", "nfm", "am")
@@ -326,7 +332,9 @@ class Receiver:
         self.audio_rate = self.if_rate
         tau = settings.deemphasis_us * 1e-6
         if settings.mode == "nfm":
-            self.audio = Decimator(self.if_rate, 16_000, lambda f: raised_cosine(f, -3500, 3500, 500), n=2048, real_output=True)
+            # 4096: long enough blocks for the tone filter's sharp edge. At 2048 the top tone, 254.1 Hz,
+            # leaked through at only 30 dB down; at 4096 it's 55, the same as on a single-channel SDR.
+            self.audio = Decimator(self.if_rate, 16_000, self._nfm_audio_shape(settings.tone_filter), n=4096, real_output=True)
             self.audio_rate = self.audio.out_rate
         elif settings.mode in ("wfm", "wfm_stereo"):
             audio_shape = lambda f: raised_cosine(f, -15_000, 15_000, 1500) * deemphasis(tau)(f)  # noqa: E731
@@ -343,6 +351,27 @@ class Receiver:
             # CW mode: the filtered channel. NFM and AM: the audio, for a tone.
             cw = settings.mode == "cw"
             self.morse = MorseReader(self.if_rate if cw else self.audio_rate, from_audio=not cw, bandwidth=self.bw)
+
+    @staticmethod
+    def _nfm_audio_shape(tone_filter: str | None):
+        """Voice up to 3.5 kHz, less a CTCSS tone when filtered. Done in the FFT, so it costs nothing."""
+        if tone_filter not in TONE_FILTERS:
+            return lambda f: raised_cosine(f, -3500, 3500, 500)
+        stages = tone_filter_stages(tone_filter, PCM_RATE)  # the audio comes out at about this rate
+
+        def shape(f):
+            z = np.exp(-2j * np.pi * np.asarray(f, dtype=np.float64) / PCM_RATE)  # z^-1
+            gain = np.ones(len(z))
+            for b0, b1, b2, a1, a2 in stages:  # the magnitude only: the FFT's filters are zero-phase
+                gain *= np.abs((b0 + b1 * z + b2 * z * z) / (1 + a1 * z + a2 * z * z))
+            return raised_cosine(f, -3500, 3500, 500) * gain
+        return shape
+
+    def set_tone_filter(self, tone_filter: str | None) -> None:
+        if tone_filter == self.settings.tone_filter or self.settings.mode != "nfm":
+            return
+        self.settings.tone_filter = tone_filter
+        self.audio.set_response(self._nfm_audio_shape(tone_filter))
 
     def retune(self, center_hz: int) -> None:
         """The tuner's center moved: find this channel in the new span."""

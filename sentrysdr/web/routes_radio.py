@@ -421,6 +421,8 @@ class TargetBody(BaseModel):
     modulation: str = "nfm"
     squelch: float | None = Field(default=-40.0, ge=pipelines.SQUELCH_DB_MIN, le=pipelines.SQUELCH_DB_MAX)  # dB; None is off
     volume_db: float = Field(default=0, ge=pipelines.VOLUME_MIN_DB, le=pipelines.VOLUME_MAX_DB)
+    # Takes a CTCSS tone out of NFM and FM audio. Kept as off for other modes.
+    tone_filter: str = Field(default="off", pattern=r"^(off|low|medium|high)$")
     clearcut_enabled: bool = False
     clearcut_system_ref: int | None = None  # an UploadSystem, as for Broadcastify
     clearcut_id: int | None = Field(default=None, ge=0, le=2**31 - 1)  # talkgroup
@@ -497,12 +499,14 @@ RETIRED_COLUMNS = SQUELCH_COLUMNS | {"clearcut_system", "rdio_system"}
 def _target_view(target: Target) -> dict:
     view = {c.name: getattr(target, c.name) for c in Target.__table__.columns if c.name not in RETIRED_COLUMNS}
     view["squelch"] = target.squelch_db  # dB, or None for off
+    view["tone_filter"] = target.tone_filter or "off"
     return view
 
 
 def _target_values(body: TargetBody) -> dict:
     values = body.model_dump()
     values["squelch_db"] = values.pop("squelch")
+    values["tone_filter"] = pipelines.clean_tone_filter(values["tone_filter"], body.modulation) if body.kind == "audio" else None
     return values
 
 

@@ -492,6 +492,15 @@ Set server URLs and keys in **Admin > Uploads and feeds**, then turn uploads on 
 
 A target's **Volume** setting applies to its recordings, uploads and live audio. It doesn't affect squelch. Any setting other than 0 dB also removes DC, which stops a tuning offset from clipping the start of a call.
 
+An NFM or FM target's **Filter mode** takes its CTCSS (PL) tone out of recordings, uploads and live audio, as a radio does before its speaker. Without it, the tone (67 to 254 Hz) is heard as a hum under every call, and ClearCut's tone decoder can mistake it for a paging tone.
+
+- **High (300 Hz, steep):** as sharp as a radio's filter. Every standard tone, up to 254.1 Hz, is at least 50 dB down, and voice from 300 Hz up is untouched.
+- **Medium (300 Hz):** a gentler slope. About 46 dB off a 179.9 Hz tone and 0.5 dB off the voice, but only about 23 dB off the highest tones (241.8 Hz and up). New targets start with this.
+- **Low (250 Hz):** gentler still, about 20 dB off a 179.9 Hz tone, and little off the highest tones.
+- **Off:** keeps everything, including DCS codes, which also sit below 300 Hz. Targets from before this setting start off.
+
+It applies on single- and multi-channel SDRs, and changing it needs no restart. The web tuner doesn't use it.
+
 ### Upload systems
 
 Broadcastify Calls, ClearCut and RDIO Scanner are set up the same way:

@@ -169,6 +169,7 @@ class Target(Base):
     # dB, as the web tuner shows it. None = off: continuous recording.
     squelch_db: Mapped[float | None] = mapped_column(nullable=True)
     volume_db: Mapped[float | None] = mapped_column(nullable=True)  # applied to the audio
+    tone_filter: Mapped[str | None] = mapped_column(String(8), nullable=True)  # pipelines.TONE_FILTERS; None is off
     clearcut_enabled: Mapped[bool] = mapped_column(default=False)
     # Retired: the ClearCut and RDIO system IDs, typed on each target. Now an UploadSystem each.
     clearcut_system: Mapped[str | None] = mapped_column(String(64), nullable=True)

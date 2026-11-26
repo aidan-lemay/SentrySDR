@@ -60,7 +60,8 @@ RESET_SETTLE_SECONDS = 3.0
 # So the SDRs on one machine start this far apart, each after the last has finished opening (about 1.2 s).
 START_GAP_SECONDS = 1.5
 RESET_RESTART_GAP = 60.0  # at most one automatic restart a minute, so a stick that always resets can't loop
-# Changing any of these restarts the tool: they are read when it starts. Volume is read live, and names are only labels.
+# Changing any of these restarts the tool: they are read when it starts. Volume and the tone filter are read live,
+# and names are only labels.
 RADIO_KEYS = ("kind", "frequency_hz", "modulation", "squelch", "gain_db", "ppm", "channels", "feeds", "feeder_uuid", "rtl_tcp_port",
               "rate", "multi")
 MULTI_STATUS_SECONDS = 1.0  # how often a multi-channel SDR's levels are published
@@ -281,6 +282,45 @@ class VolumeControl:
             scaled = int(previous_out * factor)
             samples[index] = 32767 if scaled > 32767 else -32768 if scaled < -32768 else scaled
         self.previous_in, self.previous_out = previous_in, previous_out
+        if sys.byteorder == "big":
+            samples.byteswap()
+        return samples.tobytes()
+
+
+class ToneFilter:
+    """Takes a CTCSS tone out of 16-bit audio: high-pass stages, as pipelines.TONE_FILTERS.
+
+    The filter is chosen per chunk, so changing a target's needs no restart. Off, the audio
+    passes through untouched. Plain Python: under 10 ms a second of audio on a laptop, and
+    rtl_fm only sends audio while its squelch is open.
+    """
+
+    def __init__(self):
+        self.key: tuple | None = None
+        self.stages: list[tuple] = []
+        self.state: list[list[float]] = []
+
+    def __call__(self, chunk: bytes, mode: str | None, rate: int) -> bytes:
+        if mode not in pipelines.TONE_FILTERS:
+            self.key = None
+            return chunk
+        if self.key != (mode, rate):
+            self.key = (mode, rate)
+            self.stages = pipelines.tone_filter_stages(mode, rate)
+            self.state = [[0.0, 0.0, 0.0, 0.0] for _ in self.stages]
+        samples = array("h")
+        samples.frombytes(chunk)
+        if sys.byteorder == "big":
+            samples.byteswap()
+        values: list = samples.tolist()
+        for (b0, b1, b2, a1, a2), state in zip(self.stages, self.state):
+            x1, x2, y1, y2 = state
+            for index, x in enumerate(values):
+                y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2
+                x2, x1, y2, y1 = x1, x, y1, y
+                values[index] = y
+            state[:] = (x1, x2, y1, y2)
+        samples = array("h", (32767 if v > 32767 else -32768 if v < -32768 else int(v) for v in values))
         if sys.byteorder == "big":
             samples.byteswap()
         return samples.tobytes()
@@ -660,6 +700,7 @@ class Worker:
         rate = pipelines.pcm_rate(spec)
         framer = PcmFramer(pipelines.pcm_channels(spec))
         volume = VolumeControl()
+        tone_filter = ToneFilter()
         digital = spec["modulation"] in pipelines.DIGITAL
         tail = ToolTail()
         procs: list[asyncio.subprocess.Process] = []
@@ -710,8 +751,9 @@ class Worker:
                 chunk = framer(chunk)
                 if not chunk:
                     continue
-                # Read each time: changing a target's volume needs no retune.
-                chunk = volume(chunk, (self.spec or spec).get("volume_db", 0))
+                # Read each time: changing a target's volume or tone filter needs no retune.
+                live = self.spec or spec
+                chunk = volume(tone_filter(chunk, live.get("tone_filter"), rate), live.get("volume_db", 0))
                 if writer is None:
                     writer = CallWriter(cfg, self.spec or spec, self.serial, rate, self.sup.tmp_dir, self.sup.call_sink)
                     self.in_call, self.call_started = True, writer.started_at
@@ -756,7 +798,7 @@ class Worker:
             mode = "am" if channel["modulation"] == "am" else "nfm"
             dsp.listen(channel["target_id"], tuner.Settings(
                 frequency_hz=channel["frequency_hz"], mode=mode, bandwidth_hz=widths[channel["modulation"]],
-                squelch_db=channel["squelch"]))
+                squelch_db=channel["squelch"], tone_filter=channel.get("tone_filter")))
             states[channel["target_id"]] = {
                 "resample": Resampler(dsp.receivers[channel["target_id"]].audio_rate), "volume": VolumeControl(),
                 "writer": None, "last_open": 0.0, "open_since": None, "last_call_at": None,
@@ -832,6 +874,7 @@ class Worker:
                     receiver = dsp.receivers[target_id]
                     if channel is not None:
                         receiver.settings.squelch_db = channel["squelch"]  # a changed squelch applies straight away
+                        receiver.set_tone_filter(channel.get("tone_filter"))  # and so does a tone filter
                     if not pieces:
                         continue
                     samples = state["resample"](np.concatenate(pieces))
