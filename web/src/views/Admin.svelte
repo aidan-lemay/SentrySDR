@@ -56,10 +56,16 @@
   let auditSearch = $state('');
 
   let settings = $state(null);
-  let keys = $state({ rdio_api_key: '', clearcut_api_key: '' });
   let systems = $state([]);
-  const blankSystem = () => ({ id: null, name: '', system_id: '', api_key: '' });
+  const SERVICES = [
+    { id: 'broadcastify', name: 'Broadcastify Calls', idLabel: 'Broadcastify system ID', idHint: "The node's ID from Broadcastify, not a RadioReference ID.", numeric: true },
+    { id: 'clearcut', name: 'ClearCut', idLabel: 'ClearCut system ID', idHint: 'The short name ClearCut uses for the system, such as us-ny-monroe.', numeric: false },
+    { id: 'rdio', name: 'RDIO Scanner', idLabel: 'RDIO system ID', idHint: "The system's ID in RDIO Scanner's admin, under Systems.", numeric: true },
+  ];
+  const serviceOf = (id) => SERVICES.find((s) => s.id === id) ?? SERVICES[0];
+  const blankSystem = (service = 'broadcastify') => ({ id: null, service, name: '', system_id: '', api_key: '' });
   let systemForm = $state(blankSystem());
+  const formService = $derived(serviceOf(systemForm.service));
   let systemReplies = $state({});
 
   const unused = $derived(available.filter((item) => !item.defined));
@@ -90,8 +96,8 @@
     nodes: async () => { nodes = await api('nodes'); },
     bans: async () => { bans = await api('admin/bans'); },
     audit: async () => { audit = await api(`admin/audit?limit=200${auditSearch ? `&search=${encodeURIComponent(auditSearch)}` : ''}`); },
-    settings: async () => { settings = await api('admin/settings'); systems = await api('admin/broadcastify'); },
-    uploads: async () => { settings = await api('admin/settings'); systems = await api('admin/broadcastify'); },
+    settings: async () => { settings = await api('admin/settings'); systems = await api('admin/upload-systems'); },
+    uploads: async () => { settings = await api('admin/settings'); systems = await api('admin/upload-systems'); },
     warnings: async () => { warnings = await api('admin/warnings'); },
     email: async () => { settings = await api('admin/settings'); smtpPassword = ''; },
   };
@@ -410,14 +416,8 @@
       recording_retention_gb: Number(settings.recording_retention_gb || 0),
       airframes_station_id: settings.airframes_station_id.trim(), airframes_feed: settings.airframes_feed.trim(),
     };
-    for (const name of ['rdio_api_key', 'clearcut_api_key']) {
-      if (keys[name]) body[name] = keys[name];
-    }
     const reply = await run(() => api('admin/settings', { method: 'PATCH', body }), 'Settings saved.');
-    if (reply) {
-      settings = reply;
-      keys = { rdio_api_key: '', clearcut_api_key: '' };
-    }
+    if (reply) settings = reply;
   }
 
   // --- email
@@ -479,28 +479,28 @@
     }
   }
 
-  // --- Broadcastify systems
+  // --- upload systems: Broadcastify, ClearCut and RDIO
   async function saveSystem(event) {
     event.preventDefault();
-    const body = { name: systemForm.name, system_id: Number(systemForm.system_id), api_key: systemForm.api_key || null };
-    const path = systemForm.id ? `admin/broadcastify/${systemForm.id}` : 'admin/broadcastify';
+    const body = { service: systemForm.service, name: systemForm.name, system_id: String(systemForm.system_id).trim(), api_key: systemForm.api_key || null };
+    const path = systemForm.id ? `admin/upload-systems/${systemForm.id}` : 'admin/upload-systems';
     if (await run(() => api(path, { method: systemForm.id ? 'PUT' : 'POST', body }), 'System saved.')) {
-      systemForm = blankSystem();
-      systems = await api('admin/broadcastify');
+      systemForm = blankSystem(systemForm.service);
+      systems = await api('admin/upload-systems');
     }
   }
 
   async function removeSystem(system) {
-    if (!confirm(`Remove Broadcastify system ${system.name}? Its saved key is deleted.`)) return;
-    if (await run(() => api(`admin/broadcastify/${system.id}`, { method: 'DELETE' }), 'System removed.')) {
-      systems = await api('admin/broadcastify');
+    if (!confirm(`Remove ${serviceOf(system.service).name} system ${system.name}? Its saved key is deleted.`)) return;
+    if (await run(() => api(`admin/upload-systems/${system.id}`, { method: 'DELETE' }), 'System removed.')) {
+      systems = await api('admin/upload-systems');
     }
   }
 
   async function testSystem(system) {
     systemReplies[system.id] = 'Asking Broadcastify...';
     try {
-      const text = `Broadcastify replied: ${(await api(`admin/broadcastify/${system.id}/test`, { method: 'POST' })).reply}`;
+      const text = `Broadcastify replied: ${(await api(`admin/upload-systems/${system.id}/test`, { method: 'POST' })).reply}`;
       systemReplies[system.id] = text;
       setTimeout(() => { if (systemReplies[system.id] === text) delete systemReplies[system.id]; }, NOTICE_MS);
     } catch (failure) {
@@ -1046,17 +1046,12 @@
     </fieldset>
     {:else}
     <fieldset>
-      <legend>Uploads</legend>
-      <p class="small">Saved keys are never shown again. Leave a key blank to keep the current one.</p>
-      <label class="field"><span>RDIO server</span><input type="url" bind:value={settings.rdio_server} /></label>
-      <label class="field"><span>RDIO API key {settings.rdio_api_key_set ? '(saved)' : '(not set)'}</span><input type="password" bind:value={keys.rdio_api_key} autocomplete="off" /></label>
-      <label class="field"><span>ClearCut server</span><input type="url" bind:value={settings.clearcut_server} /></label>
-      <label class="field"><span>ClearCut API key {settings.clearcut_api_key_set ? '(saved)' : '(not set)'}</span><input type="password" bind:value={keys.clearcut_api_key} autocomplete="off" /></label>
-      <label class="field"><span>ClearCut link for users</span><input type="url" bind:value={settings.clearcut_page_url} /></label>
-    </fieldset>
-    <fieldset>
-      <legend>Broadcastify Calls server</legend>
-      <label class="field"><span>Upload address</span><input class="mono" type="url" bind:value={settings.broadcastify_server} /></label>
+      <legend>Upload servers</legend>
+      <p class="small">One address per service, shared by all its systems. Each system's ID and API key are added below.</p>
+      <label class="field"><span>Broadcastify Calls upload address</span><input class="mono" type="url" bind:value={settings.broadcastify_server} /></label>
+      <label class="field"><span>ClearCut server</span><input class="mono" type="url" bind:value={settings.clearcut_server} /></label>
+      <label class="field"><span>ClearCut link for users</span><input class="mono" type="url" bind:value={settings.clearcut_page_url} /></label>
+      <label class="field"><span>RDIO Scanner server</span><input class="mono" type="url" bind:value={settings.rdio_server} /></label>
     </fieldset>
     <fieldset>
       <legend>airframes.io feed</legend>
@@ -1089,24 +1084,38 @@
   {#if tab === 'uploads'}
   <form onsubmit={saveSystem}>
     <fieldset>
-      <legend>Broadcastify Calls systems</legend>
-      <p class="small">One per node. Each target then chooses a system and a frequency slot. Saved keys are never shown again.</p>
-      {#each systems as system (system.id)}
-        <div class="small" style="margin:.5rem 0">
-          <strong>{system.name}</strong>, node {system.system_id}
-          <div class="buttons" style="margin:.2rem 0">
-            <button type="button" onclick={() => testSystem(system)}>Check credentials</button>
-            <button type="button" onclick={() => (systemForm = { ...blankSystem(), id: system.id, name: system.name, system_id: system.system_id })}>Edit</button>
-            <button type="button" onclick={() => removeSystem(system)}>Remove</button>
-          </div>
-          {#if systemReplies[system.id]}<Notice ondismiss={() => delete systemReplies[system.id]}>{systemReplies[system.id]}</Notice>{/if}
-        </div>
+      <legend>Upload systems</legend>
+      <p class="small">A Broadcastify node, ClearCut system or RDIO system, each with its own API key. Each target then chooses a system, and a slot or talkgroup. Saved keys are never shown again.</p>
+      {#each SERVICES as service (service.id)}
+        {@const mine = systems.filter((s) => s.service === service.id)}
+        {#if mine.length}
+          <h4 class="small" style="margin:.6rem 0 .2rem">{service.name}</h4>
+          {#each mine as system (system.id)}
+            <div class="small" style="margin:.3rem 0 .5rem">
+              <strong>{system.name}</strong>, <span class="mono">{system.system_id}</span>{#if !system.key_set}, <span class="st-warn">no API key, so nothing is sent</span>{/if}
+              <div class="buttons" style="margin:.2rem 0">
+                {#if system.service === 'broadcastify'}<button type="button" onclick={() => testSystem(system)}>Check credentials</button>{/if}
+                <button type="button" onclick={() => (systemForm = { ...blankSystem(system.service), id: system.id, name: system.name, system_id: system.system_id })}>Edit</button>
+                <button type="button" onclick={() => removeSystem(system)}>Remove</button>
+              </div>
+              {#if systemReplies[system.id]}<Notice ondismiss={() => delete systemReplies[system.id]}>{systemReplies[system.id]}</Notice>{/if}
+            </div>
+          {/each}
+        {/if}
       {/each}
+      <label class="field"><span>Service</span>
+        <select bind:value={systemForm.service} disabled={Boolean(systemForm.id)}>
+          {#each SERVICES as option (option.id)}<option value={option.id}>{option.name}</option>{/each}
+        </select>
+      </label>
       <label class="field"><span>Name</span><input bind:value={systemForm.name} maxlength="120" required /></label>
-      <label class="field"><span>Broadcastify system ID</span><input type="number" inputmode="numeric" min="1" bind:value={systemForm.system_id} required /><span class="hint">The node's ID from Broadcastify, not a RadioReference ID.</span></label>
+      <label class="field"><span>{formService.idLabel}</span>
+        {#if formService.numeric}<input type="number" inputmode="numeric" min="1" bind:value={systemForm.system_id} required />
+        {:else}<input class="mono" bind:value={systemForm.system_id} maxlength="64" pattern="[A-Za-z0-9_.\-]+" required />{/if}
+        <span class="hint">{formService.idHint}</span></label>
       <label class="field"><span>API key{systemForm.id ? ' (leave blank to keep the saved key)' : ''}</span><input type="password" bind:value={systemForm.api_key} autocomplete="off" required={!systemForm.id} /></label>
       <div class="buttons form-buttons"><button>{systemForm.id ? 'Save system' : 'Add system'}</button>
-        {#if systemForm.id}<button type="button" onclick={() => (systemForm = blankSystem())}>Cancel</button>{/if}
+        {#if systemForm.id}<button type="button" onclick={() => (systemForm = blankSystem(systemForm.service))}>Cancel</button>{/if}
       </div>
     </fieldset>
   </form>

@@ -147,7 +147,7 @@ Each permission except the admin-only ones can be allowed or denied per user, un
 | Antennas | Antennas and their frequency ranges |
 | Nodes | Slaves: create a one-time enrollment token, or revoke a slave |
 | Settings | How long recordings, ACARS messages and emergencies, and audit logs are kept (0 keeps them forever); a size limit for recordings; sign-ups; the map tile server; a backup download |
-| Uploads and feeds | RDIO and ClearCut servers and keys; the Broadcastify upload address and systems; the airframes.io station ID and address |
+| Uploads and feeds | The Broadcastify, ClearCut and RDIO server addresses; upload systems, each with its own ID and API key; the airframes.io station ID and address |
 | Email | The mail server for alert emails, and the daily limit. See [Email alerts](#email-alerts) |
 | Warnings | Every current health warning, including muted and hidden ones |
 
@@ -492,6 +492,18 @@ Set server URLs and keys in **Admin > Uploads and feeds**, then turn uploads on 
 
 A target's **Volume** setting applies to its recordings, uploads and live audio. It doesn't affect squelch. Any setting other than 0 dB also removes DC, which stops a tuning offset from clipping the start of a call.
 
+### Upload systems
+
+Broadcastify Calls, ClearCut and RDIO Scanner are set up the same way:
+
+1. In **Admin > Uploads and feeds > Upload servers**, enter each service's address once. It's shared by all of that service's systems.
+2. Under **Upload systems**, add each system: the service, a name, the service's own ID for it, and its API key. Saved keys are never shown again.
+3. On each target, turn on the upload, then choose the system and enter the talkgroup (for Broadcastify, the frequency slot).
+
+So one SentrySDR can feed several systems on the same service, each with its own key. A system can't be removed while a target uploads to it.
+
+Before this, ClearCut and RDIO had one API key each in settings, and each target had the system ID typed in. Upgrading turns each system ID in use into an upload system holding the old key, points those targets at it, and removes the old keys from settings. A target with a system ID but no key saved ends up with a system marked **no API key**, and its calls aren't sent until a key is added.
+
 ### Broadcastify Calls
 
 Replaces trunk-recorder's `broadcastify_uploader` for conventional channels. Broadcastify must already have approved your node: apply at broadcastify.com/apply/calls, and each frequency needs a matching RadioReference entry. See Broadcastify's [upload API](https://support.broadcastify.com/hc/en-us/articles/360049971311-Broadcastify-Calls-Ingest-Upload-API) and [production status page](https://www.broadcastify.com/calls/status/).
@@ -499,7 +511,7 @@ Replaces trunk-recorder's `broadcastify_uploader` for conventional channels. Bro
 - **Keep the clock right.** Broadcastify requires accurate time, and it rejects or wrongly deduplicates calls with bad timestamps. Each call's time comes from the machine that recorded it, so check the master and every slave with `timedatectl`, which should say `System clock synchronized: yes`. A Pi usually has no battery-backed clock, so it needs network time.
 - **Credentials are separate per environment.** Production credentials only work on `https://api.broadcastify.com/call-upload`. Development credentials are issued separately and only work on `https://api.broadcastify.com/call-upload-dev`. Don't try one on the other.
 
-1. In **Admin > Uploads and feeds > Broadcastify Calls systems**, add each node's name, system ID and API key, then select **Check credentials**. This sends no call.
+1. In **Admin > Uploads and feeds > Upload systems**, add each node as a Broadcastify Calls system with its system ID and API key, then select **Check credentials**. This sends no call.
 2. On each target, turn on **Upload calls to Broadcastify Calls**, then choose the system and the frequency's slot. Slots are on Broadcastify's Manage Calls Systems page, under Node Frequencies.
 
 All uploads go from the master, including calls recorded on slaves. A call Broadcastify skips counts as finished, and a call it rejects, or refuses for a bad API key, is not retried. The reason shows on the recording, and other calls keep uploading. Broadcastify refuses a call that arrives more than about a minute after it started (`REJECTED-CALL-SKEW-TOO-LONG`), so:
@@ -513,8 +525,9 @@ All uploads go from the master, including calls recorded on slaves. A call Broad
 ### RDIO Scanner
 
 1. In your RDIO Scanner admin, create an API key, and note the system and talkgroup IDs the channel should appear under.
-2. In **Admin > Uploads and feeds**, enter the RDIO server's address, such as `https://rdio.example.com`, and the API key. SentrySDR posts calls to its `/api/call-upload`.
-3. On each target, turn on **Upload calls to RDIO** and enter the system and talkgroup.
+2. In **Admin > Uploads and feeds**, enter the RDIO server's address, such as `https://rdio.example.com`. SentrySDR posts calls to its `/api/call-upload`.
+3. Under **Upload systems**, add an RDIO Scanner system with its system ID and the API key.
+4. On each target, turn on **Upload calls to RDIO Scanner**, choose the system and enter the talkgroup.
 
 ### Duplicate channels
 
@@ -526,7 +539,7 @@ All uploads go from the master, including calls recorded on slaves. A call Broad
 
 ClearCut makes the transcript itself after a call is uploaded, either automatically or on request, and adds it to its copy of the call.
 
-- **Setup:** a target needs the ClearCut system ID (such as `us-ny-monroe`) and the talkgroup, as well as the server and key in settings.
+- **Setup:** the server address in settings, a ClearCut upload system with its system ID (such as `us-ny-monroe`) and API key, then on each target that system and the talkgroup.
 - **Automatic:** once a minute, for talkgroups with calls still waiting, SentrySDR reads ClearCut's call list and copies any finished transcripts. It keeps looking for 24 hours after each call.
 - **On request:** **Get transcript** under a recording asks ClearCut to transcribe that call. Admins and operators can do this by default, limited to 30 requests per user per hour, because each one uses transcription time on the ClearCut server.
 - **Matching:** a recording is matched to its ClearCut call by system, talkgroup and start time. ClearCut only lists recent calls, so on a very busy talkgroup a call can scroll off the list before it's matched.

@@ -44,12 +44,12 @@ class UploadRejected(UploadError):
     """The destination refused this call for good, so retrying can't help."""
 
 
-def rdio_form(recording, target, api_key: str) -> dict[str, str]:
+def rdio_form(recording, target, system_id: int, api_key: str) -> dict[str, str]:
     started = datetime.fromtimestamp(recording.started_at, timezone.utc)
     return {
         "key": api_key,
         "dateTime": started.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
-        "system": str(target.rdio_system),
+        "system": str(system_id),
         "talkgroup": str(target.rdio_talkgroup),
         "frequency": str(recording.frequency_hz),
         "source": "0",
@@ -77,11 +77,11 @@ def _check(destination: str, response: httpx.Response) -> None:
         raise UploadError(f"{destination} returned HTTP {response.status_code}")
 
 
-async def send_rdio(client: httpx.AsyncClient, server: str, api_key: str, recording, target, audio: Path) -> None:
+async def send_rdio(client: httpx.AsyncClient, server: str, api_key: str, system_id: int, recording, target, audio: Path) -> None:
     with audio.open("rb") as handle:
         response = await client.post(
             server.rstrip("/") + "/api/call-upload",
-            data=rdio_form(recording, target, api_key),
+            data=rdio_form(recording, target, system_id, api_key),
             files={"audio": (audio.name, handle, "audio/mpeg")},
         )
     _check("rdio-scanner", response)

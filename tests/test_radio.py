@@ -5,6 +5,7 @@ import asyncio
 import contextlib
 import json
 import math
+import re
 import sqlite3
 import subprocess
 import time
@@ -21,7 +22,7 @@ from sqlalchemy import select
 from sentrysdr import capabilities, feeds, pipelines, schedule, sdr, uploaders
 from sentrysdr.context import BROADCASTIFY_RETRY_SECONDS, UPLOAD_MAX_ATTEMPTS, Context
 from sentrysdr.engine import MeasureError, VolumeControl, merge_ais_message
-from sentrysdr.models import AcarsMessage, Antenna, AuditLog, BroadcastifySystem, Node, Recorder, Recording, SdrProfile, Source, Target, UploadJob, make_session_factory
+from sentrysdr.models import AcarsMessage, Antenna, AuditLog, UploadSystem, Node, Recorder, Recording, SdrProfile, Source, Target, UploadJob, make_session_factory
 
 from .conftest import ADMIN_EMAIL, PASSWORD, add_user, client_for
 
@@ -455,14 +456,23 @@ def test_protected_recording_cannot_be_deleted(ctx, tmp_path, admin):
 
 
 # --- uploads ---------------------------------------------------------------
+
+def upload_system(admin, service, system_id, key="k", name=None):
+    """An administrator's ClearCut or RDIO system, as a target's upload needs."""
+    reply = admin.post("/api/admin/upload-systems", json={"service": service, "name": name or f"{service} {system_id}",
+                                                         "system_id": system_id, "api_key": key})
+    assert reply.status_code == 201, reply.text
+    return reply.json()["id"]
+
+
 async def run_uploads(ctx, handler):
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         return await ctx.process_uploads(client)
 
 
 async def test_rdio_upload_format_and_retry(ctx, tmp_path, admin):
-    target = make_target(admin, rdio_enabled=True, rdio_system=11, rdio_talkgroup=54241)
-    admin.patch("/api/admin/settings", json={"rdio_server": "https://rdio.example.com/", "rdio_api_key": "k1"})
+    target = make_target(admin, rdio_enabled=True, rdio_system_ref=upload_system(admin, "rdio", 11, "k1"), rdio_talkgroup=54241)
+    admin.patch("/api/admin/settings", json={"rdio_server": "https://rdio.example.com/"})
     call = store(ctx, tmp_path, target_id=target)
     seen = []
 
@@ -484,6 +494,7 @@ async def test_rdio_upload_format_and_retry(ctx, tmp_path, admin):
     assert str(seen[0].url) == "https://rdio.example.com/api/call-upload"
     for field in ('name="key"', 'name="audio"', 'name="system"', 'name="talkgroup"', 'name="dateTime"', "54241"):
         assert field in body
+    assert re.search(r'name="system"\r\n\r\n11\r\n', body) and re.search(r'name="key"\r\n\r\nk1\r\n', body)
     with ctx.db() as session:
         assert session.query(UploadJob).filter_by(recording_id=call).one().status == "done"
 
@@ -661,12 +672,10 @@ def test_tracks_merge_across_receivers_and_expire(ctx):
 
 
 # --- ClearCut transcripts --------------------------------------------------
-CC_TARGET = dict(clearcut_enabled=True, clearcut_system="us-ny-test", clearcut_id=1077)
-
-
 def uploaded_call(ctx, tmp_path, admin, started=None):
-    admin.patch("/api/admin/settings", json={"clearcut_server": "https://cc.example.com", "clearcut_api_key": "k"})
-    target = next((t["id"] for t in admin.get("/api/targets").json() if t["name"] == "CC"), None) or make_target(admin, "CC", **CC_TARGET)
+    admin.patch("/api/admin/settings", json={"clearcut_server": "https://cc.example.com"})
+    target = next((t["id"] for t in admin.get("/api/targets").json() if t["name"] == "CC"), None) or make_target(
+        admin, "CC", clearcut_enabled=True, clearcut_system_ref=upload_system(admin, "clearcut", "us-ny-test"), clearcut_id=1077)
     call = store(ctx, tmp_path, target_id=target, started=started)
     with ctx.db() as session:
         session.query(UploadJob).filter_by(recording_id=call).one().status = "done"
@@ -824,9 +833,12 @@ def test_transcribe_requests_rate_limited(ctx, tmp_path, admin):
 
 def test_clearcut_target_needs_system_and_talkgroup(admin):
     body = {"name": "x", "frequency_hz": 444_000_000, "clearcut_enabled": True}
+    system = upload_system(admin, "clearcut", "a")
     assert admin.post("/api/targets", json={**body, "clearcut_id": 5}).status_code == 422
-    assert admin.post("/api/targets", json={**body, "clearcut_system": "a", "clearcut_id": 5}).status_code == 201
-    assert admin.post("/api/targets", json={**body, "clearcut_system": "../x", "clearcut_id": 5}).status_code == 422
+    assert admin.post("/api/targets", json={**body, "clearcut_system_ref": system}).status_code == 422
+    assert admin.post("/api/targets", json={**body, "clearcut_system_ref": system, "clearcut_id": 5}).status_code == 201
+    assert admin.post("/api/targets", json={**body, "clearcut_system_ref": system + 99, "clearcut_id": 5}).status_code == 422
+    assert admin.post("/api/admin/upload-systems", json={"service": "clearcut", "name": "x", "system_id": "../x", "api_key": "k"}).status_code == 422
 
 
 def test_upgrade_adds_new_columns_to_an_old_database(tmp_path):
@@ -1167,7 +1179,7 @@ SIGNED = "https://uploads.example.com/call/abc?signature=xyz"
 
 
 def bcfy_target(admin, slot=3, **overrides):
-    system = admin.post("/api/admin/broadcastify", json={"name": "Home", "system_id": 4242, "api_key": BCFY_KEY})
+    system = admin.post("/api/admin/upload-systems", json={"name": "Home", "system_id": 4242, "api_key": BCFY_KEY})
     assert system.status_code == 201
     target = admin.post("/api/targets", json={
         "name": "Fire Dispatch", "frequency_hz": 154_430_000, "modulation": "nfm",
@@ -1286,7 +1298,7 @@ async def test_broadcastify_never_stores_the_key_or_signed_address(admin, ctx, t
 
 async def test_broadcastify_only_uses_the_targets_system_and_slot(admin, ctx, tmp_path):
     bcfy_target(admin, slot=3)
-    second = admin.post("/api/admin/broadcastify", json={"name": "Field", "system_id": 77, "api_key": "other-key"}).json()["id"]
+    second = admin.post("/api/admin/upload-systems", json={"name": "Field", "system_id": 77, "api_key": "other-key"}).json()["id"]
     target = admin.post("/api/targets", json={
         "name": "Other", "frequency_hz": 441_000_000, "modulation": "nfm",
         "broadcastify_enabled": True, "broadcastify_system_ref": second, "broadcastify_slot": 9,
@@ -1308,14 +1320,14 @@ def test_target_without_broadcastify_queues_no_job(admin, ctx, tmp_path):
     {"broadcastify_system_ref": None}, {"broadcastify_slot": None}, {"broadcastify_system_ref": 99}, {"broadcastify_slot": 0},
 ])
 def test_broadcastify_target_settings_are_validated(admin, bad):
-    system = admin.post("/api/admin/broadcastify", json={"name": "H", "system_id": 1, "api_key": "k"}).json()["id"]
+    system = admin.post("/api/admin/upload-systems", json={"name": "H", "system_id": 1, "api_key": "k"}).json()["id"]
     body = {"name": "T", "frequency_hz": 441_000_000, "modulation": "nfm", "broadcastify_enabled": True,
             "broadcastify_system_ref": system, "broadcastify_slot": 1}
     assert admin.post("/api/targets", json={**body, **bad}).status_code == 422
 
 
 def test_adsb_target_cannot_upload_to_broadcastify(admin):
-    system = admin.post("/api/admin/broadcastify", json={"name": "H", "system_id": 1, "api_key": "k"}).json()["id"]
+    system = admin.post("/api/admin/upload-systems", json={"name": "H", "system_id": 1, "api_key": "k"}).json()["id"]
     assert admin.post("/api/targets", json={
         "name": "A", "kind": "adsb", "frequency_hz": 1_090_000_000, "modulation": "adsb",
         "broadcastify_enabled": True, "broadcastify_system_ref": system, "broadcastify_slot": 1,
@@ -1325,12 +1337,12 @@ def test_adsb_target_cannot_upload_to_broadcastify(admin):
 def test_broadcastify_keys_are_sealed_and_never_returned(admin, ctx, app):
     system, _ = bcfy_target(admin)
     with ctx.db() as session:
-        assert BCFY_KEY not in session.get(BroadcastifySystem, system).api_key_sealed
+        assert BCFY_KEY not in session.get(UploadSystem, system).api_key_sealed
     add_user(ctx, "op@example.com", role="operator")
     operator = client_for(app, "op@example.com")
-    for reply in (admin.get("/api/admin/broadcastify"), operator.get("/api/broadcastify-systems"), admin.get("/api/targets"), admin.get("/api/admin/audit")):
+    for reply in (admin.get("/api/admin/upload-systems"), operator.get("/api/upload-systems"), admin.get("/api/targets"), admin.get("/api/admin/audit")):
         assert reply.status_code == 200 and BCFY_KEY not in reply.text
-    assert operator.get("/api/broadcastify-systems").json()[0]["system_id"] == 4242
+    assert operator.get("/api/upload-systems").json()[0]["system_id"] == 4242
 
 
 def test_only_admins_manage_broadcastify_systems(admin, ctx, app):
@@ -1339,30 +1351,30 @@ def test_only_admins_manage_broadcastify_systems(admin, ctx, app):
     add_user(ctx, "l@example.com")
     operator, listener = client_for(app, "op@example.com"), client_for(app, "l@example.com")
     for client in (operator, listener):
-        assert client.get("/api/admin/broadcastify").status_code == 403
-        assert client.post("/api/admin/broadcastify", json={"name": "x", "system_id": 1, "api_key": "k"}).status_code == 403
-        assert client.delete(f"/api/admin/broadcastify/{system}").status_code == 403
-        assert client.post(f"/api/admin/broadcastify/{system}/test").status_code == 403
-    assert listener.get("/api/broadcastify-systems").status_code == 403
-    assert client_for(app).get("/api/broadcastify-systems").status_code == 401
+        assert client.get("/api/admin/upload-systems").status_code == 403
+        assert client.post("/api/admin/upload-systems", json={"name": "x", "system_id": 1, "api_key": "k"}).status_code == 403
+        assert client.delete(f"/api/admin/upload-systems/{system}").status_code == 403
+        assert client.post(f"/api/admin/upload-systems/{system}/test").status_code == 403
+    assert listener.get("/api/upload-systems").status_code == 403
+    assert client_for(app).get("/api/upload-systems").status_code == 401
 
 
 def test_editing_a_system_keeps_its_key_unless_replaced(admin, ctx):
     system, _ = bcfy_target(admin)
-    assert admin.put(f"/api/admin/broadcastify/{system}", json={"name": "New", "system_id": 5}).status_code == 200
+    assert admin.put(f"/api/admin/upload-systems/{system}", json={"name": "New", "system_id": 5}).status_code == 200
     with ctx.db() as session:
-        assert ctx.secrets.open(session.get(BroadcastifySystem, system).api_key_sealed) == BCFY_KEY
-    admin.put(f"/api/admin/broadcastify/{system}", json={"name": "New", "system_id": 5, "api_key": "replaced"})
+        assert ctx.secrets.open(session.get(UploadSystem, system).api_key_sealed) == BCFY_KEY
+    admin.put(f"/api/admin/upload-systems/{system}", json={"name": "New", "system_id": 5, "api_key": "replaced"})
     with ctx.db() as session:
-        assert ctx.secrets.open(session.get(BroadcastifySystem, system).api_key_sealed) == "replaced"
-    assert admin.post("/api/admin/broadcastify", json={"name": "No key", "system_id": 1}).status_code == 422
+        assert ctx.secrets.open(session.get(UploadSystem, system).api_key_sealed) == "replaced"
+    assert admin.post("/api/admin/upload-systems", json={"name": "No key", "system_id": 1}).status_code == 422
 
 
 def test_a_system_in_use_cannot_be_deleted(admin):
     system, target = bcfy_target(admin)
-    assert admin.delete(f"/api/admin/broadcastify/{system}").status_code == 409
+    assert admin.delete(f"/api/admin/upload-systems/{system}").status_code == 409
     admin.delete(f"/api/targets/{target}")
-    assert admin.delete(f"/api/admin/broadcastify/{system}").status_code == 200
+    assert admin.delete(f"/api/admin/upload-systems/{system}").status_code == 200
 
 
 def test_credential_check_sends_no_call_and_hides_the_key(admin, ctx):
@@ -1375,7 +1387,7 @@ def test_credential_check_sends_no_call_and_hides_the_key(admin, ctx):
         return httpx.Response(200, text=f"100 bad key {BCFY_KEY} {SIGNED}")
 
     ctx.http_transport = httpx.MockTransport(handler)
-    reply = admin.post(f"/api/admin/broadcastify/{system}/test")
+    reply = admin.post(f"/api/admin/upload-systems/{system}/test")
     assert reply.status_code == 200 and "100 bad key" in reply.json()["reply"]
     assert BCFY_KEY not in reply.text and "signature" not in reply.text
     fields = form_fields(seen[0])
@@ -1396,7 +1408,7 @@ def test_a_database_from_before_broadcastify_upgrades_and_keeps_its_targets(tmp_
     with make_session_factory(db)() as session:
         target = session.scalar(select(Target))
         assert target.name == "Old" and not target.broadcastify_enabled and target.broadcastify_slot is None
-        session.add(BroadcastifySystem(name="n", system_id=1, api_key_sealed="x"))
+        session.add(UploadSystem(name="n", system_id=1, api_key_sealed="x"))
         session.commit()
 
 
@@ -1468,7 +1480,7 @@ def test_a_slot_can_only_belong_to_one_target(admin):
     reply = admin.post("/api/targets", json=second_slot_body(system))
     assert reply.status_code == 409 and "Fire Dispatch" in reply.json()["detail"]
     assert admin.post("/api/targets", json=second_slot_body(system, slot=4)).status_code == 201
-    other = admin.post("/api/admin/broadcastify", json={"name": "B", "system_id": 2, "api_key": "k"}).json()["id"]
+    other = admin.post("/api/admin/upload-systems", json={"name": "B", "system_id": 2, "api_key": "k"}).json()["id"]
     assert admin.post("/api/targets", json=second_slot_body(other, slot=3)).status_code == 201
 
 
@@ -1552,7 +1564,8 @@ def test_a_different_channel_at_the_same_time_is_not_a_duplicate(admin, ctx, tmp
 
 def test_a_skipped_clearcut_copy_is_not_matched_for_a_transcript(admin, ctx, tmp_path):
     target = admin.post("/api/targets", json={
-        "name": "T", "frequency_hz": 154_430_000, "modulation": "nfm", "clearcut_enabled": True, "clearcut_system": "s", "clearcut_id": 5,
+        "name": "T", "frequency_hz": 154_430_000, "modulation": "nfm", "clearcut_enabled": True,
+        "clearcut_system_ref": upload_system(admin, "clearcut", "s"), "clearcut_id": 5,
     }).json()["id"]
     overlap_call(ctx, target, tmp_path, "SER1", 1_800_000_000.0)
     second = overlap_call(ctx, target, tmp_path, "SER2", 1_800_000_000.0)
@@ -1816,8 +1829,8 @@ async def test_broadcastify_sends_the_newest_call_first(admin, ctx, tmp_path):
 
 
 async def test_the_broadcastify_lane_leaves_other_destinations_alone(admin, ctx, tmp_path):
-    admin.patch("/api/admin/settings", json={"clearcut_server": "https://cc.example.com", "clearcut_api_key": "k"})
-    _, target = bcfy_target(admin, clearcut_enabled=True, clearcut_system="sys", clearcut_id=5)
+    admin.patch("/api/admin/settings", json={"clearcut_server": "https://cc.example.com"})
+    _, target = bcfy_target(admin, clearcut_enabled=True, clearcut_system_ref=upload_system(admin, "clearcut", "sys"), clearcut_id=5)
     call = bcfy_recording(ctx, target, tmp_path, started=time.time() - 5, duration=2)
     seen = []
     async with httpx.AsyncClient(transport=bcfy_transport(seen)) as client:
@@ -1831,8 +1844,8 @@ async def test_the_broadcastify_lane_leaves_other_destinations_alone(admin, ctx,
 
 async def test_a_hung_clearcut_no_longer_makes_broadcastify_late(admin, ctx, tmp_path):
     """What happened in production: ClearCut timed out on every call, and Broadcastify, queued behind it, refused them all as late."""
-    admin.patch("/api/admin/settings", json={"clearcut_server": "https://cc.example.com", "clearcut_api_key": "k"})
-    _, target = bcfy_target(admin, clearcut_enabled=True, clearcut_system="sys", clearcut_id=5)
+    admin.patch("/api/admin/settings", json={"clearcut_server": "https://cc.example.com"})
+    _, target = bcfy_target(admin, clearcut_enabled=True, clearcut_system_ref=upload_system(admin, "clearcut", "sys"), clearcut_id=5)
     call = bcfy_recording(ctx, target, tmp_path, started=time.time() - 3, duration=2)
 
     async def handler(request):
@@ -1874,10 +1887,9 @@ async def test_each_destination_has_its_own_lane(ctx, monkeypatch):
 
 async def test_other_uploads_still_back_off_slowly(admin, ctx, tmp_path):
     target = admin.post("/api/targets", json={"name": "T", "frequency_hz": 441_000_000, "modulation": "nfm",
-                                              "rdio_enabled": True, "rdio_system": 1, "rdio_talkgroup": 1}).json()["id"]
+                                              "rdio_enabled": True, "rdio_system_ref": upload_system(admin, "rdio", 1), "rdio_talkgroup": 1}).json()["id"]
     call = bcfy_recording(ctx, target, tmp_path)
     ctx.set_setting("rdio_server", "https://rdio.example.com")
-    ctx.set_setting("rdio_api_key", ctx.secrets.seal("k"))
     await run_bcfy(ctx, [], post_status=500)
     with ctx.db() as session:
         job = session.scalar(select(UploadJob).where(UploadJob.recording_id == call))

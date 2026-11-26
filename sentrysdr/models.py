@@ -170,26 +170,47 @@ class Target(Base):
     squelch_db: Mapped[float | None] = mapped_column(nullable=True)
     volume_db: Mapped[float | None] = mapped_column(nullable=True)  # applied to the audio
     clearcut_enabled: Mapped[bool] = mapped_column(default=False)
+    # Retired: the ClearCut and RDIO system IDs, typed on each target. Now an UploadSystem each.
     clearcut_system: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    clearcut_system_ref: Mapped[int | None] = mapped_column(nullable=True)  # UploadSystem.id
     clearcut_id: Mapped[int | None] = mapped_column(nullable=True)  # talkgroup number
     rdio_enabled: Mapped[bool] = mapped_column(default=False)
-    rdio_system: Mapped[int | None] = mapped_column(nullable=True)
+    rdio_system: Mapped[int | None] = mapped_column(nullable=True)  # retired, as clearcut_system
+    rdio_system_ref: Mapped[int | None] = mapped_column(nullable=True)  # UploadSystem.id
     rdio_talkgroup: Mapped[int | None] = mapped_column(nullable=True)
     broadcastify_enabled: Mapped[bool | None] = mapped_column(nullable=True)
-    broadcastify_system_ref: Mapped[int | None] = mapped_column(nullable=True)  # BroadcastifySystem.id
+    broadcastify_system_ref: Mapped[int | None] = mapped_column(nullable=True)  # UploadSystem.id
     broadcastify_slot: Mapped[int | None] = mapped_column(nullable=True)  # the node's frequency slot
     acars_channels: Mapped[list | None] = mapped_column(JSON, nullable=True)  # Hz; frequency_hz is the lowest
     airframes_enabled: Mapped[bool | None] = mapped_column(nullable=True)  # feed messages to airframes.io
     feeds: Mapped[dict | None] = mapped_column(JSON, nullable=True)  # ADS-B and AIS sharing, see feeds.clean
 
 
-class BroadcastifySystem(Base):
-    """One Broadcastify Calls node. Its API key is sealed and never leaves the server."""
+UPLOAD_SERVICES = ("broadcastify", "clearcut", "rdio")
+
+
+class UploadSystem(Base):
+    """One system on an upload service: a Broadcastify Calls node, a ClearCut system or an
+    RDIO Scanner system. Its API key is sealed and never leaves the server.
+
+    The table is named for Broadcastify, which had systems first.
+    """
     __tablename__ = "broadcastify_systems"
     id: Mapped[int] = mapped_column(primary_key=True)
+    service: Mapped[str | None] = mapped_column(String(16), nullable=True)  # UPLOAD_SERVICES; None is broadcastify
     name: Mapped[str] = mapped_column(String(120))
-    system_id: Mapped[int] = mapped_column()
-    api_key_sealed: Mapped[str] = mapped_column(String(2000))
+    system_id: Mapped[int] = mapped_column()  # Broadcastify's and RDIO's number; 0 for ClearCut
+    code: Mapped[str | None] = mapped_column(String(64), nullable=True)  # ClearCut's system ID, such as us-ny-monroe
+    api_key_sealed: Mapped[str] = mapped_column(String(2000))  # empty when moved from settings without a key
+
+    @property
+    def kind(self) -> str:
+        return self.service or "broadcastify"
+
+    @property
+    def label(self) -> str | int:
+        """The service's own ID for the system: ClearCut's is text, the others' a number."""
+        return (self.code or "") if self.kind == "clearcut" else self.system_id
 
 
 class SdrProfile(Base):
@@ -486,6 +507,35 @@ def _convert_squelch_to_db(engine) -> None:
             )
 
 
+def _move_upload_keys_to_systems(engine) -> None:
+    """ClearCut and RDIO used to have one API key each, in settings, and a system ID typed on
+    each target. Make an upload system for each system ID in use, holding that key.
+
+    Each converted target has its old system ID set to NULL, so this runs once per target.
+    Keys are copied still sealed. The settings are removed, as nothing reads them now.
+    """
+    services = (("rdio", "rdio_system", "rdio_system_ref"), ("clearcut", "clearcut_system", "clearcut_system_ref"))
+    with engine.begin() as connection:
+        connection.execute(text("UPDATE broadcastify_systems SET service = 'broadcastify' WHERE service IS NULL"))
+        sealed = dict(connection.execute(text(
+            "SELECT key, value FROM settings WHERE key IN ('rdio_api_key', 'clearcut_api_key')")).all())
+        for service, old, ref in services:
+            made: dict[str, int] = {}
+            rows = connection.execute(text(f"SELECT id, {old} FROM targets WHERE {old} IS NOT NULL AND {old} != ''")).all()
+            for target_id, value in rows:
+                value = str(value)
+                if value not in made:
+                    numbered = service == "rdio"
+                    made[value] = connection.execute(UploadSystem.__table__.insert().values(
+                        service=service, name=(f"RDIO system {value}" if numbered else f"ClearCut {value}")[:120],
+                        system_id=int(value) if numbered else 0, code=None if numbered else value[:64],
+                        api_key_sealed=sealed.get(f"{service}_api_key", ""),
+                    )).inserted_primary_key[0]
+                connection.execute(text(f"UPDATE targets SET {ref} = :r, {old} = NULL WHERE id = :t"),
+                                   {"r": made[value], "t": target_id})
+        connection.execute(text("DELETE FROM settings WHERE key IN ('rdio_api_key', 'clearcut_api_key')"))
+
+
 def _drop_retired_uses(engine) -> None:
     """Some stick uses were removed from the app. Take them off sticks that had them."""
     from .capabilities import RETIRED_USES
@@ -552,6 +602,7 @@ def make_session_factory(db_path: Path):
     _retire_lock_passwords(engine)
     _convert_source_antennas(engine)
     _convert_squelch_to_db(engine)
+    _move_upload_keys_to_systems(engine)
     _drop_retired_uses(engine)
     _fill_feeder_uuids(engine)
     _fill_rtl_tcp_ports(engine)
