@@ -123,7 +123,7 @@
   <fieldset>
     <legend>Email alerts</legend>
     {#if !email.server_enabled}
-      <p class="small">Email alerts aren't turned on on this server. An admin can set them up under Admin, Email. Your keywords still flag calls and messages here.</p>
+      <p class="small">Email alerts aren't set up on this server.</p>
     {:else}
       <label class="tick"><input type="checkbox" checked={email.enabled} disabled={saving} onchange={(event) => saveEmail({ enabled: event.target.checked })} /> Email me alerts</label>
       <p class="small">
@@ -131,7 +131,7 @@
         {#if email.confirmed}<span class="st-ok">confirmed</span>.
         {:else if email.waiting}<span class="st-warn">waiting for you to open the confirmation link</span>.
         {:else}<span class="st-warn">not confirmed yet</span>.{/if}
-        Only you get these. Change the address under <a href="#/account">My account</a>; a new address needs confirming again.
+        Change it under <a href="#/account">My account</a>.
       </p>
       {#if email.enabled && !email.confirmed}
         <div class="buttons"><button type="button" onclick={resend}>Send the confirmation link again</button></div>
@@ -141,10 +141,9 @@
           <select value={email.window} onchange={(event) => saveEmail({ window: Number(event.target.value) })}>
             {#each email.windows as minutes (minutes)}<option value={minutes}>At most one email every {minutes === 60 ? 'hour' : `${minutes} minutes`}</option>{/each}
           </select>
-          <span class="hint">The first alert is emailed straight away. Anything else in that time comes together in the next email.</span>
+          <span class="hint">Later alerts are grouped into the next email.</span>
         </label>
         <label class="tick"><input type="checkbox" checked={email.important} onchange={(event) => saveEmail({ important: event.target.checked })} /> Also when someone marks a call or message important</label>
-        <p class="small dim">Emails list each call or message with its transcript or text, and a link to it here. You need to be signed in to play it. Each email has a link to turn them off.</p>
       {/if}
     {/if}
   </fieldset>
@@ -153,7 +152,7 @@
 <form onsubmit={addKeyword}>
   <fieldset>
     <legend>Keywords</legend>
-    <p class="small">Calls whose transcript, or ACARS messages whose text, contains one of these are flagged as important for you here, and listed under New alerts. Whole words or phrases, ignoring case: "fire" matches "Fire!" but not "firefighter". Calls only match once they have a transcript. Only you see your keywords.</p>
+    <p class="small">Whole words, any case, in call transcripts and ACARS text. Only you see them.</p>
     {#each keywordList as keyword (keyword.id)}
       <div class="keyword-row">
         <span><span class="mono">{keyword.word}</span> <span class="small dim">{APPLIES[keyword.applies]}</span></span>
@@ -180,7 +179,7 @@
   <form onsubmit={(event) => { event.preventDefault(); addWatch({ kind: 'channel', target_id: Number(newChannel) }, () => (newChannel = '')); }}>
     <fieldset>
       <legend>Channels to email about</legend>
-      <p class="small">An email for every call on these, transcript or not. A busy channel sends a lot: the gap above still applies.</p>
+      <p class="small">An email for every call.</p>
       {#each channels as watch (watch.id)}
         <div class="keyword-row"><span>{watch.label}</span><button type="button" onclick={() => removeWatch(watch)}>Remove</button></div>
       {:else}
@@ -201,7 +200,7 @@
   <form onsubmit={(event) => { event.preventDefault(); addWatch({ kind: 'toneout', value: newToneOut }, () => (newToneOut = '')); }}>
     <fieldset>
       <legend>Tone-outs to email about</legend>
-      <p class="small">An email as soon as a call with one of these pages is saved, without waiting for the gap above. Pages are only heard on channels set to decode tone-outs.</p>
+      <p class="small">Emailed straight away. Only heard on targets that decode tone-outs.</p>
       {#each pages as watch (watch.id)}
         <div class="keyword-row"><span>{watch.label}</span><button type="button" onclick={() => removeWatch(watch)}>Remove</button></div>
       {:else}
@@ -213,7 +212,7 @@
           {#if !pages.some((w) => w.value === 'any')}<option value="any">Any tone-out, named or not</option>{/if}
           {#each unfollowed as row (row.id)}<option value={String(row.id)}>{row.name} ({row.a_hz}{row.b_hz ? ` / ${row.b_hz}` : ''} Hz)</option>{/each}
         </select>
-        {#if !toneOuts.length}<span class="hint">An administrator lists stations' tones under Admin &gt; Tone-outs.</span>{/if}
+        {#if !toneOuts.length}<span class="hint">None listed under Admin &gt; Tone-outs yet.</span>{/if}
       </label>
       <div class="buttons form-buttons"><button class="main" disabled={!newToneOut}>Add tone-out</button></div>
     </fieldset>
@@ -223,7 +222,7 @@
 {#if emergency}
   <fieldset>
     <legend>Aircraft and ship emergencies</legend>
-    <p class="small">Which ones show under New alerts{email?.server_enabled ? ', and are emailed if you tick that below' : ''}. Every one is still recorded under Emergencies. An aircraft squawk counts after 10 seconds, so a passing misreading doesn't alert you.</p>
+    <p class="small">Which ones alert you. All are still listed under Emergencies.</p>
     {#each GROUPS as [group, heading] (group)}
       <div class="small dim" style="margin-top:.4rem">{heading}</div>
       {#each emergency.codes.filter((c) => c.kind === group) as c (c.code)}
@@ -235,11 +234,11 @@
         <option value="">Anywhere a receiver hears</option>
         {#each emergency.distances as km (km)}<option value={km}>Within {km} km</option>{/each}
       </select>
-      <span class="hint">From the SDR that heard it. One without a location set can't be measured, so what it hears always counts.</span>
+      <span class="hint">From the SDR that heard it. SDRs without a location always count.</span>
     </label>
     {#if email?.server_enabled}
       <label class="tick"><input type="checkbox" checked={emergency.email} onchange={(event) => saveEmergency({ email: event.target.checked })} /> Email me about these straight away</label>
-      <p class="small dim">Straight away even inside your gap between emails, with anything else waiting. Needs email alerts turned on above.</p>
+      <p class="small dim">Sent straight away.</p>
     {/if}
   </fieldset>
 {/if}
@@ -248,7 +247,7 @@
   <form onsubmit={(event) => { event.preventDefault(); addWatch({ kind: 'aircraft', value: newAircraft }, () => (newAircraft = '')); }}>
     <fieldset>
       <legend>Aircraft to email about</legend>
-      <p class="small">An email for every ACARS message from these. Use the registration or flight as the Messages page shows it, like N123UA or UA0123.</p>
+      <p class="small">An email for every ACARS message, by registration or flight (N123UA, UA0123).</p>
       {#each aircraft as watch (watch.id)}
         <div class="keyword-row"><span class="mono">{watch.label}</span><button type="button" onclick={() => removeWatch(watch)}>Remove</button></div>
       {:else}

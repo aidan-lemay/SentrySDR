@@ -51,7 +51,7 @@
   });
 </script>
 
-<p class="small">Every emergency any receiver has seen, kept as long as ACARS messages. A squawk counts once an aircraft has shown it for 10 seconds; AIS beacons and statuses count at once. Choose which ones alert you under Keywords and email.</p>
+<p class="small">Every emergency any receiver has seen. Choose which alert you under Alerts &gt; Settings.</p>
 {#if error}<div class="err" role="alert">{error}</div>{/if}
 <label class="field"><span>Show</span>
   <select value={kind} onchange={(event) => choose({ kind: event.target.value })}>

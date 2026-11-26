@@ -437,8 +437,8 @@
                       <label class="tick"><input type="radio" name={`mode-${source.id}`} checked={source.multichannel} disabled={source.locked && !isAdmin} onchange={() => setMultichannel(source, true)} /> Multi-channel</label>
                     </div>
                     <span class="hint">{source.multichannel
-                      ? 'Records several NFM, FM and AM targets at once, if they fit within about 2 MHz. One gain for the whole SDR; each channel keeps its own squelch.'
-                      : 'One target, recorded with rtl_fm. Choose multi-channel to record several voice targets that fit within this SDR\'s span.'}</span>
+                      ? 'Several NFM, FM and AM targets within about 2 MHz.'
+                      : 'One target, with rtl_fm.'}</span>
                   </div>
                   {#if source.multichannel}
                     {#each source.channels as ch (ch.target_id)}
@@ -469,7 +469,7 @@
                           <option value={target.id}>{target.name} ({formatMHz(target.frequency_hz)}, {MODE_LABELS[target.modulation] ?? target.modulation.toUpperCase()}){problemNote(source, target)}</option>
                         {/each}
                       </select>
-                      <span class="hint">NFM, FM and AM targets. One that doesn't fit with the others is refused, with the reason.</span>
+                      <span class="hint">NFM, FM and AM targets.</span>
                     </label>
                     <div class="buttons form-buttons"><button class="main" disabled={!draft.channel || (source.locked && !isAdmin)} onclick={() => addChannel(source)}>Add channel</button></div>
                   {:else}
@@ -483,12 +483,12 @@
                     {#if draft.target !== '' && stickProblems(source, targets.find((t) => t.id === Number(draft.target))).length}
                       <span class="hint st-warn">This SDR may not suit that target: {stickProblems(source, targets.find((t) => t.id === Number(draft.target))).join(', ')}. You can still assign it.</span>
                     {:else if draft.target !== '' && antennaUsable(source, targets.find((t) => t.id === Number(draft.target)))}
-                      <span class="hint">Its antenna is usable at that frequency, but not ideal.</span>
+                      <span class="hint">Its antenna isn't ideal at that frequency.</span>
                     {/if}
                   </label>
                   <div class="buttons form-buttons"><button class="main" disabled={source.locked && !isAdmin} onclick={() => assign(source)}>Assign</button></div>
                   {/if}
-                  {#if source.locked && !isAdmin}<p class="small st-warn">This assignment is locked. Only an administrator can change it.</p>{/if}
+                  {#if source.locked && !isAdmin}<p class="small st-warn">Locked by an administrator.</p>{/if}
                   {#if isAdmin}
                     <div class="form-buttons">
                       <label class="tick"><input type="checkbox" checked={source.locked} disabled={!source.base_recorder_id} onchange={(event) => setLocked(source, event.target)} /> Lock this assignment, so only administrators can change it</label>
@@ -500,7 +500,7 @@
                 {#if !source.active_target || source.active_target.kind === 'audio' || source.profiles.length}
                 <details>
                   <summary class="small" style="padding:.3rem 0">Squelch profiles{source.profiles.length ? ` (${source.profiles.length} saved)` : ''}</summary>
-                  <p class="small dim form-buttons">Noise differs by stick, frequency and gain. A saved profile sets the squelch and gain for one target on this SDR.</p>
+                  <p class="small dim form-buttons">A profile sets squelch and gain for one target on this SDR.</p>
                   {#each source.profiles as saved (saved.target_id)}
                     <div class="small" style="margin:.4rem 0">
                       <strong>{targetName(saved.target_id)}</strong>: squelch {saved.squelch == null ? 'off' : `${saved.squelch} dB`}, gain {gainLabel(saved.gain_db)}{saved.noise_level !== null ? `, noise ${saved.noise_level} dB on ${formatTime(saved.measured_at)}` : ''}
@@ -518,13 +518,13 @@
                   {#if source.multichannel}
                     <div class="field"><span>Gain</span>
                       <span class="mono">{gainLabel(source.gain_db)}</span>
-                      <span class="hint">A multi-channel SDR has one gain for all its channels: this SDR's, set under Admin &gt; SDR sources. A profile's squelch applies per channel. A running channel is measured live, without pausing the others.</span>
+                      <span class="hint">Multi-channel SDRs use one gain, set under Admin &gt; SDR sources.</span>
                     </div>
                   {:else}
                   <label class="field"><span>Gain (dB)</span>
                     <GainField steps={source.gain_steps} bind:value={m.gain} />
                     {#if nearestStep(source.gain_steps, m.gain) !== null}<span class="hint st-warn">Not one of this stick's gain steps. It will use {nearestStep(source.gain_steps, m.gain)} dB. Choose a step to save.</span>{/if}
-                    <span class="hint">{source.gain_steps.length ? 'AGC is automatic gain.' : 'Leave empty for automatic gain (AGC). 0 means a real 0 dB, which may miss most calls.'} A fixed gain usually gives a steadier noise level.</span>
+                    <span class="hint">{source.gain_steps.length ? 'AGC is automatic gain.' : 'Empty is automatic gain (AGC).'}</span>
                   </label>
                   {/if}
                   <p class="small dim form-buttons">Measure while nothing is transmitting on this frequency.</p>
@@ -538,7 +538,7 @@
                   {/if}
                   <label class="field"><span>Squelch (dB)</span>
                     <input class="mono" type="number" min="-130" max="0" step="0.1" bind:value={m.squelch} />
-                    <span class="hint">The same scale as the web tuner's signal meter and squelch.</span>
+                    <span class="hint">Same scale as the tuner's meter.</span>
                   </label>
                   <div class="buttons form-buttons"><button class="main" disabled={m.target === '' || m.squelch === '' || m.squelch === null} onclick={() => saveProfile(source)}>Save profile</button></div>
                 </details>
