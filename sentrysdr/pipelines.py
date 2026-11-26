@@ -230,6 +230,7 @@ def _clean_channel(raw: dict) -> dict:
     }
     channel["tone_filter"] = clean_tone_filter(raw.get("tone_filter"), channel["modulation"])
     channel["tone_squelch"] = clean_tone_squelch(raw.get("tone_squelch"), channel["modulation"])
+    channel["level_calls"] = bool(raw.get("level_calls"))
     if channel["modulation"] not in MULTI_MODES:
         raise SpecError("bad channel modulation")
     if channel["squelch"] is not None and not SQUELCH_DB_MIN <= channel["squelch"] <= SQUELCH_DB_MAX:
@@ -269,6 +270,7 @@ def sanitize_spec(spec: dict) -> dict:
         raise SpecError("volume out of range")
     clean["tone_filter"] = clean_tone_filter(spec.get("tone_filter"), clean["modulation"])
     clean["tone_squelch"] = clean_tone_squelch(spec.get("tone_squelch"), clean["modulation"])
+    clean["level_calls"] = bool(spec.get("level_calls"))
     if clean["kind"] not in ("audio", "adsb", "ais", "acars", "rtltcp", "tuner", "multi"):
         raise SpecError("bad kind")
     if clean["kind"] == "multi":
@@ -539,12 +541,51 @@ def ais_args(cfg: Config, index: int, spec: dict) -> list[str]:
     return args + feeds.ais_args(spec.get("feeds") or {})
 
 
-def encode_args(cfg: Config, raw_path: str, rate: int, out_path: str) -> list[str]:
+def encode_args(cfg: Config, raw_path: str, rate: int, out_path: str, gain_db: float = 0.0) -> list[str]:
+    level = ["-af", f"volume={gain_db:.2f}dB"] if gain_db else []  # a call's level, from call_level_gain
     return [
         cfg.binary("ffmpeg") or "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
         "-f", "s16le", "-ar", str(rate), "-ac", "1", "-i", raw_path,
-        "-codec:a", "libmp3lame", "-b:a", "32k", out_path,
+        *level, "-codec:a", "libmp3lame", "-b:a", "32k", out_path,
     ]
+
+
+# Evening out call levels: one gain per call, so a hot mic and a weak portable come out alike.
+# Not a compressor, so nothing pumps. Measured on speech, not the gaps, and never so far that
+# peaks clip or a noisy call's hiss is turned right up.
+LEVEL_TARGET_DB = -20.0  # speech's RMS, against full scale
+LEVEL_MAX_BOOST_DB = 12.0
+LEVEL_MAX_CUT_DB = 12.0
+LEVEL_PEAK_DB = -1.0
+LEVEL_FRAME_SECONDS = 0.02
+LEVEL_SPEECH_BELOW_DB = 20.0  # frames this far under the loudest (95th percentile) are gaps
+LEVEL_SILENCE = 1e-4  # quieter than this is nothing to level
+
+
+def call_level_gain(pcm: bytes, rate: int, volume_db: float = 0.0) -> float:
+    """dB to bring a call's speech to LEVEL_TARGET_DB, plus the target's volume as a trim."""
+    samples = array("h")
+    samples.frombytes(pcm[: len(pcm) & ~1])
+    if sys.byteorder == "big":
+        samples.byteswap()
+    frame = max(1, int(LEVEL_FRAME_SECONDS * rate))
+    powers = []
+    peak = 0
+    for start in range(0, len(samples) - frame + 1, frame):
+        chunk = samples[start:start + frame]
+        powers.append(sum(v * v for v in chunk) / frame)
+        peak = max(peak, max(chunk), -min(chunk))
+    if not powers or peak == 0:
+        return 0.0
+    ordered = sorted(powers)
+    loud = ordered[min(len(ordered) - 1, int(0.95 * len(ordered)))]
+    speech = [p for p in powers if p >= loud * 10 ** (-LEVEL_SPEECH_BELOW_DB / 10)]
+    rms = math.sqrt(sum(speech) / len(speech)) / 32768
+    if rms < LEVEL_SILENCE:
+        return 0.0
+    gain = LEVEL_TARGET_DB + volume_db - 20 * math.log10(rms)
+    headroom = LEVEL_PEAK_DB - 20 * math.log10(peak / 32768)
+    return round(max(-LEVEL_MAX_CUT_DB, min(gain, LEVEL_MAX_BOOST_DB, headroom)), 2)
 
 
 def live_encoder_args(cfg: Config, rate: int) -> list[str]:

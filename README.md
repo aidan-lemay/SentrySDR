@@ -524,6 +524,17 @@ How it works:
 
 The tag shows on each recording.
 
+### Call levels
+
+A target's **Even out each call's level** brings every recorded call to the same level, so a hot mic next to a weak portable doesn't make listeners reach for the volume on Broadcastify or ClearCut.
+
+- Each call gets one gain, worked out when it ends from its speech, not the gaps between words, so nothing pumps the way a compressor would.
+- Speech goes to -20 dBFS, plus the target's **Volume**, which still trims it.
+- At most 12 dB up or 12 dB down, and never so far that a peak goes over -1 dBFS.
+- It's applied by the ffmpeg command that already encodes the MP3, so it costs almost nothing: one look over the call's samples.
+- Recordings and uploads only. Live audio is heard as it comes in, before a call has ended, so it keeps the fixed Volume.
+- New audio targets start with it on, and targets from before it start off.
+
 ### Upload systems
 
 Broadcastify Calls, ClearCut and RDIO Scanner are set up the same way:

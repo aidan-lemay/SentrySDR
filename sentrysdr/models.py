@@ -171,6 +171,7 @@ class Target(Base):
     volume_db: Mapped[float | None] = mapped_column(nullable=True)  # applied to the audio
     tone_filter: Mapped[str | None] = mapped_column(String(8), nullable=True)  # pipelines.TONE_FILTERS; None is off
     tone_squelch: Mapped[str | None] = mapped_column(String(12), nullable=True)  # subaudible.clean_rule; None is off
+    level_calls: Mapped[bool | None] = mapped_column(nullable=True)  # even out each call's level: pipelines.call_level_gain
     clearcut_enabled: Mapped[bool] = mapped_column(default=False)
     # Retired: the ClearCut and RDIO system IDs, typed on each target. Now an UploadSystem each.
     clearcut_system: Mapped[str | None] = mapped_column(String(64), nullable=True)

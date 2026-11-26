@@ -365,8 +365,13 @@ class CallWriter:
                          self.spec.get("tone_squelch"), subaudible.label(tone) or "no tone")
                 return
             mp3 = self.raw_path.with_suffix(".mp3")
+            gain = 0.0
+            if self.spec.get("level_calls"):
+                # The target's volume is already in the samples; adding it to the target keeps it as a trim.
+                gain = await asyncio.to_thread(pipelines.call_level_gain, self.raw_path.read_bytes(), self.rate,
+                                               self.spec.get("volume_db") or 0.0)
             proc = await asyncio.create_subprocess_exec(
-                *pipelines.encode_args(self.cfg, str(self.raw_path), self.rate, str(mp3)),
+                *pipelines.encode_args(self.cfg, str(self.raw_path), self.rate, str(mp3), gain),
                 stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
             )
             _, err = await proc.communicate()
@@ -936,7 +941,8 @@ class Worker:
         pcm = state["volume"](pcm, channel.get("volume_db", 0))
         if state["writer"] is None:
             call_spec = {**spec, **{k: channel[k] for k in ("recorder_id", "recorder_name", "target_id", "target_name",
-                                                           "frequency_hz", "modulation", "tone_squelch") if k in channel}}
+                                                           "frequency_hz", "modulation", "tone_squelch",
+                                                           "level_calls", "volume_db") if k in channel}}
             state["writer"] = CallWriter(cfg, call_spec, self.serial, pipelines.PCM_RATE, self.sup.tmp_dir, self.sup.call_sink,
                                          subaudio_rate=sub_rate)
             state["shown"] = False
