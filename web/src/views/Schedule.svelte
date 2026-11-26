@@ -88,7 +88,7 @@
 </script>
 
 <h1>Schedule</h1>
-<p class="small">A schedule takes over its source for the times shown, or on a multi-channel SDR can add a channel instead. Afterwards the source goes back to what it was doing, unless the schedule keeps its target.{tz ? ` Times are in ${tz}.` : ''}</p>
+{#if tz}<p class="small">Times are in {tz}.</p>{/if}
 
 {#if error}<div class="err" role="alert">{error}</div>{/if}
 {#if message}<Notice ondismiss={() => (message = '')}>{message}</Notice>{/if}
@@ -158,7 +158,7 @@
         {#if form.target_id !== '' && stickProblems(chosenSource, targets.find((t) => t.id === Number(form.target_id))).length}
           <span class="hint st-warn">{chosenSource.name} may not suit that target: {stickProblems(chosenSource, targets.find((t) => t.id === Number(form.target_id))).join(', ')}. You can still schedule it.</span>
         {:else if form.target_id !== '' && antennaUsable(chosenSource, targets.find((t) => t.id === Number(form.target_id)))}
-          <span class="hint">{chosenSource.name}'s antenna is usable at that frequency, but not ideal.</span>
+          <span class="hint">{chosenSource.name}'s antenna isn't ideal at that frequency.</span>
         {/if}
       </label>
       <div class="field"><span>Repeats</span>
@@ -171,7 +171,7 @@
         <label class="field"><span>Starts</span><input type="datetime-local" bind:value={form.onceStart} required /></label>
         <label class="field"><span>Ends</span>
           <input type="datetime-local" bind:value={form.onceEnd} min={form.onceStart || undefined} required />
-          <span class="hint">{tz ? `In ${tz}, the server's time zone.` : ''} Up to 31 days long. It stays listed as finished afterwards.</span>
+          <span class="hint">Up to 31 days.</span>
         </label>
       {:else}
         <label class="field"><span>Start time</span><input type="time" bind:value={form.start} required /></label>
@@ -192,8 +192,8 @@
             <option value="add">Add as a channel</option>
           </select>
           <span class="hint">{form.mode === 'add'
-            ? `${chosenSource.name} is multi-channel: this target joins its channels for the window, and they carry on. If it doesn't fit alongside them then, it takes the SDR over instead.`
-            : `Only this target runs on ${chosenSource.name} for the window. Its channels come back afterwards.`}</span>
+            ? `Joins ${chosenSource.name}'s channels, or takes it over if it doesn't fit.`
+            : `Its channels come back afterwards.`}</span>
         </label>
       {/if}
       <label class="field"><span>When it ends</span>
@@ -201,13 +201,13 @@
           <option value="return">Go back</option>
           <option value="keep">Keep this target</option>
         </select>
-        <span class="hint">{form.onEnd === 'keep' ? 'When the time runs out, this target becomes the source\'s normal assignment, even if it had none. Turning the schedule off early doesn\'t.' : (chosenSource && !chosenSource.base_target_id ? 'The source goes back to having no assignment.' : 'The source goes back to its normal assignment.')}</span>
+        {#if form.onEnd === 'keep'}<span class="hint">Becomes the source's normal assignment when it ends.</span>{/if}
       </label>
       <div class="field">
         <span>Enabled</span>
         <label class="tick"><input type="checkbox" bind:checked={form.enabled} /> Run this schedule</label>
       </div>
-      {#if selectedLocked}<p class="small st-warn">This source's assignment is locked. Only an administrator can change its schedule.</p>{/if}
+      {#if selectedLocked}<p class="small st-warn">Locked by an administrator.</p>{/if}
       <div class="buttons form-buttons">
         <button class="main" disabled={(form.repeat === 'weekly' && !form.days.length) || selectedLocked}>Save</button>
         {#if form.id}<button type="button" onclick={() => (form = blank())}>Cancel</button>{/if}

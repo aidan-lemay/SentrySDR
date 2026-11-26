@@ -19,7 +19,7 @@ from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Reque
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 
-from .. import BUILD_ID, __version__, aio, feeds, security
+from .. import BUILD_ID, __version__, aio, feeds, security, toneouts
 from ..config import SERIAL_RE
 from ..context import Context
 from ..engine import MeasureError
@@ -182,6 +182,9 @@ def _authenticate(ctx: Context, db, authorization: str | None) -> Node:
     return node
 
 
+TONE_LABEL_RE = re.compile(r"\d{2,3}\.\d Hz|DCS \d{3}[NI]")  # as subaudible.label
+
+
 def clean_meta(raw: dict, node: Node, db) -> dict:
     """Validate a slave's call metadata and tie it to that node's own source."""
     try:
@@ -199,6 +202,9 @@ def clean_meta(raw: dict, node: Node, db) -> dict:
             "ended_at": float(raw["ended_at"]),
             "duration": float(raw["duration"]),
         }
+        tone = raw.get("tone")
+        meta["tone"] = tone if isinstance(tone, str) and TONE_LABEL_RE.fullmatch(tone) else None
+        meta["pages"] = toneouts.clean_pages(raw.get("pages"))
     except (KeyError, TypeError, ValueError) as exc:
         raise HTTPException(422, "Invalid call metadata") from exc
     times = (meta["started_at"], meta["ended_at"])

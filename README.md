@@ -147,6 +147,7 @@ Each permission except the admin-only ones can be allowed or denied per user, un
 | Antennas | Antennas and their frequency ranges |
 | Nodes | Slaves: create a one-time enrollment token, or revoke a slave |
 | Settings | How long recordings, ACARS messages and emergencies, and audit logs are kept (0 keeps them forever); a size limit for recordings; sign-ups; the map tile server; a backup download |
+| Tone-outs | The fire and EMS pages SentrySDR names: each one's A and B tones, with CSV import. See [Tone-outs](#tone-outs) |
 | Uploads and feeds | The Broadcastify, ClearCut and RDIO server addresses; upload systems, each with its own ID and API key; the airframes.io station ID and address |
 | Email | The mail server for alert emails, and the daily limit. See [Email alerts](#email-alerts) |
 | Warnings | Every current health warning, including muted and hidden ones |
@@ -491,6 +492,63 @@ With nothing else running, `sentrysdr measure --serial <serial> --mhz 444.85 --m
 Set server URLs and keys in **Admin > Uploads and feeds**, then turn uploads on per target, in the Uploads box on the Targets page. Uploads go from the master, including calls recorded on slaves. Failed uploads retry with increasing delays, up to 12 attempts, and the result shows on each recording.
 
 A target's **Volume** setting applies to its recordings, uploads and live audio. It doesn't affect squelch. Any setting other than 0 dB also removes DC, which stops a tuning offset from clipping the start of a call.
+
+An NFM or FM target's **Filter mode** takes its CTCSS (PL) tone out of recordings, uploads and live audio, as a radio does before its speaker. Without it, the tone (67 to 254 Hz) is heard as a hum under every call, and ClearCut's tone decoder can mistake it for a paging tone.
+
+- **High (300 Hz, steep):** as sharp as a radio's filter. Every standard tone, up to 254.1 Hz, is at least 50 dB down, and voice from 300 Hz up is untouched.
+- **Medium (300 Hz):** a gentler slope. About 46 dB off a 179.9 Hz tone and 0.5 dB off the voice, but only about 23 dB off the highest tones (241.8 Hz and up). New targets start with this.
+- **Low (250 Hz):** gentler still, about 20 dB off a 179.9 Hz tone, and little off the highest tones.
+- **Off:** keeps everything, including DCS codes, which also sit below 300 Hz.
+
+New NFM and FM targets start on Medium, and so did ones from before the setting existed, since de-emphasis would otherwise make their hum louder.
+
+It applies on single- and multi-channel SDRs, and changing it needs no restart. The web tuner doesn't use it.
+
+NFM and FM audio is always **de-emphasised**, as on every two-way radio. Transmitters boost treble by 6 dB an octave across the voice band, and receivers cut it back. Without that cut, recordings sound thin and the hiss between words is louder. SentrySDR uses the usual narrowband value, 750 µs (a corner at 212 Hz), scaled so 700 Hz is unchanged and calls stay about as loud as before. It applies on single- and multi-channel SDRs and in the web tuner, and DC (a carrier's frequency error) is taken out first so it isn't lifted too.
+
+De-emphasis also lifts a CTCSS tone, by about 9 to 11 dB against the voice, so with **Filter mode** off the hum is louder than it used to be. Leave the tone filter on unless you need what's below 300 Hz.
+
+### Tone squelch
+
+An NFM or FM target's **Tone squelch** works like a radio's: only calls carrying the channel's CTCSS tone or DCS code are kept, so other users of a shared channel, distant stations and intermod aren't recorded or uploaded.
+
+- **Off:** every call is kept, and nothing is measured. No CPU is used.
+- **Detect only:** every call is kept, and tagged with the tone or code it carried, such as `179.9 Hz` or `DCS 664N`. This is how to find a channel's tone.
+- **CTCSS tone** or **DCS code:** only calls with that tone or code are kept. They're tagged too.
+
+How it works, as a scanner does it:
+
+- While a call is on air, the band under 300 Hz is kept at a low rate, before the tone filter takes the tone out.
+- With a tone or code set, when the call ends every quarter second is checked, with a one-second window around it, for that tone (holding a real share of the band, and well above the tones either side of it in the table) or that code (at least two whole codewords).
+- Only the stretches with it are kept. A repeater's tail after the tone stops is cut off, so is anyone else who keys up within the hang time, and a gap in the tone of under 0.75 seconds doesn't split the call. A call with none of it is dropped. The recording's start time moves to where the tone begins.
+- **Detect only** names the tone from a call's first 3 seconds; three seconds separates the closest tones, 2.4 Hz apart.
+- It costs about 10 ms of CPU per call on a laptop, and nothing on a target with it off.
+- **Live audio isn't gated:** it opens on any signal, as monitoring with tone squelch off does. The SDR shows on air for calls that are then dropped.
+- **DCS polarity:** a code sent inverted reads as its partner (023 inverted is 047). A DCS rule without a polarity accepts both, and tags say which was heard.
+- On air, against a county's published tones, every call carrying its channel's tone was kept whole, calls with another agency's tone on a shared channel were dropped, and repeater tails were cut.
+
+The tag shows on each recording.
+
+### Call levels
+
+A target's **Even out each call's level** brings every recorded call to the same level, so a hot mic next to a weak portable doesn't make listeners reach for the volume on Broadcastify or ClearCut.
+
+- Each call gets one gain, worked out when it ends from its speech, not the gaps between words, so nothing pumps the way a compressor would.
+- Speech goes to -20 dBFS, plus the target's **Volume**, which still trims it.
+- At most 12 dB up or 12 dB down, and never so far that a peak goes over -1 dBFS.
+- It's applied by the ffmpeg command that already encodes the MP3, so it costs almost nothing: one look over the call's samples.
+- Recordings and uploads only. Live audio is heard as it comes in, before a call has ended, so it keeps the fixed Volume.
+- New audio targets start with it on, and targets from before it start off.
+
+### Tone-outs
+
+A target set to **Decode tone-outs** finds fire and EMS pages in its calls: two-tone sequential pages (Motorola Quick Call II and the like, an A tone for about a second then a B tone for about three) and single long tones. Each one is named from **Admin > Tone-outs**, tagged on the recording, and emailed to anyone who follows it.
+
+- **Admin > Tone-outs:** each station's or group's name, A tone and B tone (none for a long tone). Paste a CSV to add many: name, A, B, notes. A heard tone matches a listed one within 1.5%, as most decoders do. A page that matches nothing is still tagged, as an unknown tone-out with its tones, so you can add it.
+- **Alert settings > Tone-outs to email about:** follow particular tone-outs, or any. These emails go as soon as the call is saved, without waiting for your gap between emails, as emergencies do.
+- **When:** the page is found while the call is on air, and the email can go once the call ends and is saved. A long dispatch after the tones delays it by that long.
+- **CPU:** a pitch check every 50 ms plus a purity check, about 6 ms a second of audio on a laptop, only while a call is on air, and only on targets with it on. Off costs nothing.
+- In testing it found pages down to about 6 dB signal to noise, and nothing in voice.
 
 ### Upload systems
 

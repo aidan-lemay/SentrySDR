@@ -220,7 +220,10 @@
     <div class="call" class:important={call.important || call.matches.length}>
       <div><strong>{call.target_name || 'Unknown target'}</strong> <span class="mono small nowrap">{formatMHz(call.frequency_hz)}</span></div>
       <div class="small">{formatTime(call.started_at)}, {formatDuration(call.duration)}, {formatSize(call.size_bytes)}</div>
-      <div class="small dim">{call.source_name} on {call.node_name}</div>
+      <div class="small dim">{call.source_name} on {call.node_name}{#if call.tone} · <span class="mono">{call.tone}</span>{/if}</div>
+      {#if call.tone_outs?.length}
+        <div class="small"><span class="st-bad">{call.tone_outs.map((p) => p.label).join(', ')}</span></div>
+      {/if}
       {#if call.matches.length || call.important}
         <div class="small">
           {#if call.matches.length}<span class="st-bad">Matches: {call.matches.join(', ')}</span>{/if}

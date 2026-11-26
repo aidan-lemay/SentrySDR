@@ -905,11 +905,12 @@ async def test_changing_volume_applies_without_retuning(tmp_path):
     cfg = make_config(tmp_path, bin_dirs=[tmp_path / "bin"])
     sup = supervisor(cfg, calls, pcm=lambda serial, data, rate: chunks.append(data), statuses=statuses)
     try:
-        await sup.apply({"SER1": spec()})
+        # AM: FM's own filters (DC out, de-emphasis) would change these samples whatever the volume.
+        await sup.apply({"SER1": spec(modulation="am")})
         assert await wait_for(lambda: len(chunks) > 2)
         pid = (tmp_path / "bin" / "rtl_fm.pid").read_text()
         assert chunks[-1][:2] == b"\x10\x00"
-        await sup.apply({"SER1": spec(volume_db=12)})
+        await sup.apply({"SER1": spec(modulation="am", volume_db=12)})
         chunks.clear()
         assert await wait_for(lambda: len(chunks) > 40)
         assert chunks[-1][:2] != b"\x10\x00"  # DC is removed once boosted

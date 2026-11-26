@@ -158,6 +158,7 @@ def find_matches(ctx, session, user: User, perms: set[str], since: float) -> lis
     if "listen_recordings" in perms:
         call_words = [k.word for k in words if k.applies in ("calls", "both")]
         channels = [w.target_id for w in watches if w.kind == "channel" and w.target_id]
+        pages = {w.value for w in watches if w.kind == "toneout"}
         arrived = func.coalesce(Recording.transcript_at, Recording.ended_at)
         expression = keywords.pattern(call_words)
         conditions = []
@@ -167,6 +168,8 @@ def find_matches(ctx, session, user: User, perms: set[str], since: float) -> lis
             conditions.append(and_(Recording.target_id.in_(channels), Recording.ended_at > since))
         if user.email_important:
             conditions.append(and_(Recording.important.is_(True), Recording.important_at > since))
+        if pages:
+            conditions.append(and_(Recording.tone_outs.is_not(None), Recording.ended_at > since))
         if conditions:
             for r in session.scalars(select(Recording).where(or_(*conditions)).order_by(Recording.started_at).limit(200)):
                 if ("call", r.id) in sent:
@@ -177,11 +180,15 @@ def find_matches(ctx, session, user: User, perms: set[str], since: float) -> lis
                     why.append("a channel you watch")
                 if r.important and user.email_important and (r.important_at or 0) > since:
                     why.append("marked important")
+                paged = [p for p in r.tone_outs or [] if "any" in pages or str(p.get("id")) in pages] if pages and r.ended_at > since else []
+                if paged:
+                    why.append("a tone-out you follow")
                 if not why:
                     continue
                 items.append({
-                    "kind": "call", "id": r.id, "at": r.started_at, "why": why, "matched": matched,
-                    "title": r.target_name or "Call", "detail": f"{(r.frequency_hz or 0) / 1e6:.4f}".rstrip("0").rstrip(".") + " MHz",
+                    "kind": "call", "id": r.id, "at": r.started_at, "why": why, "matched": matched, "urgent": bool(paged),
+                    "title": ("Tone-out: " + ", ".join(p.get("name") or "unknown" for p in paged) + " on " if paged else "")
+                             + (r.target_name or "Call"), "detail": f"{(r.frequency_hz or 0) / 1e6:.4f}".rstrip("0").rstrip(".") + " MHz",
                     "text": r.transcript or "", "link": f"{ctx.cfg.public_url.rstrip('/')}/#/recordings?call={r.id}",
                 })
 
@@ -239,11 +246,15 @@ def find_matches(ctx, session, user: User, perms: set[str], since: float) -> lis
 
 def compose(ctx, user: User, items: list[dict], last_today: bool) -> tuple[str, str]:
     # Emergencies first, in the subject and the email.
-    items = sorted(items, key=lambda i: (i["kind"] != "emergency", i["at"]))
+    items = sorted(items, key=lambda i: (i["kind"] != "emergency", not i.get("urgent"), i["at"]))
     shown = items[:ITEMS_PER_EMAIL]
     first = items[0]
     if first["kind"] == "emergency":
         subject = f"SentrySDR {first['title']}: {first['detail']}"
+        if len(items) > 1:
+            subject += f", and {len(items) - 1} more alert{'s' if len(items) > 2 else ''}"
+    elif first.get("urgent"):  # a tone-out
+        subject = f"SentrySDR {first['title']}"
         if len(items) > 1:
             subject += f", and {len(items) - 1} more alert{'s' if len(items) > 2 else ''}"
     elif len(items) == 1:
@@ -304,8 +315,10 @@ def pending(ctx) -> list[tuple[int, str, str, dict, list[dict]]]:
             if not can_email(user):
                 continue
             window = (user.email_window if user.email_window in WINDOWS else DEFAULT_WINDOW) * 60
-            waiting = now - (user.email_last_sent_at or 0) < window  # only an emergency goes before the gap is up
-            if waiting and not user.email_emergencies:
+            # Only an emergency or a tone-out goes before the gap is up.
+            waiting = now - (user.email_last_sent_at or 0) < window
+            follows_pages = bool(session.scalar(select(UserWatch.id).where(UserWatch.user_id == user.id, UserWatch.kind == "toneout").limit(1)))
+            if waiting and not user.email_emergencies and not follows_pages:
                 continue
             count = sent_today(session, user.id)
             if count >= cap:
@@ -313,7 +326,7 @@ def pending(ctx) -> list[tuple[int, str, str, dict, list[dict]]]:
             since = max(user.email_since or now, now - LOOKBACK_SECONDS)
             try:
                 items = find_matches(ctx, session, user, effective_permissions(user), since)
-                if not items or (waiting and not any(i["kind"] == "emergency" for i in items)):
+                if not items or (waiting and not any(i["kind"] == "emergency" or i.get("urgent") for i in items)):
                     continue
                 subject, body = compose(ctx, user, items, last_today=count + 1 >= cap)
             except Exception:

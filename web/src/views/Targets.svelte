@@ -2,12 +2,12 @@
   import { onMount } from 'svelte';
   let { user } = $props();
   const isAdmin = user.role === 'admin';
-  import { ADSB_AGGREGATORS, AIS_SERVICES, api, feedLabel, formatMHz, MODULATIONS } from '../lib.js';
+  import { ADSB_AGGREGATORS, AIS_SERVICES, api, CTCSS_TONES, DCS_CODES, feedLabel, formatMHz, MODULATIONS } from '../lib.js';
   import Notice from '../Notice.svelte';
   import { clearAfter } from '../notice.svelte.js';
 
   const blank = () => ({
-    id: null, name: '', description: '', kind: 'audio', mhz: '', modulation: 'nfm', squelch: -40, volume_db: 0,
+    id: null, name: '', description: '', kind: 'audio', mhz: '', modulation: 'nfm', squelch: -40, volume_db: 0, tone_filter: 'medium', toneMode: 'off', toneCode: '', level_calls: true, decode_tone_outs: false,
     clearcut_enabled: false, clearcut_system_ref: '', clearcut_id: '', rdio_enabled: false, rdio_system_ref: '', rdio_talkgroup: '',
     broadcastify_enabled: false, broadcastify_system_ref: '', broadcastify_slot: '',
     channels: [], newChannel: '', airframes_enabled: false, feeds: blankFeeds(),
@@ -49,14 +49,20 @@
 
   let targets = $state([]);
   let systems = $state([]);
+  // Tone squelch is stored as off, detect, ctcss:179.9 or dcs:023 (dcs:023N to require a polarity).
+  const toneRule = (f) => (f.toneMode === 'ctcss' || f.toneMode === 'dcs') && f.toneCode ? `${f.toneMode}:${f.toneCode}` : f.toneMode === 'detect' ? 'detect' : 'off';
+  function toneForm(rule) {
+    const [mode, code] = (rule || 'off').split(':');
+    return { toneMode: mode, toneCode: code ?? '' };
+  }
   // Each service's systems are added by an administrator. A target picks one, and its slot or talkgroup there.
   const UPLOADS = [
     { service: 'broadcastify', name: 'Broadcastify', long: 'Broadcastify Calls', enabled: 'broadcastify_enabled', ref: 'broadcastify_system_ref', tg: 'broadcastify_slot',
-      idWord: 'node', tgLabel: 'Frequency slot', tgHint: "The Slot beside this frequency on Broadcastify's Manage Calls Systems page, under Node Frequencies." },
+      idWord: 'node', tgLabel: 'Frequency slot', tgHint: "From Broadcastify's Node Frequencies list." },
     { service: 'clearcut', name: 'ClearCut', long: 'ClearCut', enabled: 'clearcut_enabled', ref: 'clearcut_system_ref', tg: 'clearcut_id',
-      idWord: 'system', tgLabel: 'ClearCut talkgroup', tgHint: 'The talkgroup ID (TGID) this channel is listed under in ClearCut.' },
+      idWord: 'system', tgLabel: 'Talkgroup (TGID)', tgHint: '' },
     { service: 'rdio', name: 'RDIO', long: 'RDIO Scanner', enabled: 'rdio_enabled', ref: 'rdio_system_ref', tg: 'rdio_talkgroup',
-      idWord: 'system', tgLabel: 'RDIO talkgroup', tgHint: "The talkgroup ID (TGID) under the system in RDIO Scanner's admin." },
+      idWord: 'system', tgLabel: 'Talkgroup (TGID)', tgHint: '' },
   ];
   let form = $state(blank());
   let error = $state('');
@@ -122,7 +128,7 @@
       modulation: form.kind === 'acars' ? 'acars' : ['rtltcp', 'tuner'].includes(form.kind) ? form.kind : fixed ? fixed.modulation : form.modulation,
       acars_channels: channelsHz, airframes_enabled: form.kind === 'acars' && form.airframes_enabled,
       feeds: feedsBody(form.kind, form.feeds),
-      squelch: optionalNumber(form.squelch), volume_db: Number(form.volume_db || 0),
+      squelch: optionalNumber(form.squelch), volume_db: Number(form.volume_db || 0), tone_filter: form.tone_filter || 'off', tone_squelch: toneRule(form), level_calls: form.kind === 'audio' && Boolean(form.level_calls), decode_tone_outs: form.kind === 'audio' && Boolean(form.decode_tone_outs),
       clearcut_enabled: audio && Boolean(form.clearcut_enabled), clearcut_system_ref: optionalInt(form.clearcut_system_ref), clearcut_id: optionalInt(form.clearcut_id),
       rdio_enabled: audio && Boolean(form.rdio_enabled), rdio_system_ref: optionalInt(form.rdio_system_ref), rdio_talkgroup: optionalInt(form.rdio_talkgroup),
       broadcastify_enabled: audio && Boolean(form.broadcastify_enabled), broadcastify_system_ref: optionalInt(form.broadcastify_system_ref), broadcastify_slot: optionalInt(form.broadcastify_slot),
@@ -143,7 +149,7 @@
     form = {
       ...blank(), ...target, mhz: target.frequency_hz / 1e6,
       clearcut_enabled: Boolean(target.clearcut_enabled), clearcut_system_ref: target.clearcut_system_ref ?? '', clearcut_id: target.clearcut_id ?? '',
-      rdio_enabled: Boolean(target.rdio_enabled), rdio_system_ref: target.rdio_system_ref ?? '', rdio_talkgroup: target.rdio_talkgroup ?? '', volume_db: target.volume_db ?? 0,
+      rdio_enabled: Boolean(target.rdio_enabled), rdio_system_ref: target.rdio_system_ref ?? '', rdio_talkgroup: target.rdio_talkgroup ?? '', volume_db: target.volume_db ?? 0, tone_filter: target.tone_filter ?? 'off', ...toneForm(target.tone_squelch), level_calls: Boolean(target.level_calls), decode_tone_outs: Boolean(target.decode_tone_outs),
       broadcastify_enabled: Boolean(target.broadcastify_enabled), broadcastify_system_ref: target.broadcastify_system_ref ?? '', broadcastify_slot: target.broadcastify_slot ?? '',
       channels: (target.acars_channels ?? []).map((hz) => +(hz / 1e6).toFixed(4)), newChannel: '', airframes_enabled: Boolean(target.airframes_enabled),
       feeds: blankFeeds(target.feeds ?? {}),
@@ -206,7 +212,7 @@
     <label class="field"><span>Name / alpha tag</span><input bind:value={form.name} required maxlength="120" /></label>
     <label class="field"><span>Description</span>
       <input bind:value={form.description} maxlength="500" placeholder="Optional" />
-      <span class="hint">What it's used for, such as "Fire dispatch, county-wide". Shown under its name here and on the Sources page.</span>
+      <span class="hint">Such as "Fire dispatch, county-wide".</span>
     </label>
     <label class="field"><span>Type</span>
       <select bind:value={form.kind}>
@@ -242,24 +248,24 @@
       </div>
       {#if channelProblem}<p class="small st-bad form-buttons" role="alert">{channelProblem}</p>{/if}
       {#if span > MAX_SPAN_MHZ}
-        <p class="small st-bad form-buttons" role="alert">These span {span.toFixed(3)} MHz, but one stick covers at most {MAX_SPAN_MHZ} MHz. Remove the outermost channel, or put it on another target and stick.</p>
+        <p class="small st-bad form-buttons" role="alert">These span {span.toFixed(3)} MHz; one stick covers {MAX_SPAN_MHZ} MHz.</p>
       {:else}
-        <p class="small dim form-buttons">One stick decodes every channel here at once, so they must fit within {MAX_SPAN_MHZ} MHz{sortedChannels.length > 1 ? ` (these span ${span.toFixed(3)} MHz)` : ''}.</p>
+        <p class="small dim form-buttons">All channels must fit within {MAX_SPAN_MHZ} MHz{sortedChannels.length > 1 ? ` (now ${span.toFixed(3)} MHz)` : ''}.</p>
       {/if}
     {/if}
     {#if form.kind === 'rtltcp'}
       <label class="field"><span>Starting frequency (MHz)</span>
         <input class="mono" type="number" inputmode="decimal" step="0.0001" min="0.5" max="2200" bind:value={form.mhz} required />
-        <span class="hint">The program that connects can retune it. Nothing is recorded while an SDR serves rtl_tcp.</span>
+        <span class="hint">Nothing is recorded while an SDR serves rtl_tcp.</span>
       </label>
-      <p class="small dim form-buttons">rtl_tcp has no password: whoever can reach it controls the stick. It listens only on the address in that machine's configuration file, on the SDR's own port. Only administrators can use it.</p>
+      <p class="small dim form-buttons">rtl_tcp has no password: anyone who can reach its port controls the stick.</p>
     {/if}
     {#if form.kind === 'tuner'}
       <label class="field"><span>Starting center frequency (MHz)</span>
         <input class="mono" type="number" inputmode="decimal" step="0.0001" min="0.5" max="2200" bind:value={form.mhz} required />
-        <span class="hint">Where the SDR starts. Whoever's tuning it can move it anywhere the stick reaches.</span>
+        <span class="hint">Where the tuner starts.</span>
       </label>
-      <p class="small dim form-buttons">An SDR assigned this opens under Tuner, for anyone with the Tuner permission. Nothing is recorded while an SDR is a tuner.</p>
+      <p class="small dim form-buttons">Nothing is recorded while an SDR is a tuner.</p>
     {/if}
     {#if form.kind === 'audio'}
       <label class="field"><span>Frequency (MHz)</span><input class="mono" type="number" inputmode="decimal" step="0.0001" min="0.5" max="2200" bind:value={form.mhz} required /></label>
@@ -267,16 +273,64 @@
         <select bind:value={form.modulation}>
           {#each MODULATIONS as option (option.value)}<option value={option.value}>{option.label}</option>{/each}
         </select>
-        {#if ['nfm', 'fm'].includes(form.modulation)}<span class="hint">Narrowband for public safety and business radio, which has been 12.5 kHz since 2013. Wideband for ham repeaters, low band (25 to 50 MHz) and older systems. RadioReference lists them as FMN and FM.</span>{/if}
+        {#if ['nfm', 'fm'].includes(form.modulation)}<span class="hint">RadioReference's FMN is narrowband, FM is wideband.</span>{/if}
       </label>
       <label class="field"><span>Squelch (dB)</span>
         <input class="mono" type="number" min="-130" max="0" step="0.1" placeholder="Off" bind:value={form.squelch} />
-        <span class="hint">The same scale as the web tuner's signal meter and squelch, so a level that works there works here at the same gain. Used on any SDR without a saved profile for this target. Must sit above the noise: measure each SDR on the Sources page. Leave empty to record all the time.</span>
+        <span class="hint">Same scale as the tuner's meter. An SDR's saved profile overrides it. Empty records all the time.</span>
       </label>
+      {#if ['nfm', 'fm'].includes(form.modulation)}
+        <label class="field"><span>Tone squelch</span>
+          <select bind:value={form.toneMode} onchange={() => (form.toneCode = '')}>
+            <option value="off">Off</option>
+            <option value="detect">Detect only: tag each call</option>
+            <option value="ctcss">CTCSS tone</option>
+            <option value="dcs">DCS code</option>
+          </select>
+          <span class="hint">Records only while this tone or code is there, like a scanner. Calls are tagged with what was heard. Live audio isn't gated.</span>
+        </label>
+        {#if form.toneMode === 'ctcss'}
+          <label class="field"><span>Tone (Hz)</span>
+            <select bind:value={form.toneCode} required>
+              <option value="">Choose a tone</option>
+              {#each CTCSS_TONES as tone (tone)}<option value={tone}>{tone}</option>{/each}
+            </select>
+          </label>
+        {:else if form.toneMode === 'dcs'}
+          <label class="field"><span>Code</span>
+            <select bind:value={form.toneCode} required>
+              <option value="">Choose a code</option>
+              {#each DCS_CODES as code (code)}<option value={code}>{code}</option>{/each}
+            </select>
+            <span class="hint">Either polarity matches.</span>
+          </label>
+        {/if}
+      {/if}
+      {#if ['nfm', 'fm'].includes(form.modulation)}
+        <label class="field"><span>Filter mode</span>
+          <select bind:value={form.tone_filter}>
+            <option value="off">Off</option>
+            <option value="low">Low (250 Hz)</option>
+            <option value="medium">Medium (300 Hz)</option>
+            <option value="high">High (300 Hz, steep)</option>
+          </select>
+          <span class="hint">Removes the CTCSS hum. Medium can leave a trace of tones above 240 Hz; Off keeps DCS.</span>
+        </label>
+      {/if}
       <label class="field"><span>Volume (dB)</span>
         <input class="mono" type="number" inputmode="decimal" min="-20" max="30" step="1" bind:value={form.volume_db} />
-        <span class="hint">Applies to recordings, uploads and live audio, on any SDR. 0 leaves the audio unchanged. Too much boost clips loud voices.</span>
+        <span class="hint">Too much boost clips loud voices.</span>
       </label>
+      <div class="field"><span>Call levels</span>
+        <label class="tick"><input type="checkbox" bind:checked={form.level_calls} /> Even out each call's level</label>
+        <span class="hint">Recordings and uploads only.</span>
+      </div>
+      {#if ['nfm', 'fm', 'am'].includes(form.modulation)}
+        <div class="field"><span>Tone-outs</span>
+          <label class="tick"><input type="checkbox" bind:checked={form.decode_tone_outs} /> Decode QC2 and long-tone pages</label>
+          <span class="hint">Named from Admin &gt; Tone-outs.</span>
+        </div>
+      {/if}
     {/if}
   </fieldset>
   {#if form.kind === 'adsb'}
@@ -287,12 +341,12 @@
           {#each ADSB_AGGREGATORS as [id, label] (id)}<label class="tick"><input type="checkbox" value={id} bind:group={form.feeds.aggregators} /> {label}</label>{/each}
         </div>
       </div>
-      <p class="small dim form-buttons">readsb connects out to each one. Nothing is opened to the network. Each SDR is identified by its own random ID.</p>
+      <p class="small dim form-buttons">readsb connects out; nothing is opened to the network.</p>
       <div class="field"><span>FlightRadar24, FlightAware</span><label class="tick"><input type="checkbox" bind:checked={form.feeds.beastOn} /> Offer data to fr24feed or piaware</label></div>
       {#if form.feeds.beastOn}
         <label class="field"><span>Local port</span>
           <input class="mono" type="number" inputmode="numeric" min="1025" max="65535" bind:value={form.feeds.beastPort} required />
-          <span class="hint">Beast data on 127.0.0.1 only, on the machine with the SDR. Point fr24feed or piaware at 127.0.0.1 and this port. See the README for setup.</span>
+          <span class="hint">On 127.0.0.1 of the SDR's machine, for fr24feed or piaware.</span>
         </label>
       {/if}
   </fieldset>
@@ -319,7 +373,7 @@
   <fieldset>
     <legend>Sharing</legend>
       <div class="field"><span>airframes.io</span><label class="tick"><input type="checkbox" bind:checked={form.airframes_enabled} /> Feed messages to airframes.io</label></div>
-      {#if form.airframes_enabled}<p class="small dim form-buttons">Sent with the station ID set under Admin &gt; Uploads and feeds. Nothing is sent until one is set.</p>{/if}
+      {#if form.airframes_enabled}<p class="small dim form-buttons">Needs a station ID under Admin &gt; Uploads and feeds.</p>{/if}
   </fieldset>
   {/if}
   {#if form.kind === 'audio'}
@@ -334,11 +388,11 @@
               <option value="">Choose a system</option>
               {#each choices as system (system.id)}<option value={system.id}>{system.name} ({upload.idWord} {system.system_id})</option>{/each}
             </select>
-            {#if !choices.length}<span class="hint">An administrator adds {upload.name} systems under Admin &gt; Uploads and feeds.</span>{/if}
+            {#if !choices.length}<span class="hint">Add one under Admin &gt; Uploads and feeds.</span>{/if}
           </label>
           <label class="field"><span>{upload.tgLabel}</span>
             <input type="number" inputmode="numeric" min={upload.service === 'broadcastify' ? 1 : 0} bind:value={form[upload.tg]} required />
-            <span class="hint">{upload.tgHint}</span>
+            {#if upload.tgHint}<span class="hint">{upload.tgHint}</span>{/if}
           </label>
         {/if}
       {/each}

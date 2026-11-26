@@ -64,7 +64,7 @@
 </script>
 
 <h1>Scanner</h1>
-<p class="small">New calls from the channels you choose play one after another as they finish. Hold stays on the channel that's playing; Skip moves on.</p>
+<p class="small">New calls from these channels play as they finish.</p>
 {#if error}<div class="err" role="alert">{error}</div>{/if}
 
 <NowPlaying {player} />

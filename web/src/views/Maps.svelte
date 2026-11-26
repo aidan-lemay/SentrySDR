@@ -227,5 +227,5 @@
 <p class="small">
   {located.length} {kind === 'adsb' ? 'aircraft' : 'ships'} with a position{items.length !== located.length ? `, ${items.length - located.length} without` : ''}.
   {#if !items.length}Assign an {kind === 'adsb' ? 'ADS-B' : 'AIS'} target to a source to see traffic here.{/if}
-  {#if receivers.length}Squares are receivers{kind === 'adsb' ? ', and each outline is how far one has heard aircraft' : ''}.{:else if user.role === 'admin'}Give an SDR a location under Admin &gt; SDR sources to show it here.{/if}
+  {#if receivers.length}Squares are receivers{kind === 'adsb' ? '; outlines show their range' : ''}.{/if}
 </p>

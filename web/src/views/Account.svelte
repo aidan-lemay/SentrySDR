@@ -249,7 +249,7 @@
     <legend>Sources page</legend>
     <details ontoggle={openLayout}>
       <summary class="small" style="padding:.3rem 0">Order and groups</summary>
-      <p class="small dim">How the Sources page looks to you, on any device. Nobody else sees it. Collapse a group on the Sources page itself.</p>
+      <p class="small dim">Only you see this arrangement.</p>
       {#if layoutNote?.kind === 'err'}<div class="err" role="alert">{layoutNote.text}</div>{/if}
       {#if arranged && !arranged.length}<p class="small dim">No sources yet.</p>{/if}
       {#if arranged?.length}

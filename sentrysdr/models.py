@@ -169,6 +169,10 @@ class Target(Base):
     # dB, as the web tuner shows it. None = off: continuous recording.
     squelch_db: Mapped[float | None] = mapped_column(nullable=True)
     volume_db: Mapped[float | None] = mapped_column(nullable=True)  # applied to the audio
+    tone_filter: Mapped[str | None] = mapped_column(String(8), nullable=True)  # pipelines.TONE_FILTERS; None is off
+    tone_squelch: Mapped[str | None] = mapped_column(String(12), nullable=True)  # subaudible.clean_rule; None is off
+    level_calls: Mapped[bool | None] = mapped_column(nullable=True)  # even out each call's level: pipelines.call_level_gain
+    decode_tone_outs: Mapped[bool | None] = mapped_column(nullable=True)  # find QC2 and long-tone pages: toneouts.Detector
     clearcut_enabled: Mapped[bool] = mapped_column(default=False)
     # Retired: the ClearCut and RDIO system IDs, typed on each target. Now an UploadSystem each.
     clearcut_system: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -184,6 +188,16 @@ class Target(Base):
     acars_channels: Mapped[list | None] = mapped_column(JSON, nullable=True)  # Hz; frequency_hz is the lowest
     airframes_enabled: Mapped[bool | None] = mapped_column(nullable=True)  # feed messages to airframes.io
     feeds: Mapped[dict | None] = mapped_column(JSON, nullable=True)  # ADS-B and AIS sharing, see feeds.clean
+
+
+class ToneOut(Base):
+    """A page the master names: a station's or group's A and B tones, or one long tone (b_hz None)."""
+    __tablename__ = "tone_outs"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(120))
+    a_hz: Mapped[float] = mapped_column()
+    b_hz: Mapped[float | None] = mapped_column(nullable=True)
+    notes: Mapped[str] = mapped_column(String(300), default="")
 
 
 UPLOAD_SERVICES = ("broadcastify", "clearcut", "rdio")
@@ -276,6 +290,9 @@ class Recording(Base):
     size_bytes: Mapped[int] = mapped_column(default=0)
     protected: Mapped[bool] = mapped_column(default=False, index=True)
     transcript: Mapped[str | None] = mapped_column(nullable=True)
+    tone: Mapped[str | None] = mapped_column(String(16), nullable=True)  # the CTCSS tone or DCS code heard, as subaudible.label
+    # Pages heard in the call, named from the Tone-outs table when it was stored: [{a, b, at, id, name}].
+    tone_outs: Mapped[list | None] = mapped_column(JSON, nullable=True)
     # Snapshots, so transcripts can still be found after the target is deleted.
     clearcut_system: Mapped[str | None] = mapped_column(String(64), nullable=True)
     clearcut_talkgroup: Mapped[int | None] = mapped_column(nullable=True)
@@ -329,9 +346,9 @@ class UserWatch(Base):
     __tablename__ = "user_watches"
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
-    kind: Mapped[str] = mapped_column(String(8))  # channel|aircraft
+    kind: Mapped[str] = mapped_column(String(8))  # channel|aircraft|toneout
     target_id: Mapped[int | None] = mapped_column(ForeignKey("targets.id", ondelete="CASCADE"), nullable=True)
-    value: Mapped[str] = mapped_column(String(16), default="")  # a registration or flight, for aircraft
+    value: Mapped[str] = mapped_column(String(16), default="")  # a registration or flight; a tone-out's id, or "any"
     created_at: Mapped[float] = mapped_column(default=now)
 
 
@@ -536,6 +553,19 @@ def _move_upload_keys_to_systems(engine) -> None:
         connection.execute(text("DELETE FROM settings WHERE key IN ('rdio_api_key', 'clearcut_api_key')"))
 
 
+def _default_tone_filter(engine) -> None:
+    """De-emphasis (always on for NFM and FM) lifts a CTCSS tone about 10 dB, so a target without the
+    tone filter would hum louder than before. Targets from before the tone filter existed get Medium,
+    as new ones do. Once only: a marker in settings, so turning it off later sticks.
+    """
+    with engine.begin() as connection:
+        if connection.execute(text("SELECT 1 FROM settings WHERE key = 'tone_filter_defaulted'")).first():
+            return
+        connection.execute(text("UPDATE targets SET tone_filter = 'medium' WHERE tone_filter IS NULL AND kind = 'audio' "
+                                "AND modulation IN ('nfm', 'fm')"))
+        connection.execute(text("INSERT INTO settings (key, value) VALUES ('tone_filter_defaulted', '1')"))
+
+
 def _drop_retired_uses(engine) -> None:
     """Some stick uses were removed from the app. Take them off sticks that had them."""
     from .capabilities import RETIRED_USES
@@ -603,6 +633,7 @@ def make_session_factory(db_path: Path):
     _convert_source_antennas(engine)
     _convert_squelch_to_db(engine)
     _move_upload_keys_to_systems(engine)
+    _default_tone_filter(engine)
     _drop_retired_uses(engine)
     _fill_feeder_uuids(engine)
     _fill_rtl_tcp_ports(engine)

@@ -5,7 +5,7 @@
   import { clearAfter, NOTICE_MS } from '../notice.svelte.js';
   import GainField from '../GainField.svelte';
 
-  const TABS = [['users', 'Users'], ['sources', 'SDR sources'], ['antennas', 'Antennas'], ['nodes', 'Nodes'], ['bans', 'Bans'], ['audit', 'Audit log'], ['settings', 'Settings'], ['uploads', 'Uploads and feeds'], ['email', 'Email'], ['warnings', 'Warnings']];
+  const TABS = [['users', 'Users'], ['sources', 'SDR sources'], ['antennas', 'Antennas'], ['nodes', 'Nodes'], ['bans', 'Bans'], ['audit', 'Audit log'], ['settings', 'Settings'], ['uploads', 'Uploads and feeds'], ['email', 'Email'], ['toneouts', 'Tone-outs'], ['warnings', 'Warnings']];
   const MUTE_CHOICES = [['1', '1 hour'], ['4', '4 hours'], ['8', '8 hours'], ['24', '1 day'], ['72', '3 days'], ['168', '1 week'], ['', 'Until I unmute it']];
   const PERMISSIONS = [
     ['listen_live', 'Listen live'], ['listen_recordings', 'Play recordings'], ['download', 'Download'],
@@ -58,9 +58,9 @@
   let settings = $state(null);
   let systems = $state([]);
   const SERVICES = [
-    { id: 'broadcastify', name: 'Broadcastify Calls', idLabel: 'Broadcastify system ID', idHint: "The node's ID from Broadcastify, not a RadioReference ID.", numeric: true },
-    { id: 'clearcut', name: 'ClearCut', idLabel: 'ClearCut system ID', idHint: 'The short name ClearCut uses for the system, such as us-ny-monroe.', numeric: false },
-    { id: 'rdio', name: 'RDIO Scanner', idLabel: 'RDIO system ID', idHint: "The system's ID in RDIO Scanner's admin, under Systems.", numeric: true },
+    { id: 'broadcastify', name: 'Broadcastify Calls', idLabel: 'Broadcastify system ID', idHint: 'Not the RadioReference ID.', numeric: true },
+    { id: 'clearcut', name: 'ClearCut', idLabel: 'ClearCut system ID', idHint: 'Such as us-ny-monroe.', numeric: false },
+    { id: 'rdio', name: 'RDIO Scanner', idLabel: 'RDIO system ID', idHint: '', numeric: true },
   ];
   const serviceOf = (id) => SERVICES.find((s) => s.id === id) ?? SERVICES[0];
   const blankSystem = (service = 'broadcastify') => ({ id: null, service, name: '', system_id: '', api_key: '' });
@@ -77,7 +77,7 @@
     try {
       const reply = await action();
       if (success) {
-        message = success;
+        message = typeof success === 'function' ? success(reply) : success;
         scrollTo(0, 0);
       }
       return reply ?? true;
@@ -99,6 +99,7 @@
     settings: async () => { settings = await api('admin/settings'); systems = await api('admin/upload-systems'); },
     uploads: async () => { settings = await api('admin/settings'); systems = await api('admin/upload-systems'); },
     warnings: async () => { warnings = await api('admin/warnings'); },
+    toneouts: async () => { toneOuts = await api('admin/tone-outs'); },
     email: async () => { settings = await api('admin/settings'); smtpPassword = ''; },
   };
 
@@ -479,6 +480,31 @@
     }
   }
 
+  // --- tone-outs
+  let toneOuts = $state([]);
+  const blankToneOut = () => ({ id: null, name: '', a_hz: '', b_hz: '', notes: '' });
+  let toneOutForm = $state(blankToneOut());
+  let toneOutCsv = $state('');
+  async function saveToneOut(event) {
+    event.preventDefault();
+    const body = { name: toneOutForm.name.trim(), a_hz: Number(toneOutForm.a_hz), b_hz: toneOutForm.b_hz === '' ? null : Number(toneOutForm.b_hz), notes: toneOutForm.notes.trim() };
+    const path = toneOutForm.id ? `admin/tone-outs/${toneOutForm.id}` : 'admin/tone-outs';
+    if (await run(() => api(path, { method: toneOutForm.id ? 'PUT' : 'POST', body }), 'Tone-out saved.')) {
+      toneOutForm = blankToneOut();
+      await loaders.toneouts();
+    }
+  }
+  async function removeToneOut(row) {
+    if (!confirm(`Remove ${row.name}? People following it stop getting its emails.`)) return;
+    if (await run(() => api(`admin/tone-outs/${row.id}`, { method: 'DELETE' }), 'Tone-out removed.')) await loaders.toneouts();
+  }
+  async function importToneOuts(event) {
+    event.preventDefault();
+    const reply = await run(() => api('admin/tone-outs/import', { method: 'POST', body: { text: toneOutCsv } }),
+      (r) => `Added ${r.added}${r.skipped ? `, skipped ${r.skipped} already listed` : ''}.${r.problems.length ? ' ' + r.problems.join(' ') : ''}`);
+    if (reply) { toneOutCsv = ''; await loaders.toneouts(); }
+  }
+
   // --- upload systems: Broadcastify, ClearCut and RDIO
   async function saveSystem(event) {
     event.preventDefault();
@@ -707,7 +733,7 @@
       {#if sourceForm.feederId}
         <div class="field"><span>Feeder ID</span>
           <span class="mono small copyable">{sourceForm.feederId}</span>
-          <span class="hint">Sent with ADS-B shared to aggregators, so they can tell this SDR's feed apart. Some feeder stats pages ask for it. Keep it private: anyone with it could feed data as this receiver.</span>
+          <span class="hint">Identifies this SDR to ADS-B aggregators. Keep it private.</span>
         </div>
       {/if}
       <label class="field"><span>Description</span><input bind:value={sourceForm.description} maxlength="500" /></label>
@@ -716,15 +742,15 @@
           <option value="">None</option>
           {#each antennas as antenna (antenna.id)}<option value={antenna.id}>{antenna.name}{antenna.kind && antenna.kind !== antenna.name ? ` (${antenna.kind})` : ''}</option>{/each}
         </select>
-        <span class="hint">Add antennas under the Antennas section. One antenna can feed several SDRs.</span>
+        <span class="hint">Add antennas under Antennas.</span>
       </label>
       <label class="field"><span>Gain (dB)</span>
         <GainField steps={formSteps} bind:value={sourceForm.gain} />
         {#if formNearest !== null}<span class="hint st-warn">Not one of this stick's gain steps. It will use {formNearest} dB. Choose a step to save.</span>{/if}
         {#if formSteps.length}
-          <span class="hint">Only this stick's own steps can be used. AGC is automatic gain.</span>
+          <span class="hint">AGC is automatic gain.</span>
         {:else}
-          <span class="hint">Starts at {DEFAULT_GAIN_DB} dB. Leave empty for automatic gain (AGC). 0 means a real 0 dB, which may miss most calls. Detect the stick below to choose from its own steps.</span>
+          <span class="hint">Empty is automatic gain (AGC).</span>
         {/if}
       </label>
       <label class="field"><span>Frequency correction (ppm)</span><input type="number" min="-500" max="500" bind:value={sourceForm.ppm} /></label>
@@ -733,22 +759,22 @@
           <input class="mono" type="number" inputmode="decimal" step="any" min="-90" max="90" aria-label="Latitude" placeholder="Latitude" bind:value={sourceForm.lat} />
           <input class="mono" type="number" inputmode="decimal" step="any" min="-180" max="180" aria-label="Longitude" placeholder="Longitude" bind:value={sourceForm.lon} />
         </div>
+        <span class="hint">Decimal degrees. Shown to anyone who can see maps.</span>
       </div>
       <label class="field"><span>Antenna height (m)</span>
         <input class="mono" type="number" inputmode="decimal" step="any" min="-500" max="10000" bind:value={sourceForm.alt} />
-        <span class="hint">Optional. Where the antenna is, in decimal degrees (43.1566, -77.6088), for the map's receiver marker and ADS-B coverage. Anyone who can see maps sees it. Moving it starts the coverage again.</span>
       </label>
       <label class="field"><span>rtl_tcp port</span>
         <input class="mono" type="number" inputmode="numeric" min="1024" max="65535" placeholder="Picked for you" bind:value={sourceForm.rtlTcpPort} />
-        <span class="hint">Used when this SDR is on an rtl_tcp target. Each SDR on one machine needs its own. The address is set in that machine's configuration file.</span>
+        <span class="hint">Each SDR on one machine needs its own.</span>
       </label>
       <div class="field"><span>Warnings</span>
         <label class="tick"><input type="checkbox" bind:checked={sourceForm.quiet} /> Don't warn if its stick is unplugged</label>
-        <span class="hint">For everyone. Other faults still warn. The warning still shows under Admin, Warnings.</span>
+        <span class="hint">Other faults still warn.</span>
       </div>
       <label class="field"><span>Multi-channel: most channels</span>
         <input class="mono" type="number" inputmode="numeric" min="1" max={MULTI_MAX_CHANNELS} placeholder={String(MULTI_DEFAULT_CHANNELS)} bind:value={sourceForm.maxChannels} />
-        <span class="hint">How many channels this SDR can record at once when it's multi-channel. Each one costs CPU on the machine it's plugged into, so check that machine first. Empty is {MULTI_DEFAULT_CHANNELS}; at most {MULTI_MAX_CHANNELS}.</span>
+        <span class="hint">Empty is {MULTI_DEFAULT_CHANNELS}; at most {MULTI_MAX_CHANNELS}. Check the machine first.</span>
       </label>
       <div class="buttons form-buttons">
         <button type="button" disabled={!sourceForm.key || benchmarking} onclick={checkMachine}>{benchmarking ? 'Checking...' : 'Check this machine'}</button>
@@ -770,17 +796,17 @@
           {:else}
             Multi-channel isn't recommended on this machine. Single channel still works.
           {/if}
-          <span class="small dim">A cursory check: made-up samples, timed. The Sources page shows the real processing load while it runs, which is the figure to trust.</span>
+          <span class="small dim">A rough estimate. The Sources page shows the real load.</span>
         </div>
       {/if}
     </fieldset>
     <fieldset>
       <legend>What this stick can do</legend>
-      <p class="small dim form-buttons">The range and uses only warn: a target this stick doesn't suit can still be assigned. Gain steps limit the gain boxes to the stick's own steps. Leave anything blank to skip it.</p>
+      <p class="small dim form-buttons">These only warn; any target can still be assigned.</p>
       <div class="buttons form-buttons">
         <button type="button" disabled={!sourceForm.key || detecting} onclick={detect}>{detecting ? 'Detecting...' : 'Detect from the stick'}</button>
       </div>
-      <p class="small dim form-buttons">Reads the tuner and gain steps, and fills in that tuner's usual range. Pauses the stick for a few seconds. Works on slaves too.</p>
+      <p class="small dim form-buttons">Pauses the stick for a few seconds.</p>
       <label class="field"><span>Tuner</span>
         <input bind:value={sourceForm.tuner} maxlength="40" list="tuner-names" placeholder="R820T" />
         <datalist id="tuner-names">{#each TUNERS as name (name)}<option value={name}></option>{/each}</datalist>
@@ -793,7 +819,7 @@
       </div>
       <label class="field"><span>Gain steps (dB)</span>
         <input class="mono" bind:value={sourceForm.steps} placeholder="0.0 0.9 1.4 ..." />
-        <span class="hint">Separated by spaces or commas. These become the only gains you can choose for this stick.</span>
+        <span class="hint">Separated by spaces or commas.</span>
       </label>
       <div class="field top"><span>Uses</span>
         <div>
@@ -887,13 +913,12 @@
         </table>
       </div>
       {#if rangeProblem}<p class="small st-bad form-buttons" role="alert">{rangeProblem}</p>{/if}
-      <p class="small dim form-buttons">Add one range per band, and rate how well the antenna works there. Where ranges overlap, the best rating counts: with 100 to 200 Ideal and 80 to 220 Usable, 110 MHz is Ideal and 205 MHz is Usable. A target in a Usable range gets a note; one in a Deaf range, or outside every range, gets a warning. Either can still be assigned. With no ranges, nothing is checked.</p>
+      <p class="small dim form-buttons">Where ranges overlap, the best rating counts. Targets outside every range get a warning.</p>
       <label class="field"><span>Notes</span><input bind:value={antennaForm.notes} maxlength="500" placeholder="Mounting, feed line, splitter..." /></label>
       <div class="buttons form-buttons">
         <button class="main">{antennaForm.id ? 'Save antenna' : 'Add antenna'}</button>
         {#if antennaForm.id}<button type="button" onclick={() => { antennaForm = blankAntenna(); rangeProblem = ''; }}>Cancel</button>{/if}
       </div>
-      <p class="small dim form-buttons">To use an antenna, choose it on each SDR under SDR sources.</p>
     </fieldset>
   </form>
 {/if}
@@ -1020,7 +1045,7 @@
       <legend>How long to keep things</legend>
       <label class="field"><span>Recordings (days)</span>
         <input type="number" inputmode="numeric" min="0" bind:value={settings.recording_retention_days} />
-        <span class="hint">0 keeps them forever. Protected recordings are never removed automatically.</span>
+        <span class="hint">0 keeps them forever. Protected recordings are kept.</span>
       </label>
       <label class="field"><span>Audit logs (days)</span>
         <input type="number" inputmode="numeric" min="0" bind:value={settings.audit_retention_days} />
@@ -1028,13 +1053,13 @@
       </label>
       <label class="field"><span>Recordings size limit (GB)</span>
         <input type="number" inputmode="decimal" min="0" step="any" bind:value={settings.recording_retention_gb} />
-        <span class="hint">0 means no limit. Over it, the oldest unprotected recordings are deleted first. Using {formatSize(settings.recordings_bytes)}{settings.disk ? `, with ${formatSize(settings.disk.free)} free on that disk` : ''}.</span>
+        <span class="hint">0 is no limit; the oldest go first. Using {formatSize(settings.recordings_bytes)}{settings.disk ? `, with ${formatSize(settings.disk.free)} free on that disk` : ''}.</span>
       </label>
       <label class="field"><span>ACARS messages (days)</span>
         <input type="number" inputmode="numeric" min="0" bind:value={settings.message_retention_days} />
         <span class="hint">0 keeps them forever.</span>
       </label>
-      <p class="small wrap-any">Recordings are in <span class="mono">{settings.recordings_dir}</span> and logs in <span class="mono">{settings.log_dir}</span>. Change these in the configuration file.</p>
+      <p class="small wrap-any">Recordings are in <span class="mono">{settings.recordings_dir}</span> and logs in <span class="mono">{settings.log_dir}</span>. Set in the configuration file.</p>
     </fieldset>
     <fieldset>
       <legend>Sign-ups</legend>
@@ -1047,7 +1072,6 @@
     {:else}
     <fieldset>
       <legend>Upload servers</legend>
-      <p class="small">One address per service, shared by all its systems. Each system's ID and API key are added below.</p>
       <label class="field"><span>Broadcastify Calls upload address</span><input class="mono" type="url" bind:value={settings.broadcastify_server} /></label>
       <label class="field"><span>ClearCut server</span><input class="mono" type="url" bind:value={settings.clearcut_server} /></label>
       <label class="field"><span>ClearCut link for users</span><input class="mono" type="url" bind:value={settings.clearcut_page_url} /></label>
@@ -1055,10 +1079,10 @@
     </fieldset>
     <fieldset>
       <legend>airframes.io feed</legend>
-      <p class="small">ACARS targets with feeding turned on send each message here. No account is needed.</p>
+      <p class="small">No account needed.</p>
       <label class="field"><span>Station ID</span>
         <input class="mono" bind:value={settings.airframes_station_id} maxlength="40" pattern="[A-Za-z0-9][A-Za-z0-9\-]*" placeholder="KE-KSEA-ACARS" />
-        <span class="hint">Your initials, the nearest airport's ICAO code, then ACARS. Leave empty to send nothing.</span>
+        <span class="hint">Initials, nearest airport, ACARS. Empty sends nothing.</span>
       </label>
       <label class="field"><span>Feed address</span><input class="mono" bind:value={settings.airframes_feed} maxlength="260" placeholder="feed.acars.io:5550" /></label>
     </fieldset>
@@ -1075,7 +1099,7 @@
     <form onsubmit={downloadBackup}>
       <fieldset>
         <legend>Backup</legend>
-        <p class="small">The database and <span class="mono">secret.key</span>, as one file: every account, setting, SDR, target, schedule and recording's details, and the key that decrypts the saved API keys. Recordings themselves aren't included. Keep the file private.</p>
+        <p class="small">The database and <span class="mono">secret.key</span>, which decrypts saved keys. Audio isn't included. Keep it private.</p>
         <label class="field"><span>Your password</span><input type="password" bind:value={backupPassword} required autocomplete="current-password" /></label>
         <div class="buttons form-buttons"><button disabled={backingUp}>{backingUp ? 'Preparing...' : 'Download backup'}</button></div>
       </fieldset>
@@ -1085,7 +1109,7 @@
   <form onsubmit={saveSystem}>
     <fieldset>
       <legend>Upload systems</legend>
-      <p class="small">A Broadcastify node, ClearCut system or RDIO system, each with its own API key. Each target then chooses a system, and a slot or talkgroup. Saved keys are never shown again.</p>
+      <p class="small">Targets choose a system and talkgroup. Saved keys are never shown again.</p>
       {#each SERVICES as service (service.id)}
         {@const mine = systems.filter((s) => s.service === service.id)}
         {#if mine.length}
@@ -1112,7 +1136,7 @@
       <label class="field"><span>{formService.idLabel}</span>
         {#if formService.numeric}<input type="number" inputmode="numeric" min="1" bind:value={systemForm.system_id} required />
         {:else}<input class="mono" bind:value={systemForm.system_id} maxlength="64" pattern="[A-Za-z0-9_.\-]+" required />{/if}
-        <span class="hint">{formService.idHint}</span></label>
+        {#if formService.idHint}<span class="hint">{formService.idHint}</span>{/if}</label>
       <label class="field"><span>API key{systemForm.id ? ' (leave blank to keep the saved key)' : ''}</span><input type="password" bind:value={systemForm.api_key} autocomplete="off" required={!systemForm.id} /></label>
       <div class="buttons form-buttons"><button>{systemForm.id ? 'Save system' : 'Add system'}</button>
         {#if systemForm.id}<button type="button" onclick={() => (systemForm = blankSystem(systemForm.service))}>Cancel</button>{/if}
@@ -1122,8 +1146,46 @@
   {/if}
 {/if}
 
+{#if tab === 'toneouts'}
+  <p class="small">Names for pages heard on targets that decode tone-outs. Tones match within 1.5%.</p>
+  <div class="box">
+    {#each toneOuts as row (row.id)}
+      <div class="call">
+        <div><strong>{row.name}</strong> <span class="mono small">{row.a_hz}{row.b_hz ? ` / ${row.b_hz}` : ' (long tone)'} Hz</span></div>
+        {#if row.notes}<div class="small dim">{row.notes}</div>{/if}
+        <div class="buttons">
+          <button type="button" onclick={() => (toneOutForm = { ...row, b_hz: row.b_hz ?? '' })}>Edit</button>
+          <button type="button" class="bad" onclick={() => removeToneOut(row)}>Remove</button>
+        </div>
+      </div>
+    {:else}
+      <p class="small dim">None yet.</p>
+    {/each}
+  </div>
+  <form onsubmit={saveToneOut}>
+    <fieldset>
+      <legend>{toneOutForm.id ? 'Edit tone-out' : 'Add a tone-out'}</legend>
+      <label class="field"><span>Name</span><input bind:value={toneOutForm.name} maxlength="120" required placeholder="Station 5" /></label>
+      <label class="field"><span>A tone (Hz)</span><input class="mono" type="number" inputmode="decimal" step="0.1" min="250" max="3200" bind:value={toneOutForm.a_hz} required /></label>
+      <label class="field"><span>B tone (Hz)</span><input class="mono" type="number" inputmode="decimal" step="0.1" min="250" max="3200" bind:value={toneOutForm.b_hz} /><span class="hint">Empty for a single long tone.</span></label>
+      <label class="field"><span>Notes</span><input bind:value={toneOutForm.notes} maxlength="300" /></label>
+      <div class="buttons form-buttons"><button class="main">{toneOutForm.id ? 'Save tone-out' : 'Add tone-out'}</button>
+        {#if toneOutForm.id}<button type="button" onclick={() => (toneOutForm = blankToneOut())}>Cancel</button>{/if}
+      </div>
+    </fieldset>
+  </form>
+  <form onsubmit={importToneOuts}>
+    <fieldset>
+      <legend>Import</legend>
+      <p class="small">CSV: name, A tone, B tone, notes. Duplicates are skipped.</p>
+      <textarea class="mono" rows="6" bind:value={toneOutCsv} placeholder="Station 5,1006.9,1530.0,Engine 5 and Rescue 5"></textarea>
+      <div class="buttons form-buttons"><button class="main" disabled={!toneOutCsv.trim()}>Import</button></div>
+    </fieldset>
+  </form>
+{/if}
+
 {#if tab === 'warnings'}
-  <p class="small dim">Everything that needs attention now, including what's hidden. Muting is for you only: other admins and operators still see it. To stop a warning for everyone, set <strong>Don't warn if offline</strong> on the slave under Nodes, or on the SDR under SDR sources.</p>
+  <p class="small dim">Muting hides a warning for you only.</p>
   <div class="box">
     {#each warnings.current as warning (warning.key)}
       <div class="call">
@@ -1136,7 +1198,7 @@
         {:else}
           {#if warning.acknowledge}
             <div class="buttons" style="margin:.3rem 0 0"><button onclick={() => acknowledgeWarning(warning)}>Acknowledge</button></div>
-            <p class="small dim">Clears it for everyone until something new fails. Muting would hide new failures too.</p>
+            <p class="small dim">Clears it for everyone until something new fails.</p>
           {/if}
           <div class="pair" style="margin-top:.3rem">
             <select aria-label="Mute for how long" value={muteFor[warning.key] ?? '8'} onchange={(event) => (muteFor[warning.key] = event.target.value)}>
@@ -1152,7 +1214,7 @@
   </div>
   {#if warnings.cleared.length}
     <h2>Muted, but cleared for now</h2>
-    <p class="small dim">These have stopped for now. The mute still applies if they come back.</p>
+    <p class="small dim">Stopped for now. Mutes still apply.</p>
     <div class="box">
       {#each warnings.cleared as mute (mute.key)}
         <div class="call">
@@ -1169,11 +1231,11 @@
   <form onsubmit={saveEmail}>
     <fieldset>
       <legend>Alert emails</legend>
-      <p class="small">Each user chooses their own alerts on the Alerts page, and gets them only at an address they've confirmed. Mail goes through the server below; SentrySDR doesn't run its own.</p>
+      <p class="small">Users choose their own alerts. Mail goes through this server.</p>
       <label class="tick"><input type="checkbox" checked={settings.email_alerts_enabled === 'true' || settings.email_alerts_enabled === true} onchange={(event) => (settings.email_alerts_enabled = event.target.checked)} /> Send alert emails</label>
       <label class="field"><span>Most emails per person per day</span>
         <input type="number" inputmode="numeric" min="1" max="1000" bind:value={settings.email_daily_cap} />
-        <span class="hint">Stops a noisy keyword filling an inbox, or getting this server's mail marked as spam. Confirmation emails don't count.</span>
+        <span class="hint">Per user. Confirmation emails don't count.</span>
       </label>
     </fieldset>
     <fieldset>
@@ -1190,17 +1252,17 @@
       <label class="field"><span>Username</span><input bind:value={settings.smtp_username} maxlength="254" autocomplete="off" /></label>
       <label class="field"><span>Password {settings.smtp_password_set ? '(saved)' : '(not set)'}</span>
         <input type="password" bind:value={smtpPassword} autocomplete="new-password" />
-        <span class="hint">Stored encrypted, and never shown again. Leave empty to keep the saved one. For Gmail or Outlook, use an app password.</span>
+        <span class="hint">Empty keeps the saved one. Gmail and Outlook need an app password.</span>
       </label>
       <label class="field"><span>From</span>
         <input bind:value={settings.smtp_from} maxlength="254" placeholder="SentrySDR <alerts@example.com>" />
-        <span class="hint">An address the mail server is allowed to send as, or the email may be refused or land in spam.</span>
+        <span class="hint">One the mail server may send as.</span>
       </label>
       <div class="buttons form-buttons">
         <button class="main">Save email settings</button>
         <button type="button" disabled={testing || !settings.smtp_host} onclick={testEmail}>{testing ? 'Sending...' : 'Send me a test email'}</button>
       </div>
-      <p class="small dim form-buttons">The test uses the saved settings, so save first. It goes to your own address.</p>
+      <p class="small dim form-buttons">Uses saved settings; goes to your address.</p>
     </fieldset>
   </form>
 {/if}

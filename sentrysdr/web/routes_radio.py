@@ -13,7 +13,7 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 
-from .. import emergencies, aio, capabilities, coverage, feeds, pipelines, schedule
+from .. import emergencies, aio, capabilities, coverage, feeds, pipelines, schedule, subaudible
 from ..config import SERIAL_RE
 from ..context import Context
 from ..engine import MeasureError
@@ -421,6 +421,12 @@ class TargetBody(BaseModel):
     modulation: str = "nfm"
     squelch: float | None = Field(default=-40.0, ge=pipelines.SQUELCH_DB_MIN, le=pipelines.SQUELCH_DB_MAX)  # dB; None is off
     volume_db: float = Field(default=0, ge=pipelines.VOLUME_MIN_DB, le=pipelines.VOLUME_MAX_DB)
+    # Takes a CTCSS tone out of NFM and FM audio. Kept as off for other modes.
+    tone_filter: str = Field(default="off", pattern=r"^(off|low|medium|high)$")
+    # Keep only calls with this CTCSS tone or DCS code: off, detect (tag only), ctcss:179.9, dcs:023 or dcs:023N.
+    tone_squelch: str = Field(default="off", max_length=12)
+    level_calls: bool = False  # one gain per recorded call, to a common level
+    decode_tone_outs: bool = False  # find QC2 and long-tone pages, named from the Tone-outs table
     clearcut_enabled: bool = False
     clearcut_system_ref: int | None = None  # an UploadSystem, as for Broadcastify
     clearcut_id: int | None = Field(default=None, ge=0, le=2**31 - 1)  # talkgroup
@@ -462,6 +468,10 @@ def _validate_target(body: TargetBody, db, target_id: int | None = None) -> None
         body.feeds = feeds.clean(body.kind, body.feeds) or None
     except feeds.FeedError as exc:
         raise HTTPException(422, str(exc)) from None
+    try:
+        subaudible.clean_rule(body.tone_squelch)
+    except ValueError as exc:
+        raise HTTPException(422, f"Tone squelch: {exc}") from None
     for service, enabled, ref, talkgroup, name in UPLOAD_FIELDS:
         if not getattr(body, enabled):
             continue
@@ -497,12 +507,20 @@ RETIRED_COLUMNS = SQUELCH_COLUMNS | {"clearcut_system", "rdio_system"}
 def _target_view(target: Target) -> dict:
     view = {c.name: getattr(target, c.name) for c in Target.__table__.columns if c.name not in RETIRED_COLUMNS}
     view["squelch"] = target.squelch_db  # dB, or None for off
+    view["tone_filter"] = target.tone_filter or "off"
+    view["tone_squelch"] = target.tone_squelch or "off"
+    view["level_calls"] = bool(target.level_calls)
+    view["decode_tone_outs"] = bool(target.decode_tone_outs)
     return view
 
 
 def _target_values(body: TargetBody) -> dict:
     values = body.model_dump()
     values["squelch_db"] = values.pop("squelch")
+    values["tone_filter"] = pipelines.clean_tone_filter(values["tone_filter"], body.modulation) if body.kind == "audio" else None
+    values["tone_squelch"] = pipelines.clean_tone_squelch(values["tone_squelch"], body.modulation) if body.kind == "audio" else None
+    values["level_calls"] = body.level_calls and body.kind == "audio"
+    values["decode_tone_outs"] = body.decode_tone_outs and body.kind == "audio" and body.modulation in pipelines.ANALOG
     return values
 
 
