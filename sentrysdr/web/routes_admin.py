@@ -17,11 +17,11 @@ import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import or_, select
+from sqlalchemy import delete, func, or_, select
 
-from .. import acars, health, notify, security, uploaders
+from .. import acars, health, notify, security, toneouts, uploaders
 from ..context import SECRET_SETTINGS, SETTING_DEFAULTS
-from ..models import AuditLog, Ban, UploadSystem, Target, User, UserSession
+from ..models import AuditLog, Ban, ToneOut, UploadSystem, Target, User, UserSession, UserWatch
 from .deps import ALL_PERMISSIONS, admin_user, ctx_of, effective_permissions, get_db, ip_of
 from .routes_account import check_new_password, confirm_password, normalize_email, revoke_sessions
 
@@ -214,6 +214,114 @@ def remove_ban(ban_id: int, request: Request, admin: User = Depends(admin_user),
     ctx.bans_cache = (0.0, [])
     ctx.audit("admin.ban_removed", user=admin, ip=ip_of(request), target=value)
     return {"detail": "Removed"}
+
+
+# --- tone-outs: the pages the master names ----------------------------------------------
+MAX_TONE_OUTS = 500
+
+
+def tone_out_view(row: ToneOut) -> dict:
+    return {"id": row.id, "name": row.name, "a_hz": row.a_hz, "b_hz": row.b_hz, "notes": row.notes}
+
+
+class ToneOutBody(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    a_hz: float = Field(ge=toneouts.LOW_HZ, le=toneouts.HIGH_HZ)
+    b_hz: float | None = Field(default=None, ge=toneouts.LOW_HZ, le=toneouts.HIGH_HZ)  # None: one long tone
+    notes: str = Field(default="", max_length=300)
+
+
+def _check_tone_out(db, body: ToneOutBody, row_id: int | None = None) -> None:
+    if body.b_hz is not None and toneouts.close(body.b_hz, body.a_hz):
+        raise HTTPException(422, "The A and B tones must differ by more than 1.5%, or a decoder can't tell them apart")
+    for other in db.scalars(select(ToneOut).where(ToneOut.id != (row_id or 0))):
+        if (other.b_hz is None) == (body.b_hz is None) and toneouts.close(body.a_hz, other.a_hz) \
+                and (body.b_hz is None or toneouts.close(body.b_hz, other.b_hz)):
+            raise HTTPException(409, f"{other.name} has the same tones, within 1.5%")
+
+
+@router.get("/tone-outs")
+def list_tone_outs(db=Depends(get_db)):
+    return [tone_out_view(r) for r in db.scalars(select(ToneOut).order_by(ToneOut.name))]
+
+
+@router.post("/tone-outs", status_code=201)
+def create_tone_out(body: ToneOutBody, request: Request, admin: User = Depends(admin_user), db=Depends(get_db)):
+    if db.scalar(select(func.count()).select_from(ToneOut)) >= MAX_TONE_OUTS:
+        raise HTTPException(409, f"At most {MAX_TONE_OUTS} tone-outs")
+    _check_tone_out(db, body)
+    row = ToneOut(**body.model_dump())
+    db.add(row)
+    db.commit()
+    ctx_of(request).audit("tone_out.created", user=admin, ip=ip_of(request), target=row.name)
+    return tone_out_view(row)
+
+
+@router.put("/tone-outs/{row_id}")
+def update_tone_out(row_id: int, body: ToneOutBody, request: Request, admin: User = Depends(admin_user), db=Depends(get_db)):
+    row = db.get(ToneOut, row_id)
+    if row is None:
+        raise HTTPException(404, "Tone-out not found")
+    _check_tone_out(db, body, row_id)
+    for key, value in body.model_dump().items():
+        setattr(row, key, value)
+    db.commit()
+    ctx_of(request).audit("tone_out.updated", user=admin, ip=ip_of(request), target=row.name)
+    return tone_out_view(row)
+
+
+@router.delete("/tone-outs/{row_id}")
+def delete_tone_out(row_id: int, request: Request, admin: User = Depends(admin_user), db=Depends(get_db)):
+    row = db.get(ToneOut, row_id)
+    if row is None:
+        raise HTTPException(404, "Tone-out not found")
+    name = row.name
+    db.delete(row)
+    db.execute(delete(UserWatch).where(UserWatch.kind == "toneout", UserWatch.value == str(row_id)))
+    db.commit()
+    ctx_of(request).audit("tone_out.deleted", user=admin, ip=ip_of(request), target=name)
+    return {"detail": "Deleted"}
+
+
+class ToneOutImport(BaseModel):
+    text: str = Field(max_length=100_000)  # CSV: name, A Hz, B Hz (empty for a long tone), notes
+
+
+@router.post("/tone-outs/import")
+def import_tone_outs(body: ToneOutImport, request: Request, admin: User = Depends(admin_user), db=Depends(get_db)):
+    """Add rows from CSV. A header row, and rows already in the table, are skipped; bad rows are listed."""
+    import csv
+    import io
+    added, skipped, problems = 0, 0, []
+    for number, cells in enumerate(csv.reader(io.StringIO(body.text)), start=1):
+        cells = [c.strip() for c in cells]
+        if not any(cells):
+            continue
+        try:
+            row = ToneOutBody(name=cells[0], a_hz=float(cells[1]), b_hz=float(cells[2]) if len(cells) > 2 and cells[2] else None,
+                              notes=cells[3] if len(cells) > 3 else "")
+        except (IndexError, ValueError):
+            if number == 1:
+                continue  # a header
+            problems.append(f"Line {number}: needs a name, an A tone and maybe a B tone, in Hz")
+            continue
+        try:
+            _check_tone_out(db, row)
+        except HTTPException as exc:
+            if exc.status_code == 409:
+                skipped += 1
+                continue
+            problems.append(f"Line {number}: {exc.detail}")
+            continue
+        if db.scalar(select(func.count()).select_from(ToneOut)) >= MAX_TONE_OUTS:
+            problems.append(f"Stopped at line {number}: at most {MAX_TONE_OUTS} tone-outs")
+            break
+        db.add(ToneOut(**row.model_dump()))
+        db.flush()
+        added += 1
+    db.commit()
+    ctx_of(request).audit("tone_out.imported", user=admin, ip=ip_of(request), details={"added": added})
+    return {"added": added, "skipped": skipped, "problems": problems[:50]}
 
 
 # --- upload systems: Broadcastify Calls nodes, ClearCut and RDIO Scanner systems ------

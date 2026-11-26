@@ -19,7 +19,7 @@ from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Reque
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 
-from .. import BUILD_ID, __version__, aio, feeds, security
+from .. import BUILD_ID, __version__, aio, feeds, security, toneouts
 from ..config import SERIAL_RE
 from ..context import Context
 from ..engine import MeasureError
@@ -204,6 +204,7 @@ def clean_meta(raw: dict, node: Node, db) -> dict:
         }
         tone = raw.get("tone")
         meta["tone"] = tone if isinstance(tone, str) and TONE_LABEL_RE.fullmatch(tone) else None
+        meta["pages"] = toneouts.clean_pages(raw.get("pages"))
     except (KeyError, TypeError, ValueError) as exc:
         raise HTTPException(422, "Invalid call metadata") from exc
     times = (meta["started_at"], meta["ended_at"])

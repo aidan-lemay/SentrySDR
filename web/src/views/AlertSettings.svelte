@@ -18,6 +18,8 @@
   let newEmail = $state(true);
   let newChannel = $state('');
   let newAircraft = $state('');
+  let toneOuts = $state([]);
+  let newToneOut = $state('');
   let saving = $state(false);
   let emergency = $state(null);
   const GROUPS = [['adsb', 'Aircraft (ADS-B)'], ['ais', 'Ships (AIS)']];
@@ -26,6 +28,8 @@
   const channels = $derived(watches.filter((w) => w.kind === 'channel'));
   const aircraft = $derived(watches.filter((w) => w.kind === 'aircraft'));
   const unwatched = $derived(targets.filter((t) => !channels.some((w) => w.target_id === t.id)));
+  const pages = $derived(watches.filter((w) => w.kind === 'toneout'));
+  const unfollowed = $derived(toneOuts.filter((t) => !pages.some((w) => w.value === String(t.id))));
 
   async function run(action, success) {
     error = '';
@@ -45,6 +49,7 @@
       api('me/email-alerts'), api('me/keywords'), api('me/watches'), api('targets').catch(() => []),
     ]);
     if (email.messages) emergency = await api('me/emergency-alerts');
+    if (email.calls) toneOuts = await api('tone-outs').catch(() => []);
   }
 
   // --- email
@@ -188,6 +193,29 @@
         </select>
       </label>
       <div class="buttons form-buttons"><button class="main" disabled={!newChannel}>Add channel</button></div>
+    </fieldset>
+  </form>
+{/if}
+
+{#if email?.calls}
+  <form onsubmit={(event) => { event.preventDefault(); addWatch({ kind: 'toneout', value: newToneOut }, () => (newToneOut = '')); }}>
+    <fieldset>
+      <legend>Tone-outs to email about</legend>
+      <p class="small">An email as soon as a call with one of these pages is saved, without waiting for the gap above. Pages are only heard on channels set to decode tone-outs.</p>
+      {#each pages as watch (watch.id)}
+        <div class="keyword-row"><span>{watch.label}</span><button type="button" onclick={() => removeWatch(watch)}>Remove</button></div>
+      {:else}
+        <p class="small dim">None.</p>
+      {/each}
+      <label class="field"><span>Tone-out</span>
+        <select bind:value={newToneOut} required>
+          <option value="" disabled>Choose...</option>
+          {#if !pages.some((w) => w.value === 'any')}<option value="any">Any tone-out, named or not</option>{/if}
+          {#each unfollowed as row (row.id)}<option value={String(row.id)}>{row.name} ({row.a_hz}{row.b_hz ? ` / ${row.b_hz}` : ''} Hz)</option>{/each}
+        </select>
+        {#if !toneOuts.length}<span class="hint">An administrator lists stations' tones under Admin &gt; Tone-outs.</span>{/if}
+      </label>
+      <div class="buttons form-buttons"><button class="main" disabled={!newToneOut}>Add tone-out</button></div>
     </fieldset>
   </form>
 {/if}

@@ -11,8 +11,8 @@ from sqlalchemy import func, select
 
 from .. import notify, security
 from ..acars import normalize_tail
-from ..models import EmailLog, Target, User, UserWatch
-from .deps import admin_user, ctx_of, current_user, effective_permissions, get_db, ip_of
+from ..models import EmailLog, Target, ToneOut, User, UserWatch
+from .deps import require, admin_user, ctx_of, current_user, effective_permissions, get_db, ip_of
 
 router = APIRouter(prefix="/api")
 
@@ -158,8 +158,17 @@ async def email_off(request: Request, u: int | None = Query(default=None), t: st
 # --- watches: channels and aircraft ----------------------------------------------
 def _watch_view(db, watch: UserWatch) -> dict:
     target = db.get(Target, watch.target_id) if watch.target_id else None
-    return {"id": watch.id, "kind": watch.kind, "target_id": watch.target_id,
-            "label": target.name if target else watch.value}
+    label = target.name if target else watch.value
+    if watch.kind == "toneout":
+        row = db.get(ToneOut, int(watch.value)) if watch.value.isdigit() else None
+        label = "Any tone-out" if watch.value == "any" else row.name if row else "A removed tone-out"
+    return {"id": watch.id, "kind": watch.kind, "target_id": watch.target_id, "value": watch.value, "label": label}
+
+
+@router.get("/tone-outs")
+def tone_out_choices(_user: User = Depends(require("listen_recordings")), db=Depends(get_db)):
+    """The pages someone can be emailed about."""
+    return [{"id": r.id, "name": r.name, "a_hz": r.a_hz, "b_hz": r.b_hz} for r in db.scalars(select(ToneOut).order_by(ToneOut.name))]
 
 
 @router.get("/me/watches")
@@ -197,8 +206,16 @@ def add_watch(body: WatchBody, user: User = Depends(current_user), db=Depends(ge
         if any(w.kind == "aircraft" and w.value == value for w in existing):
             raise HTTPException(409, "You already watch that aircraft")
         watch = UserWatch(user_id=user.id, kind="aircraft", value=value)
+    elif body.kind == "toneout":
+        if "listen_recordings" not in perms:
+            raise HTTPException(403, "Missing permission: listen_recordings")
+        if body.value != "any" and not (body.value.isdigit() and db.get(ToneOut, int(body.value))):
+            raise HTTPException(404, "Tone-out not found")
+        if any(w.kind == "toneout" and w.value == body.value for w in existing):
+            raise HTTPException(409, "You already follow that tone-out")
+        watch = UserWatch(user_id=user.id, kind="toneout", value=body.value)
     else:
-        raise HTTPException(422, "A watch is a channel or an aircraft")
+        raise HTTPException(422, "A watch is a channel, an aircraft or a tone-out")
     db.add(watch)
     db.commit()
     return _watch_view(db, watch)

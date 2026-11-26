@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Awaitable, Callable
 
 from . import aio
-from . import acars, capabilities, feeds, pipelines, sdr, subaudible
+from . import acars, capabilities, feeds, pipelines, sdr, subaudible, toneouts
 from .config import Config
 
 log = logging.getLogger("sentrysdr.engine")
@@ -340,6 +340,8 @@ class CallWriter:
         self.cfg, self.spec, self.serial, self.rate, self.sink = cfg, spec, serial, rate, sink
         # The call's CTCSS tone or DCS code, collected only when its target has tone squelch.
         self.subaudio = subaudible.Collector(subaudio_rate) if spec.get("tone_squelch") else None
+        # Pages in the call, only when its target decodes tone-outs.
+        self.toneouts = toneouts.Detector(rate) if spec.get("tone_outs") else None
         self.id = str(uuid.uuid4())
         self.started_at = time.time()
         self.raw_path = tmp_dir / f"{self.id}.raw"
@@ -351,6 +353,8 @@ class CallWriter:
         return self.bytes / (2 * self.rate)
 
     def write(self, chunk: bytes) -> None:
+        if self.toneouts is not None:
+            self.toneouts.feed(chunk)
         self.handle.write(chunk)
         self.bytes += len(chunk)
 
@@ -396,6 +400,10 @@ class CallWriter:
             }
             if tone is not None:
                 meta["tone"] = subaudible.label(tone)
+            pages = self.toneouts.pages() if self.toneouts is not None else []
+            if pages:
+                meta["pages"] = pages
+                log.info("[%s] tone-out on %s: %s", self.serial, spec.get("target_name"), pages)
             await self.sink(meta, mp3)
         finally:
             self.raw_path.unlink(missing_ok=True)
@@ -942,7 +950,7 @@ class Worker:
         if state["writer"] is None:
             call_spec = {**spec, **{k: channel[k] for k in ("recorder_id", "recorder_name", "target_id", "target_name",
                                                            "frequency_hz", "modulation", "tone_squelch",
-                                                           "level_calls", "volume_db") if k in channel}}
+                                                           "level_calls", "volume_db", "tone_outs") if k in channel}}
             state["writer"] = CallWriter(cfg, call_spec, self.serial, pipelines.PCM_RATE, self.sup.tmp_dir, self.sup.call_sink,
                                          subaudio_rate=sub_rate)
             state["shown"] = False

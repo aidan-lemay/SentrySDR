@@ -172,6 +172,7 @@ class Target(Base):
     tone_filter: Mapped[str | None] = mapped_column(String(8), nullable=True)  # pipelines.TONE_FILTERS; None is off
     tone_squelch: Mapped[str | None] = mapped_column(String(12), nullable=True)  # subaudible.clean_rule; None is off
     level_calls: Mapped[bool | None] = mapped_column(nullable=True)  # even out each call's level: pipelines.call_level_gain
+    decode_tone_outs: Mapped[bool | None] = mapped_column(nullable=True)  # find QC2 and long-tone pages: toneouts.Detector
     clearcut_enabled: Mapped[bool] = mapped_column(default=False)
     # Retired: the ClearCut and RDIO system IDs, typed on each target. Now an UploadSystem each.
     clearcut_system: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -187,6 +188,16 @@ class Target(Base):
     acars_channels: Mapped[list | None] = mapped_column(JSON, nullable=True)  # Hz; frequency_hz is the lowest
     airframes_enabled: Mapped[bool | None] = mapped_column(nullable=True)  # feed messages to airframes.io
     feeds: Mapped[dict | None] = mapped_column(JSON, nullable=True)  # ADS-B and AIS sharing, see feeds.clean
+
+
+class ToneOut(Base):
+    """A page the master names: a station's or group's A and B tones, or one long tone (b_hz None)."""
+    __tablename__ = "tone_outs"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(120))
+    a_hz: Mapped[float] = mapped_column()
+    b_hz: Mapped[float | None] = mapped_column(nullable=True)
+    notes: Mapped[str] = mapped_column(String(300), default="")
 
 
 UPLOAD_SERVICES = ("broadcastify", "clearcut", "rdio")
@@ -280,6 +291,8 @@ class Recording(Base):
     protected: Mapped[bool] = mapped_column(default=False, index=True)
     transcript: Mapped[str | None] = mapped_column(nullable=True)
     tone: Mapped[str | None] = mapped_column(String(16), nullable=True)  # the CTCSS tone or DCS code heard, as subaudible.label
+    # Pages heard in the call, named from the Tone-outs table when it was stored: [{a, b, at, id, name}].
+    tone_outs: Mapped[list | None] = mapped_column(JSON, nullable=True)
     # Snapshots, so transcripts can still be found after the target is deleted.
     clearcut_system: Mapped[str | None] = mapped_column(String(64), nullable=True)
     clearcut_talkgroup: Mapped[int | None] = mapped_column(nullable=True)
@@ -333,9 +346,9 @@ class UserWatch(Base):
     __tablename__ = "user_watches"
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
-    kind: Mapped[str] = mapped_column(String(8))  # channel|aircraft
+    kind: Mapped[str] = mapped_column(String(8))  # channel|aircraft|toneout
     target_id: Mapped[int | None] = mapped_column(ForeignKey("targets.id", ondelete="CASCADE"), nullable=True)
-    value: Mapped[str] = mapped_column(String(16), default="")  # a registration or flight, for aircraft
+    value: Mapped[str] = mapped_column(String(16), default="")  # a registration or flight; a tone-out's id, or "any"
     created_at: Mapped[float] = mapped_column(default=now)
 
 

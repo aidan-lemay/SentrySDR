@@ -231,6 +231,7 @@ def _clean_channel(raw: dict) -> dict:
     channel["tone_filter"] = clean_tone_filter(raw.get("tone_filter"), channel["modulation"])
     channel["tone_squelch"] = clean_tone_squelch(raw.get("tone_squelch"), channel["modulation"])
     channel["level_calls"] = bool(raw.get("level_calls"))
+    channel["tone_outs"] = bool(raw.get("tone_outs"))
     if channel["modulation"] not in MULTI_MODES:
         raise SpecError("bad channel modulation")
     if channel["squelch"] is not None and not SQUELCH_DB_MIN <= channel["squelch"] <= SQUELCH_DB_MAX:
@@ -271,6 +272,7 @@ def sanitize_spec(spec: dict) -> dict:
     clean["tone_filter"] = clean_tone_filter(spec.get("tone_filter"), clean["modulation"])
     clean["tone_squelch"] = clean_tone_squelch(spec.get("tone_squelch"), clean["modulation"])
     clean["level_calls"] = bool(spec.get("level_calls"))
+    clean["tone_outs"] = bool(spec.get("tone_outs")) and clean["modulation"] in ANALOG
     if clean["kind"] not in ("audio", "adsb", "ais", "acars", "rtltcp", "tuner", "multi"):
         raise SpecError("bad kind")
     if clean["kind"] == "multi":

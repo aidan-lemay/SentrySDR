@@ -426,6 +426,7 @@ class TargetBody(BaseModel):
     # Keep only calls with this CTCSS tone or DCS code: off, detect (tag only), ctcss:179.9, dcs:023 or dcs:023N.
     tone_squelch: str = Field(default="off", max_length=12)
     level_calls: bool = False  # one gain per recorded call, to a common level
+    decode_tone_outs: bool = False  # find QC2 and long-tone pages, named from the Tone-outs table
     clearcut_enabled: bool = False
     clearcut_system_ref: int | None = None  # an UploadSystem, as for Broadcastify
     clearcut_id: int | None = Field(default=None, ge=0, le=2**31 - 1)  # talkgroup
@@ -509,6 +510,7 @@ def _target_view(target: Target) -> dict:
     view["tone_filter"] = target.tone_filter or "off"
     view["tone_squelch"] = target.tone_squelch or "off"
     view["level_calls"] = bool(target.level_calls)
+    view["decode_tone_outs"] = bool(target.decode_tone_outs)
     return view
 
 
@@ -518,6 +520,7 @@ def _target_values(body: TargetBody) -> dict:
     values["tone_filter"] = pipelines.clean_tone_filter(values["tone_filter"], body.modulation) if body.kind == "audio" else None
     values["tone_squelch"] = pipelines.clean_tone_squelch(values["tone_squelch"], body.modulation) if body.kind == "audio" else None
     values["level_calls"] = body.level_calls and body.kind == "audio"
+    values["decode_tone_outs"] = body.decode_tone_outs and body.kind == "audio" and body.modulation in pipelines.ANALOG
     return values
 
 

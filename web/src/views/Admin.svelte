@@ -5,7 +5,7 @@
   import { clearAfter, NOTICE_MS } from '../notice.svelte.js';
   import GainField from '../GainField.svelte';
 
-  const TABS = [['users', 'Users'], ['sources', 'SDR sources'], ['antennas', 'Antennas'], ['nodes', 'Nodes'], ['bans', 'Bans'], ['audit', 'Audit log'], ['settings', 'Settings'], ['uploads', 'Uploads and feeds'], ['email', 'Email'], ['warnings', 'Warnings']];
+  const TABS = [['users', 'Users'], ['sources', 'SDR sources'], ['antennas', 'Antennas'], ['nodes', 'Nodes'], ['bans', 'Bans'], ['audit', 'Audit log'], ['settings', 'Settings'], ['uploads', 'Uploads and feeds'], ['email', 'Email'], ['toneouts', 'Tone-outs'], ['warnings', 'Warnings']];
   const MUTE_CHOICES = [['1', '1 hour'], ['4', '4 hours'], ['8', '8 hours'], ['24', '1 day'], ['72', '3 days'], ['168', '1 week'], ['', 'Until I unmute it']];
   const PERMISSIONS = [
     ['listen_live', 'Listen live'], ['listen_recordings', 'Play recordings'], ['download', 'Download'],
@@ -77,7 +77,7 @@
     try {
       const reply = await action();
       if (success) {
-        message = success;
+        message = typeof success === 'function' ? success(reply) : success;
         scrollTo(0, 0);
       }
       return reply ?? true;
@@ -99,6 +99,7 @@
     settings: async () => { settings = await api('admin/settings'); systems = await api('admin/upload-systems'); },
     uploads: async () => { settings = await api('admin/settings'); systems = await api('admin/upload-systems'); },
     warnings: async () => { warnings = await api('admin/warnings'); },
+    toneouts: async () => { toneOuts = await api('admin/tone-outs'); },
     email: async () => { settings = await api('admin/settings'); smtpPassword = ''; },
   };
 
@@ -477,6 +478,31 @@
     } finally {
       backingUp = false;
     }
+  }
+
+  // --- tone-outs
+  let toneOuts = $state([]);
+  const blankToneOut = () => ({ id: null, name: '', a_hz: '', b_hz: '', notes: '' });
+  let toneOutForm = $state(blankToneOut());
+  let toneOutCsv = $state('');
+  async function saveToneOut(event) {
+    event.preventDefault();
+    const body = { name: toneOutForm.name.trim(), a_hz: Number(toneOutForm.a_hz), b_hz: toneOutForm.b_hz === '' ? null : Number(toneOutForm.b_hz), notes: toneOutForm.notes.trim() };
+    const path = toneOutForm.id ? `admin/tone-outs/${toneOutForm.id}` : 'admin/tone-outs';
+    if (await run(() => api(path, { method: toneOutForm.id ? 'PUT' : 'POST', body }), 'Tone-out saved.')) {
+      toneOutForm = blankToneOut();
+      await loaders.toneouts();
+    }
+  }
+  async function removeToneOut(row) {
+    if (!confirm(`Remove ${row.name}? People following it stop getting its emails.`)) return;
+    if (await run(() => api(`admin/tone-outs/${row.id}`, { method: 'DELETE' }), 'Tone-out removed.')) await loaders.toneouts();
+  }
+  async function importToneOuts(event) {
+    event.preventDefault();
+    const reply = await run(() => api('admin/tone-outs/import', { method: 'POST', body: { text: toneOutCsv } }),
+      (r) => `Added ${r.added}${r.skipped ? `, skipped ${r.skipped} already listed` : ''}.${r.problems.length ? ' ' + r.problems.join(' ') : ''}`);
+    if (reply) { toneOutCsv = ''; await loaders.toneouts(); }
   }
 
   // --- upload systems: Broadcastify, ClearCut and RDIO
@@ -1120,6 +1146,44 @@
     </fieldset>
   </form>
   {/if}
+{/if}
+
+{#if tab === 'toneouts'}
+  <p class="small">The pages SentrySDR names: each station's or group's A and B tones, or one long tone. A target set to decode tone-outs finds any page; this list names it, for recordings and alert emails. A heard tone matches within 1.5%.</p>
+  <div class="box">
+    {#each toneOuts as row (row.id)}
+      <div class="call">
+        <div><strong>{row.name}</strong> <span class="mono small">{row.a_hz}{row.b_hz ? ` / ${row.b_hz}` : ' (long tone)'} Hz</span></div>
+        {#if row.notes}<div class="small dim">{row.notes}</div>{/if}
+        <div class="buttons">
+          <button type="button" onclick={() => (toneOutForm = { ...row, b_hz: row.b_hz ?? '' })}>Edit</button>
+          <button type="button" class="bad" onclick={() => removeToneOut(row)}>Remove</button>
+        </div>
+      </div>
+    {:else}
+      <p class="small dim">None yet.</p>
+    {/each}
+  </div>
+  <form onsubmit={saveToneOut}>
+    <fieldset>
+      <legend>{toneOutForm.id ? 'Edit tone-out' : 'Add a tone-out'}</legend>
+      <label class="field"><span>Name</span><input bind:value={toneOutForm.name} maxlength="120" required placeholder="Station 5" /></label>
+      <label class="field"><span>A tone (Hz)</span><input class="mono" type="number" inputmode="decimal" step="0.1" min="250" max="3200" bind:value={toneOutForm.a_hz} required /></label>
+      <label class="field"><span>B tone (Hz)</span><input class="mono" type="number" inputmode="decimal" step="0.1" min="250" max="3200" bind:value={toneOutForm.b_hz} /><span class="hint">Leave empty for a single long tone, such as an all-call.</span></label>
+      <label class="field"><span>Notes</span><input bind:value={toneOutForm.notes} maxlength="300" /></label>
+      <div class="buttons form-buttons"><button class="main">{toneOutForm.id ? 'Save tone-out' : 'Add tone-out'}</button>
+        {#if toneOutForm.id}<button type="button" onclick={() => (toneOutForm = blankToneOut())}>Cancel</button>{/if}
+      </div>
+    </fieldset>
+  </form>
+  <form onsubmit={importToneOuts}>
+    <fieldset>
+      <legend>Import</legend>
+      <p class="small">CSV, one per line: name, A tone, B tone (empty for a long tone), notes. A header line and ones already listed are skipped.</p>
+      <textarea class="mono" rows="6" bind:value={toneOutCsv} placeholder="Station 5,1006.9,1530.0,Engine 5 and Rescue 5"></textarea>
+      <div class="buttons form-buttons"><button class="main" disabled={!toneOutCsv.trim()}>Import</button></div>
+    </fieldset>
+  </form>
 {/if}
 
 {#if tab === 'warnings'}

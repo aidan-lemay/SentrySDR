@@ -147,6 +147,7 @@ Each permission except the admin-only ones can be allowed or denied per user, un
 | Antennas | Antennas and their frequency ranges |
 | Nodes | Slaves: create a one-time enrollment token, or revoke a slave |
 | Settings | How long recordings, ACARS messages and emergencies, and audit logs are kept (0 keeps them forever); a size limit for recordings; sign-ups; the map tile server; a backup download |
+| Tone-outs | The fire and EMS pages SentrySDR names: each one's A and B tones, with CSV import. See [Tone-outs](#tone-outs) |
 | Uploads and feeds | The Broadcastify, ClearCut and RDIO server addresses; upload systems, each with its own ID and API key; the airframes.io station ID and address |
 | Email | The mail server for alert emails, and the daily limit. See [Email alerts](#email-alerts) |
 | Warnings | Every current health warning, including muted and hidden ones |
@@ -534,6 +535,16 @@ A target's **Even out each call's level** brings every recorded call to the same
 - It's applied by the ffmpeg command that already encodes the MP3, so it costs almost nothing: one look over the call's samples.
 - Recordings and uploads only. Live audio is heard as it comes in, before a call has ended, so it keeps the fixed Volume.
 - New audio targets start with it on, and targets from before it start off.
+
+### Tone-outs
+
+A target set to **Decode tone-outs** finds fire and EMS pages in its calls: two-tone sequential pages (Motorola Quick Call II and the like, an A tone for about a second then a B tone for about three) and single long tones. Each one is named from **Admin > Tone-outs**, tagged on the recording, and emailed to anyone who follows it.
+
+- **Admin > Tone-outs:** each station's or group's name, A tone and B tone (none for a long tone). Paste a CSV to add many: name, A, B, notes. A heard tone matches a listed one within 1.5%, as most decoders do. A page that matches nothing is still tagged, as an unknown tone-out with its tones, so you can add it.
+- **Alert settings > Tone-outs to email about:** follow particular tone-outs, or any. These emails go as soon as the call is saved, without waiting for your gap between emails, as emergencies do.
+- **When:** the page is found while the call is on air, and the email can go once the call ends and is saved. A long dispatch after the tones delays it by that long.
+- **CPU:** a pitch check every 50 ms plus a purity check, about 6 ms a second of audio on a laptop, only while a call is on air, and only on targets with it on. Off costs nothing.
+- In testing it found pages down to about 6 dB signal to noise, and nothing in voice.
 
 ### Upload systems
 

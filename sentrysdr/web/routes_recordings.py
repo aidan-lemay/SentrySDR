@@ -13,7 +13,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy import func, or_, select
 
-from .. import keywords, uploaders
+from .. import keywords, toneouts, uploaders
 from ..models import Recording, UploadJob, User
 from .deps import ctx_of, current_user, get_db, ip_of, require
 from .routes_alerts import important_condition, user_words
@@ -37,6 +37,7 @@ def _view(recording: Recording, uploads: list[UploadJob] | None = None, words: l
         "ended_at": recording.ended_at, "duration": recording.duration,
         "size_bytes": recording.size_bytes, "protected": recording.protected,
         "transcript": recording.transcript, "tone": recording.tone,
+        "tone_outs": [{**page, "label": toneouts.describe(page)} for page in recording.tone_outs or []],
         "clearcut_system": recording.clearcut_system,
         "uploads": [{"destination": u.destination, "status": u.status, "detail": u.last_error} for u in uploads or []],
     }

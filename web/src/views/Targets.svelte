@@ -7,7 +7,7 @@
   import { clearAfter } from '../notice.svelte.js';
 
   const blank = () => ({
-    id: null, name: '', description: '', kind: 'audio', mhz: '', modulation: 'nfm', squelch: -40, volume_db: 0, tone_filter: 'medium', toneMode: 'off', toneCode: '', level_calls: true,
+    id: null, name: '', description: '', kind: 'audio', mhz: '', modulation: 'nfm', squelch: -40, volume_db: 0, tone_filter: 'medium', toneMode: 'off', toneCode: '', level_calls: true, decode_tone_outs: false,
     clearcut_enabled: false, clearcut_system_ref: '', clearcut_id: '', rdio_enabled: false, rdio_system_ref: '', rdio_talkgroup: '',
     broadcastify_enabled: false, broadcastify_system_ref: '', broadcastify_slot: '',
     channels: [], newChannel: '', airframes_enabled: false, feeds: blankFeeds(),
@@ -128,7 +128,7 @@
       modulation: form.kind === 'acars' ? 'acars' : ['rtltcp', 'tuner'].includes(form.kind) ? form.kind : fixed ? fixed.modulation : form.modulation,
       acars_channels: channelsHz, airframes_enabled: form.kind === 'acars' && form.airframes_enabled,
       feeds: feedsBody(form.kind, form.feeds),
-      squelch: optionalNumber(form.squelch), volume_db: Number(form.volume_db || 0), tone_filter: form.tone_filter || 'off', tone_squelch: toneRule(form), level_calls: form.kind === 'audio' && Boolean(form.level_calls),
+      squelch: optionalNumber(form.squelch), volume_db: Number(form.volume_db || 0), tone_filter: form.tone_filter || 'off', tone_squelch: toneRule(form), level_calls: form.kind === 'audio' && Boolean(form.level_calls), decode_tone_outs: form.kind === 'audio' && Boolean(form.decode_tone_outs),
       clearcut_enabled: audio && Boolean(form.clearcut_enabled), clearcut_system_ref: optionalInt(form.clearcut_system_ref), clearcut_id: optionalInt(form.clearcut_id),
       rdio_enabled: audio && Boolean(form.rdio_enabled), rdio_system_ref: optionalInt(form.rdio_system_ref), rdio_talkgroup: optionalInt(form.rdio_talkgroup),
       broadcastify_enabled: audio && Boolean(form.broadcastify_enabled), broadcastify_system_ref: optionalInt(form.broadcastify_system_ref), broadcastify_slot: optionalInt(form.broadcastify_slot),
@@ -149,7 +149,7 @@
     form = {
       ...blank(), ...target, mhz: target.frequency_hz / 1e6,
       clearcut_enabled: Boolean(target.clearcut_enabled), clearcut_system_ref: target.clearcut_system_ref ?? '', clearcut_id: target.clearcut_id ?? '',
-      rdio_enabled: Boolean(target.rdio_enabled), rdio_system_ref: target.rdio_system_ref ?? '', rdio_talkgroup: target.rdio_talkgroup ?? '', volume_db: target.volume_db ?? 0, tone_filter: target.tone_filter ?? 'off', ...toneForm(target.tone_squelch), level_calls: Boolean(target.level_calls),
+      rdio_enabled: Boolean(target.rdio_enabled), rdio_system_ref: target.rdio_system_ref ?? '', rdio_talkgroup: target.rdio_talkgroup ?? '', volume_db: target.volume_db ?? 0, tone_filter: target.tone_filter ?? 'off', ...toneForm(target.tone_squelch), level_calls: Boolean(target.level_calls), decode_tone_outs: Boolean(target.decode_tone_outs),
       broadcastify_enabled: Boolean(target.broadcastify_enabled), broadcastify_system_ref: target.broadcastify_system_ref ?? '', broadcastify_slot: target.broadcastify_slot ?? '',
       channels: (target.acars_channels ?? []).map((hz) => +(hz / 1e6).toFixed(4)), newChannel: '', airframes_enabled: Boolean(target.airframes_enabled),
       feeds: blankFeeds(target.feeds ?? {}),
@@ -283,6 +283,12 @@
         <input class="mono" type="number" inputmode="decimal" min="-20" max="30" step="1" bind:value={form.volume_db} />
         <span class="hint">Applies to recordings, uploads and live audio, on any SDR. 0 leaves the audio unchanged. Too much boost clips loud voices.</span>
       </label>
+      {#if ['nfm', 'fm', 'am'].includes(form.modulation)}
+        <div class="field"><span>Tone-outs</span>
+          <label class="tick"><input type="checkbox" bind:checked={form.decode_tone_outs} /> Decode tone-outs (QC2 and long-tone pages)</label>
+          <span class="hint">Finds pages in each call and names them from Admin &gt; Tone-outs, for the recording's tag and alert emails. Off costs nothing.</span>
+        </div>
+      {/if}
       <div class="field"><span>Call levels</span>
         <label class="tick"><input type="checkbox" bind:checked={form.level_calls} /> Even out each call's level</label>
         <span class="hint">Recordings and uploads: each call is brought to a common level, so a hot mic and a weak portable sound alike. One gain per call, so nothing pumps; at most 12 dB up or down, and never clipping. Volume still trims it. Live audio isn't changed.</span>
