@@ -339,7 +339,11 @@ class CallWriter:
                  subaudio_rate: float = subaudible.RATE):
         self.cfg, self.spec, self.serial, self.rate, self.sink = cfg, spec, serial, rate, sink
         # The call's CTCSS tone or DCS code, collected only when its target has tone squelch.
-        self.subaudio = subaudible.Collector(subaudio_rate) if spec.get("tone_squelch") else None
+        rule = spec.get("tone_squelch")
+        # A tone or code to keep: the whole call is checked. Detect only: its first seconds name it.
+        self.strict = bool(rule) and rule != "detect"
+        seconds = min(cfg.max_call_seconds + 5, subaudible.MAX_COLLECT_SECONDS) if self.strict else subaudible.COLLECT_SECONDS
+        self.subaudio = subaudible.Collector(subaudio_rate, seconds) if rule else None
         # Pages in the call, only when its target decodes tone-outs.
         self.toneouts = toneouts.Detector(rate) if spec.get("tone_outs") else None
         self.id = str(uuid.uuid4())
@@ -352,6 +356,21 @@ class CallWriter:
     def duration(self) -> float:
         return self.bytes / (2 * self.rate)
 
+    def _keep(self, spans: list[tuple[float, float]]) -> float:
+        """Cut the recording down to these stretches, as a scanner's tone squelch would have
+        heard it. Returns how much was cut from the start, for the call's start time.
+        Tone squelch is FM only, so the audio is mono 16-bit."""
+        if not spans:
+            self.bytes = 0
+            return 0.0
+        data = self.raw_path.read_bytes()
+        cut = lambda t: max(0, min(len(data), int(t * self.rate) * 2))  # noqa: E731
+        kept = b"".join(data[cut(start):cut(end)] for start, end in spans)
+        if len(kept) != len(data):
+            self.raw_path.write_bytes(kept)
+            self.bytes = len(kept)
+        return spans[0][0]
+
     def write(self, chunk: bytes) -> None:
         if self.toneouts is not None:
             self.toneouts.feed(chunk)
@@ -363,11 +382,17 @@ class CallWriter:
         try:
             if self.duration < self.cfg.min_call_seconds:
                 return
-            tone = self.subaudio.identify() if self.subaudio is not None else None
-            if not subaudible.matches(self.spec.get("tone_squelch"), tone):
-                log.info("[%s] call on %s dropped: tone squelch %s, heard %s", self.serial, self.spec.get("target_name"),
-                         self.spec.get("tone_squelch"), subaudible.label(tone) or "no tone")
-                return
+            trimmed = 0.0
+            if self.strict:
+                spans, tone = await asyncio.to_thread(subaudible.kept_spans, self.subaudio.samples, self.subaudio.rate,
+                                                      self.spec["tone_squelch"])
+                trimmed = await asyncio.to_thread(self._keep, spans)
+                if self.duration < self.cfg.min_call_seconds:
+                    log.info("[%s] call on %s dropped: no %s in it", self.serial, self.spec.get("target_name"),
+                             self.spec["tone_squelch"])
+                    return
+            else:
+                tone = self.subaudio.identify() if self.subaudio is not None else None
             mp3 = self.raw_path.with_suffix(".mp3")
             gain = 0.0
             if self.spec.get("level_calls"):
@@ -394,13 +419,15 @@ class CallWriter:
                 "recorder_name": spec["recorder_name"],
                 "frequency_hz": spec["frequency_hz"],
                 "modulation": spec["modulation"],
-                "started_at": self.started_at,
-                "ended_at": self.started_at + self.duration,
+                "started_at": self.started_at + trimmed,
+                "ended_at": self.started_at + trimmed + self.duration,
                 "duration": self.duration,
             }
             if tone is not None:
                 meta["tone"] = subaudible.label(tone)
             pages = self.toneouts.pages() if self.toneouts is not None else []
+            for page in pages:
+                page["at"] = round(max(0.0, page["at"] - trimmed), 2)
             if pages:
                 meta["pages"] = pages
                 log.info("[%s] tone-out on %s: %s", self.serial, spec.get("target_name"), pages)

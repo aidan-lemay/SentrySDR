@@ -225,3 +225,85 @@ def test_the_band_is_only_kept_when_asked():
     receiver.set_subaudio(False)
     assert receiver.sub is None and receiver.sub_out == []
     assert tuner.Receiver(RATE, 8192, tuner.Settings(CENTER, "am", subaudio=True), CENTER).sub is None
+
+
+# --- as a scanner does it: only the stretches with the tone --------------------------------
+def spans(audio: np.ndarray, rule: str):
+    collector = subaudible.Collector(seconds=60)
+    pcm = (np.clip(audio, -1, 1) * 32767).astype("<i2").tobytes()
+    for start in range(0, len(pcm), 6400):
+        collector.feed(pcm[start:start + 6400])
+    return subaudible.kept_spans(collector.samples, collector.rate, rule)
+
+
+def kept(found_spans) -> float:
+    return sum(end - start for start, end in found_spans[0])
+
+
+def test_a_repeater_tail_is_cut_off():
+    call = np.concatenate([tone(179.9, 3.0) + voice(3.0), voice(1.5) * 0.2])  # then the tail: carrier, no tone
+    result = spans(call, "ctcss:179.9")
+    assert kept(result) == pytest.approx(3.0, abs=0.3) and result[1] == ("ctcss", "179.9")
+
+
+def test_another_user_in_the_same_call_is_cut_out():
+    call = np.concatenate([tone(179.9, 3.0) + voice(3.0), tone(118.8, 3.0) + voice(3.0)])
+    result = spans(call, "ctcss:179.9")
+    assert len(result[0]) == 1 and result[0][0][0] == 0 and result[0][0][1] == pytest.approx(3.0, abs=0.3)
+    other = spans(call, "ctcss:118.8")
+    assert other[0][0][0] == pytest.approx(3.0, abs=0.3)  # the other way round: only the second user
+
+
+def test_a_short_fade_doesnt_split_the_call():
+    with_tone = tone(179.9, 2.0) + voice(2.0)
+    call = np.concatenate([with_tone, voice(0.4), with_tone])
+    result = spans(call, "ctcss:179.9")
+    assert len(result[0]) == 1 and kept(result) == pytest.approx(4.4, abs=0.3)
+
+
+def test_a_call_without_the_tone_keeps_nothing():
+    assert spans(tone(118.8) + voice(), "ctcss:179.9") == ([], None)
+    assert spans(voice(), "ctcss:179.9") == ([], None)
+
+
+def test_neighbouring_tones_dont_open_each_other():
+    assert spans(tone(162.2) + voice(), "ctcss:159.8")[0] == []
+    assert kept(spans(tone(159.8) + voice(), "ctcss:159.8")) == pytest.approx(3.0, abs=0.3)
+
+
+def test_dcs_stretches():
+    call = np.concatenate([dcs("664") + voice(), voice(1.5) * 0.2])
+    result = spans(call, "dcs:664")
+    assert kept(result) == pytest.approx(3.0, abs=0.4) and result[1] == ("dcs", "664N")
+    assert spans(dcs("023") + voice(), "dcs:664")[0] == []
+
+
+FAKE_LATE_TONE = """\
+#!/usr/bin/env python3
+import math, struct, sys, time
+def burst(seconds, pl):
+    return b"".join(struct.pack("<h", int(32767 * ((0.12 * math.sin(2 * math.pi * pl * i / 16000) if pl else 0)
+                                              + 0.3 * math.sin(2 * math.pi * 1000 * i / 16000)))) for i in range(int(seconds * 16000)))
+data = burst(1.5, None) + burst(2.0, 179.9) + burst(1.5, None)  # someone else, then the right user, then a tail
+for start in range(0, len(data), 3200):
+    sys.stdout.buffer.write(data[start:start + 3200]); sys.stdout.flush(); time.sleep(0.01)
+time.sleep(60)
+"""
+
+
+async def test_a_single_channel_sdr_records_only_the_toned_part(tmp_path):
+    install_tool(tmp_path / "bin", "rtl_fm", FAKE_LATE_TONE)
+    calls = []
+    sup = supervisor(make_config(tmp_path, bin_dirs=[tmp_path / "bin"], hang_seconds=0.4), calls)
+    started = __import__("time").time()
+    try:
+        await sup.apply({"SER1": spec(tone_squelch="ctcss:179.9", tone_filter="high")})
+        for _ in range(200):
+            if calls:
+                break
+            await asyncio.sleep(0.05)
+    finally:
+        await sup.shutdown()
+    meta = calls[0][0]
+    assert meta["tone"] == "179.9 Hz" and meta["duration"] == pytest.approx(2.0, abs=0.4)
+    assert meta["started_at"] - started == pytest.approx(1.5, abs=0.6)  # its start moved to where the tone began

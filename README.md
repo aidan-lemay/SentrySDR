@@ -516,14 +516,16 @@ An NFM or FM target's **Tone squelch** works like a radio's: only calls carrying
 - **Detect only:** every call is kept, and tagged with the tone or code it carried, such as `179.9 Hz` or `DCS 664N`. This is how to find a channel's tone.
 - **CTCSS tone** or **DCS code:** only calls with that tone or code are kept. They're tagged too.
 
-How it works:
+How it works, as a scanner does it:
 
-- While a call is on air, the band under 300 Hz is kept at a low rate, before the tone filter takes the tone out. When the call ends, its first 3 seconds are checked against every standard tone and code. Three seconds separates the closest tones, 2.4 Hz apart.
-- A call shorter than 0.4 seconds can't be decided, so with a tone or code set it's dropped.
-- It costs about 10 ms of CPU per call on a laptop, and nothing after a call's first 3 seconds or on a target with it off.
-- **Live audio isn't gated:** it opens on any signal, as monitoring with tone squelch off does, because the tone can only be decided after it's been heard for a while. The SDR shows on air for calls that are then dropped.
-- **One call, one tone:** a call is decided by its first 3 seconds. If a second user keys up within the hang time, before the squelch closes, they're part of the same call.
+- While a call is on air, the band under 300 Hz is kept at a low rate, before the tone filter takes the tone out.
+- With a tone or code set, when the call ends every quarter second is checked, with a one-second window around it, for that tone (holding a real share of the band, and well above the tones either side of it in the table) or that code (at least two whole codewords).
+- Only the stretches with it are kept. A repeater's tail after the tone stops is cut off, so is anyone else who keys up within the hang time, and a gap in the tone of under 0.75 seconds doesn't split the call. A call with none of it is dropped. The recording's start time moves to where the tone begins.
+- **Detect only** names the tone from a call's first 3 seconds; three seconds separates the closest tones, 2.4 Hz apart.
+- It costs about 10 ms of CPU per call on a laptop, and nothing on a target with it off.
+- **Live audio isn't gated:** it opens on any signal, as monitoring with tone squelch off does. The SDR shows on air for calls that are then dropped.
 - **DCS polarity:** a code sent inverted reads as its partner (023 inverted is 047). A DCS rule without a polarity accepts both, and tags say which was heard.
+- On air, against a county's published tones, every call carrying its channel's tone was kept whole, calls with another agency's tone on a shared channel were dropped, and repeater tails were cut.
 
 The tag shows on each recording.
 

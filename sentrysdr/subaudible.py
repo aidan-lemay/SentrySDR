@@ -1,7 +1,8 @@
 """Which CTCSS tone or DCS code a call carries, for tone squelch and for tagging calls.
 
 The sub-audible band (below 300 Hz) is low-passed and kept at a low rate while a call is on
-air, up to COLLECT_SECONDS. When the call ends, identify() looks at what was kept. Plain
+air, up to COLLECT_SECONDS (the whole call for tone squelch). When the call ends, identify()
+names the tone, and kept_spans() finds where a tone squelch's tone is. Plain
 Python, so it runs anywhere; it costs nothing on a target with tone squelch off, and nothing
 after the first few seconds of a call.
 
@@ -110,10 +111,10 @@ class Collector:
     once it has COLLECT_SECONDS.
     """
 
-    def __init__(self, rate: float = RATE):
+    def __init__(self, rate: float = RATE, seconds: float = COLLECT_SECONDS):
         self.rate = rate
         self.samples: list[float] = []
-        self.limit = int(COLLECT_SECONDS * rate)
+        self.limit = int(seconds * rate)
         self.stages = [_lowpass(LOWPASS_HZ, INPUT_RATE)] * 2
         self.state = [[0.0, 0.0, 0.0, 0.0] for _ in self.stages]
         self.phase = 0
@@ -218,8 +219,17 @@ def dcs_partner(code: str) -> str | None:
 
 
 def _dcs(samples: list[float], rate: float) -> tuple[str, str] | None:
+    counts = _dcs_counts(samples, rate)
+    if not counts:
+        return None
+    count, code = max((n, c) for c, n in counts.items())
+    return ("dcs", code) if count >= DCS_MIN_WORDS else None
+
+
+def _dcs_counts(samples: list[float], rate: float) -> dict[str, int]:
+    """How many whole codewords of each code, at the bit timing that finds the most."""
     period = rate / DCS_BAUD
-    best: tuple[int, str] | None = None
+    best: dict[str, int] = {}
     for step in range(8):  # where a bit starts is unknown: try eight places in one
         offset = period * (step + 0.5) / 8
         bits = []
@@ -237,9 +247,90 @@ def _dcs(samples: list[float], rate: float) -> tuple[str, str] | None:
                 code = DCS_TABLE.get(word)
                 if code:
                     counts[code] = counts.get(code, 0) + 1
-        for code, count in counts.items():
-            if best is None or count > best[0]:
-                best = (count, code)
-    if best is None or best[0] < DCS_MIN_WORDS:
-        return None
-    return "dcs", best[1]
+        if sum(counts.values()) > sum(best.values()):
+            best = counts
+    return best
+
+
+# --- tone squelch, as a scanner does it -------------------------------------------------
+# A scanner opens only while the right tone is there: its audio closes when the tone stops,
+# cutting off a repeater's tail, and stays shut for anyone else on the channel. Here the whole
+# call's band is kept, and when it ends each STEP_SECONDS is checked with a WINDOW_SECONDS
+# window around it. Stretches with the tone are kept (gaps under BRIDGE_SECONDS bridged); the
+# rest of the recording is cut.
+STEP_SECONDS = 0.25
+WINDOW_SECONDS = 1.0  # long enough to tell neighbouring tones 2.4 Hz apart
+EDGE_TRIM = 0.25  # see kept_spans
+BRIDGE_SECONDS = 0.75  # a fade this short doesn't split a call
+WINDOW_MIN_SHARE = 0.1  # the target tone's share of the band in a window
+WINDOW_MIN_LEAD = 4.0  # over each neighbouring tone in the table
+WINDOW_DCS_WORDS = 2  # of the 5 or so a window holds
+MAX_COLLECT_SECONDS = 600.0
+
+
+def _power(shaped: list[float], hz: float, rate: float, scale: float) -> float:
+    coeff = 2 * math.cos(2 * math.pi * hz / rate)
+    s1 = s2 = 0.0
+    for x in shaped:
+        s1, s2 = x + coeff * s1 - s2, s1
+    amplitude = 2 * abs(s1 - cmath.exp(-2j * math.pi * hz / rate) * s2) / scale
+    return amplitude * amplitude / 2
+
+
+def _neighbours(tone: float) -> list[float]:
+    index = CTCSS_TONES.index(tone)
+    return [CTCSS_TONES[i] for i in (index - 1, index + 1) if 0 <= i < len(CTCSS_TONES)]
+
+
+def kept_spans(samples: list[float], rate: float, rule: str) -> tuple[list[tuple[float, float]], tuple[str, str] | None]:
+    """Where in a call the rule's tone or code is, as [(start s, end s)], and what was heard there.
+
+    Only for a CTCSS or DCS rule. Empty when the tone never shows: the call is dropped.
+    """
+    kind, _, code = rule.partition(":")
+    step, width = int(STEP_SECONDS * rate), int(WINDOW_SECONDS * rate)
+    if len(samples) < width // 2 or step < 1:
+        return [], None
+    window = [0.5 - 0.5 * math.cos(2 * math.pi * i / (width - 1)) for i in range(width)]
+    tone = float(code) if kind == "ctcss" else 0.0
+    neighbours = _neighbours(tone) if kind == "ctcss" else []
+    present: list[bool] = []
+    heard: dict[str, int] = {}
+    for centre in range(step // 2, len(samples), step):
+        start = max(0, min(centre - width // 2, len(samples) - width))
+        chunk = samples[start:start + width]
+        mean = sum(chunk) / len(chunk)
+        chunk = [x - mean for x in chunk]
+        if kind == "ctcss":
+            shape = window[: len(chunk)]
+            shaped = [x * w for x, w in zip(chunk, shape)]
+            scale = sum(shape)
+            total = sum(x * x for x in chunk) / len(chunk)
+            target = _power(shaped, tone, rate, scale)
+            rivals = [_power(shaped, n, rate, scale) for n in neighbours]
+            present.append(total > 1e-12 and target >= WINDOW_MIN_SHARE * total
+                           and target >= WINDOW_MIN_LEAD * max(rivals, default=0.0))
+        else:
+            counts = _dcs_counts(chunk, rate)
+            wanted = {c: n for c, n in counts.items() if matches(rule, ("dcs", c))}
+            present.append(sum(wanted.values()) >= WINDOW_DCS_WORDS)
+            for c, n in wanted.items():
+                heard[c] = heard.get(c, 0) + n
+    spans: list[list[float]] = []
+    for index, on in enumerate(present):
+        if not on:
+            continue
+        begin, end = index * STEP_SECONDS, (index + 1) * STEP_SECONDS
+        if spans and begin - spans[-1][1] <= BRIDGE_SECONDS:
+            spans[-1][1] = end
+        else:
+            spans.append([begin, end])
+    length = len(samples) / rate
+    # A window still sees the tone when centred up to about a step outside it, so an edge inside
+    # the call comes out a step wide. One at the call's own start or end is left as it is.
+    spans = [(s + EDGE_TRIM if s > 0 else s, min(e, length) - (EDGE_TRIM if e < length else 0)) for s, e in spans]
+    spans = [(s, e) for s, e in spans if e > s]
+    if not spans:
+        return [], None
+    found = ("ctcss", f"{tone:.1f}") if kind == "ctcss" else ("dcs", max(heard, key=heard.get)) if heard else None
+    return spans, found

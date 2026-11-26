@@ -287,7 +287,7 @@
             <option value="ctcss">CTCSS tone</option>
             <option value="dcs">DCS code</option>
           </select>
-          <span class="hint">Keeps only calls with this tone or code. Calls are tagged with what was heard. Live audio isn't gated.</span>
+          <span class="hint">Records only while this tone or code is there, like a scanner. Calls are tagged with what was heard. Live audio isn't gated.</span>
         </label>
         {#if form.toneMode === 'ctcss'}
           <label class="field"><span>Tone (Hz)</span>
