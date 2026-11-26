@@ -298,11 +298,13 @@ class Settings:
     deemphasis_us: int = 75
     morse: bool = False  # decode Morse: CW, or an ID sent as a tone in NFM or AM
     tone_filter: str | None = None  # NFM only: take out a CTCSS tone, as pipelines.TONE_FILTERS
+    subaudio: bool = False  # NFM only: keep the band under 300 Hz at a low rate, for tone squelch
 
 
 MORSE_MODES = ("cw", "nfm", "am")
 WARMUP_SECONDS = 0.08  # a new receiver's audio is muted this long: see Receiver.process
-DC_CUT_HZ = 30.0  # NFM audio below this is taken out, a few FFT bins either side of DC
+DC_CUT_HZ = 30.0
+SUBAUDIO_RATE = 1600  # for tone squelch: comfortably over twice 300 Hz  # NFM audio below this is taken out, a few FFT bins either side of DC
 
 
 class Receiver:
@@ -348,6 +350,10 @@ class Receiver:
                 # The pilot comes out of its filter n/8 samples late: hold the multiplex back as much.
                 self.delay = np.zeros(self.pilot.delay, dtype=np.float32)
                 self.rds = RdsDecoder(self.if_rate)
+        self.sub: Decimator | None = None
+        self.sub_out: list[np.ndarray] = []
+        self.sub_rate = 0.0
+        self.set_subaudio(settings.subaudio)
         self.warmup = int(WARMUP_SECONDS * self.audio_rate * (2 if settings.mode == "wfm_stereo" else 1))
         self.morse: MorseReader | None = None
         if settings.morse and settings.mode in MORSE_MODES:
@@ -373,6 +379,16 @@ class Receiver:
             no_dc = 1 - raised_cosine(f, -DC_CUT_HZ, DC_CUT_HZ, DC_CUT_HZ)
             return raised_cosine(f, -3500, 3500, 500) * gain * no_dc
         return shape
+
+    def set_subaudio(self, on: bool) -> None:
+        """Keep the band under 300 Hz, before any filter, for finding a call's CTCSS tone or DCS code."""
+        on = on and self.settings.mode == "nfm"
+        self.settings.subaudio = on
+        if on and self.sub is None:
+            self.sub = Decimator(self.if_rate, SUBAUDIO_RATE, lambda f: raised_cosine(f, -300, 300, 60), n=4096, real_output=True)
+            self.sub_rate = self.sub.out_rate
+        elif not on:
+            self.sub, self.sub_out = None, []
 
     def set_tone_filter(self, tone_filter: str | None) -> None:
         if tone_filter == self.settings.tone_filter or self.settings.mode != "nfm":
@@ -442,6 +458,8 @@ class Receiver:
             phase = np.angle(joined[1:] * np.conj(joined[:-1])).astype(np.float32)
             deviation = 5_000 if mode == "nfm" else 75_000
             mpx = phase * np.float32(self.if_rate / (2 * np.pi * deviation))
+            if self.sub is not None:
+                self.sub_out.append(self.sub.push(mpx))
             if mode != "wfm_stereo":
                 return self.audio.push(mpx) * (0.7 if mode == "nfm" else 1.0)
             return self._stereo(mpx)

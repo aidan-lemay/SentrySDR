@@ -10,7 +10,7 @@ import sys
 from array import array
 from dataclasses import dataclass
 
-from . import feeds
+from . import feeds, subaudible
 from .config import Config
 
 ANALOG = {"nfm", "fm", "am", "wfm"}  # nfm: 12.5 kHz channels; fm: 25 kHz (5 kHz deviation)
@@ -211,6 +211,15 @@ def tone_filter_gain(mode: str, freq_hz: float, rate: float = PCM_RATE) -> float
     return stages_gain(tone_filter_stages(mode, rate), freq_hz, rate)
 
 
+def clean_tone_squelch(value, modulation: str) -> str | None:
+    """A tone squelch rule that applies to this mode, or None. Refuses a malformed one."""
+    try:
+        rule = subaudible.clean_rule(value)
+    except ValueError as exc:
+        raise SpecError(str(exc)) from exc
+    return rule if modulation in TONE_FILTER_MODES else None
+
+
 def _clean_channel(raw: dict) -> dict:
     channel = {
         "recorder_id": int(raw["recorder_id"]), "recorder_name": str(raw.get("recorder_name", ""))[:120],
@@ -220,6 +229,7 @@ def _clean_channel(raw: dict) -> dict:
         "volume_db": float(raw.get("volume_db") or 0),
     }
     channel["tone_filter"] = clean_tone_filter(raw.get("tone_filter"), channel["modulation"])
+    channel["tone_squelch"] = clean_tone_squelch(raw.get("tone_squelch"), channel["modulation"])
     if channel["modulation"] not in MULTI_MODES:
         raise SpecError("bad channel modulation")
     if channel["squelch"] is not None and not SQUELCH_DB_MIN <= channel["squelch"] <= SQUELCH_DB_MAX:
@@ -258,6 +268,7 @@ def sanitize_spec(spec: dict) -> dict:
     if not VOLUME_MIN_DB <= clean["volume_db"] <= VOLUME_MAX_DB:
         raise SpecError("volume out of range")
     clean["tone_filter"] = clean_tone_filter(spec.get("tone_filter"), clean["modulation"])
+    clean["tone_squelch"] = clean_tone_squelch(spec.get("tone_squelch"), clean["modulation"])
     if clean["kind"] not in ("audio", "adsb", "ais", "acars", "rtltcp", "tuner", "multi"):
         raise SpecError("bad kind")
     if clean["kind"] == "multi":

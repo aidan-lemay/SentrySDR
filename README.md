@@ -505,6 +505,25 @@ NFM and FM audio is always **de-emphasised**, as on every two-way radio. Transmi
 
 De-emphasis also lifts a CTCSS tone, by about 9 to 11 dB against the voice, so with **Filter mode** off the hum is louder than it used to be. Leave the tone filter on unless you need what's below 300 Hz.
 
+### Tone squelch
+
+An NFM or FM target's **Tone squelch** works like a radio's: only calls carrying the channel's CTCSS tone or DCS code are kept, so other users of a shared channel, distant stations and intermod aren't recorded or uploaded.
+
+- **Off:** every call is kept, and nothing is measured. No CPU is used.
+- **Detect only:** every call is kept, and tagged with the tone or code it carried, such as `179.9 Hz` or `DCS 664N`. This is how to find a channel's tone.
+- **CTCSS tone** or **DCS code:** only calls with that tone or code are kept. They're tagged too.
+
+How it works:
+
+- While a call is on air, the band under 300 Hz is kept at a low rate, before the tone filter takes the tone out. When the call ends, its first 3 seconds are checked against every standard tone and code. Three seconds separates the closest tones, 2.4 Hz apart.
+- A call shorter than 0.4 seconds can't be decided, so with a tone or code set it's dropped.
+- It costs about 10 ms of CPU per call on a laptop, and nothing after a call's first 3 seconds or on a target with it off.
+- **Live audio isn't gated:** it opens on any signal, as monitoring with tone squelch off does, because the tone can only be decided after it's been heard for a while. The SDR shows on air for calls that are then dropped.
+- **One call, one tone:** a call is decided by its first 3 seconds. If a second user keys up within the hang time, before the squelch closes, they're part of the same call.
+- **DCS polarity:** a code sent inverted reads as its partner (023 inverted is 047). A DCS rule without a polarity accepts both, and tags say which was heard.
+
+The tag shows on each recording.
+
 ### Upload systems
 
 Broadcastify Calls, ClearCut and RDIO Scanner are set up the same way:

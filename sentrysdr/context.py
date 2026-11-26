@@ -449,6 +449,7 @@ class Context:
             "squelch": profile.squelch_db if profile else target.squelch_db,
             "gain_db": profile.gain_db if profile else source.gain_db,
             "ppm": source.ppm, "volume_db": target.volume_db or 0, "tone_filter": target.tone_filter,
+            "tone_squelch": target.tone_squelch,
             "channels": target.acars_channels or [] if target.kind == "acars" else [],
             "feeds": target.feeds or {} if target.kind in ("adsb", "ais") else {},
             "feeder_uuid": source.feeder_uuid,
@@ -474,6 +475,7 @@ class Context:
                 "frequency_hz": target.frequency_hz, "modulation": target.modulation,
                 "squelch": profile.squelch_db if profile else target.squelch_db,
                 "volume_db": target.volume_db or 0, "tone_filter": target.tone_filter,
+                "tone_squelch": target.tone_squelch,
             }
             if pipelines.multi_plan([(c["frequency_hz"], c["modulation"]) for c in channels + [channel]]) is None:
                 left_out.append(recorder)  # it was edited since, and no longer fits
@@ -607,7 +609,7 @@ class Context:
                 recorder_name=meta.get("recorder_name", ""),
                 frequency_hz=meta.get("frequency_hz", 0), modulation=meta.get("modulation", ""),
                 started_at=meta["started_at"], ended_at=meta["ended_at"], duration=meta["duration"],
-                rel_path=str(relative), size_bytes=destination.stat().st_size,
+                rel_path=str(relative), size_bytes=destination.stat().st_size, tone=meta.get("tone"),
             )
             session.add(recording)
             target = session.get(Target, meta["target_id"]) if meta.get("target_id") else None

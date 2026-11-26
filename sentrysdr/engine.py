@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Awaitable, Callable
 
 from . import aio
-from . import acars, capabilities, feeds, pipelines, sdr
+from . import acars, capabilities, feeds, pipelines, sdr, subaudible
 from .config import Config
 
 log = logging.getLogger("sentrysdr.engine")
@@ -335,8 +335,11 @@ class AudioFilter:
 class CallWriter:
     """Accumulates PCM for one call, then encodes it to MP3."""
 
-    def __init__(self, cfg: Config, spec: dict, serial: str, rate: int, tmp_dir: Path, sink: CallSink):
+    def __init__(self, cfg: Config, spec: dict, serial: str, rate: int, tmp_dir: Path, sink: CallSink,
+                 subaudio_rate: float = subaudible.RATE):
         self.cfg, self.spec, self.serial, self.rate, self.sink = cfg, spec, serial, rate, sink
+        # The call's CTCSS tone or DCS code, collected only when its target has tone squelch.
+        self.subaudio = subaudible.Collector(subaudio_rate) if spec.get("tone_squelch") else None
         self.id = str(uuid.uuid4())
         self.started_at = time.time()
         self.raw_path = tmp_dir / f"{self.id}.raw"
@@ -355,6 +358,11 @@ class CallWriter:
         self.handle.close()
         try:
             if self.duration < self.cfg.min_call_seconds:
+                return
+            tone = self.subaudio.identify() if self.subaudio is not None else None
+            if not subaudible.matches(self.spec.get("tone_squelch"), tone):
+                log.info("[%s] call on %s dropped: tone squelch %s, heard %s", self.serial, self.spec.get("target_name"),
+                         self.spec.get("tone_squelch"), subaudible.label(tone) or "no tone")
                 return
             mp3 = self.raw_path.with_suffix(".mp3")
             proc = await asyncio.create_subprocess_exec(
@@ -381,6 +389,8 @@ class CallWriter:
                 "ended_at": self.started_at + self.duration,
                 "duration": self.duration,
             }
+            if tone is not None:
+                meta["tone"] = subaudible.label(tone)
             await self.sink(meta, mp3)
         finally:
             self.raw_path.unlink(missing_ok=True)
@@ -759,13 +769,15 @@ class Worker:
                     continue
                 # Read each time: changing a target's volume or tone filter needs no retune.
                 live = self.spec or spec
+                if writer is None:
+                    writer = CallWriter(cfg, live, self.serial, rate, self.sup.tmp_dir, self.sup.call_sink)
+                    self.in_call, self.call_started = True, writer.started_at
+                    self._publish()
+                if writer.subaudio is not None and not digital:
+                    writer.subaudio.feed(chunk)  # before the tone filter takes the tone out
                 if not digital:
                     chunk = audio_filter(chunk, spec["modulation"], live.get("tone_filter"), rate)
                 chunk = volume(chunk, live.get("volume_db", 0))
-                if writer is None:
-                    writer = CallWriter(cfg, self.spec or spec, self.serial, rate, self.sup.tmp_dir, self.sup.call_sink)
-                    self.in_call, self.call_started = True, writer.started_at
-                    self._publish()
                 writer.write(chunk)
                 self.sup.pcm(self.serial, chunk, rate)
                 # Measured across max_call_seconds splits, which don't close the squelch.
@@ -806,7 +818,8 @@ class Worker:
             mode = "am" if channel["modulation"] == "am" else "nfm"
             dsp.listen(channel["target_id"], tuner.Settings(
                 frequency_hz=channel["frequency_hz"], mode=mode, bandwidth_hz=widths[channel["modulation"]],
-                squelch_db=channel["squelch"], tone_filter=channel.get("tone_filter")))
+                squelch_db=channel["squelch"], tone_filter=channel.get("tone_filter"),
+                subaudio=bool(channel.get("tone_squelch"))))
             states[channel["target_id"]] = {
                 "resample": Resampler(dsp.receivers[channel["target_id"]].audio_rate), "volume": VolumeControl(),
                 "writer": None, "last_open": 0.0, "open_since": None, "last_call_at": None,
@@ -883,14 +896,19 @@ class Worker:
                     if channel is not None:
                         receiver.settings.squelch_db = channel["squelch"]  # a changed squelch applies straight away
                         receiver.set_tone_filter(channel.get("tone_filter"))  # and so does a tone filter
+                        receiver.set_subaudio(bool(channel.get("tone_squelch")))  # and tone squelch
                     if not pieces:
                         continue
                     samples = state["resample"](np.concatenate(pieces))
+                    sub, receiver.sub_out = receiver.sub_out, []
                     if not len(samples):
                         continue
                     if np.any(samples):
                         pcm = (np.clip(samples, -1, 1) * 32767).astype("<i2").tobytes()
-                        self._channel_audio(spec, channel or {}, target_id, state, pcm, now_)
+                        self._channel_audio(spec, channel or {}, target_id, state, pcm, now_, receiver.sub_rate)
+                        writer = state["writer"]
+                        if sub and writer is not None and writer.subaudio is not None:
+                            writer.subaudio.extend(np.concatenate(sub))
                     elif state["writer"] and now_ - state["last_open"] >= cfg.hang_seconds:
                         self._channel_end(target_id, state)
                 for target_id, levels in self.level_watch.items():
@@ -912,13 +930,15 @@ class Worker:
                 if state["writer"]:
                     self._channel_end(target_id, state)
 
-    def _channel_audio(self, spec: dict, channel: dict, target_id: int, state: dict, pcm: bytes, now_: float) -> None:
+    def _channel_audio(self, spec: dict, channel: dict, target_id: int, state: dict, pcm: bytes, now_: float,
+                       sub_rate: float = subaudible.RATE) -> None:
         cfg = self.cfg
         pcm = state["volume"](pcm, channel.get("volume_db", 0))
         if state["writer"] is None:
             call_spec = {**spec, **{k: channel[k] for k in ("recorder_id", "recorder_name", "target_id", "target_name",
-                                                           "frequency_hz", "modulation") if k in channel}}
-            state["writer"] = CallWriter(cfg, call_spec, self.serial, pipelines.PCM_RATE, self.sup.tmp_dir, self.sup.call_sink)
+                                                           "frequency_hz", "modulation", "tone_squelch") if k in channel}}
+            state["writer"] = CallWriter(cfg, call_spec, self.serial, pipelines.PCM_RATE, self.sup.tmp_dir, self.sup.call_sink,
+                                         subaudio_rate=sub_rate)
             state["shown"] = False
         state["writer"].write(pcm)
         if not state["shown"] and state["writer"].duration >= cfg.min_call_seconds:

@@ -170,6 +170,7 @@ class Target(Base):
     squelch_db: Mapped[float | None] = mapped_column(nullable=True)
     volume_db: Mapped[float | None] = mapped_column(nullable=True)  # applied to the audio
     tone_filter: Mapped[str | None] = mapped_column(String(8), nullable=True)  # pipelines.TONE_FILTERS; None is off
+    tone_squelch: Mapped[str | None] = mapped_column(String(12), nullable=True)  # subaudible.clean_rule; None is off
     clearcut_enabled: Mapped[bool] = mapped_column(default=False)
     # Retired: the ClearCut and RDIO system IDs, typed on each target. Now an UploadSystem each.
     clearcut_system: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -277,6 +278,7 @@ class Recording(Base):
     size_bytes: Mapped[int] = mapped_column(default=0)
     protected: Mapped[bool] = mapped_column(default=False, index=True)
     transcript: Mapped[str | None] = mapped_column(nullable=True)
+    tone: Mapped[str | None] = mapped_column(String(16), nullable=True)  # the CTCSS tone or DCS code heard, as subaudible.label
     # Snapshots, so transcripts can still be found after the target is deleted.
     clearcut_system: Mapped[str | None] = mapped_column(String(64), nullable=True)
     clearcut_talkgroup: Mapped[int | None] = mapped_column(nullable=True)

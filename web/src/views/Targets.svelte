@@ -2,12 +2,12 @@
   import { onMount } from 'svelte';
   let { user } = $props();
   const isAdmin = user.role === 'admin';
-  import { ADSB_AGGREGATORS, AIS_SERVICES, api, feedLabel, formatMHz, MODULATIONS } from '../lib.js';
+  import { ADSB_AGGREGATORS, AIS_SERVICES, api, CTCSS_TONES, DCS_CODES, feedLabel, formatMHz, MODULATIONS } from '../lib.js';
   import Notice from '../Notice.svelte';
   import { clearAfter } from '../notice.svelte.js';
 
   const blank = () => ({
-    id: null, name: '', description: '', kind: 'audio', mhz: '', modulation: 'nfm', squelch: -40, volume_db: 0, tone_filter: 'medium',
+    id: null, name: '', description: '', kind: 'audio', mhz: '', modulation: 'nfm', squelch: -40, volume_db: 0, tone_filter: 'medium', toneMode: 'off', toneCode: '',
     clearcut_enabled: false, clearcut_system_ref: '', clearcut_id: '', rdio_enabled: false, rdio_system_ref: '', rdio_talkgroup: '',
     broadcastify_enabled: false, broadcastify_system_ref: '', broadcastify_slot: '',
     channels: [], newChannel: '', airframes_enabled: false, feeds: blankFeeds(),
@@ -49,6 +49,12 @@
 
   let targets = $state([]);
   let systems = $state([]);
+  // Tone squelch is stored as off, detect, ctcss:179.9 or dcs:023 (dcs:023N to require a polarity).
+  const toneRule = (f) => (f.toneMode === 'ctcss' || f.toneMode === 'dcs') && f.toneCode ? `${f.toneMode}:${f.toneCode}` : f.toneMode === 'detect' ? 'detect' : 'off';
+  function toneForm(rule) {
+    const [mode, code] = (rule || 'off').split(':');
+    return { toneMode: mode, toneCode: code ?? '' };
+  }
   // Each service's systems are added by an administrator. A target picks one, and its slot or talkgroup there.
   const UPLOADS = [
     { service: 'broadcastify', name: 'Broadcastify', long: 'Broadcastify Calls', enabled: 'broadcastify_enabled', ref: 'broadcastify_system_ref', tg: 'broadcastify_slot',
@@ -122,7 +128,7 @@
       modulation: form.kind === 'acars' ? 'acars' : ['rtltcp', 'tuner'].includes(form.kind) ? form.kind : fixed ? fixed.modulation : form.modulation,
       acars_channels: channelsHz, airframes_enabled: form.kind === 'acars' && form.airframes_enabled,
       feeds: feedsBody(form.kind, form.feeds),
-      squelch: optionalNumber(form.squelch), volume_db: Number(form.volume_db || 0), tone_filter: form.tone_filter || 'off',
+      squelch: optionalNumber(form.squelch), volume_db: Number(form.volume_db || 0), tone_filter: form.tone_filter || 'off', tone_squelch: toneRule(form),
       clearcut_enabled: audio && Boolean(form.clearcut_enabled), clearcut_system_ref: optionalInt(form.clearcut_system_ref), clearcut_id: optionalInt(form.clearcut_id),
       rdio_enabled: audio && Boolean(form.rdio_enabled), rdio_system_ref: optionalInt(form.rdio_system_ref), rdio_talkgroup: optionalInt(form.rdio_talkgroup),
       broadcastify_enabled: audio && Boolean(form.broadcastify_enabled), broadcastify_system_ref: optionalInt(form.broadcastify_system_ref), broadcastify_slot: optionalInt(form.broadcastify_slot),
@@ -143,7 +149,7 @@
     form = {
       ...blank(), ...target, mhz: target.frequency_hz / 1e6,
       clearcut_enabled: Boolean(target.clearcut_enabled), clearcut_system_ref: target.clearcut_system_ref ?? '', clearcut_id: target.clearcut_id ?? '',
-      rdio_enabled: Boolean(target.rdio_enabled), rdio_system_ref: target.rdio_system_ref ?? '', rdio_talkgroup: target.rdio_talkgroup ?? '', volume_db: target.volume_db ?? 0, tone_filter: target.tone_filter ?? 'off',
+      rdio_enabled: Boolean(target.rdio_enabled), rdio_system_ref: target.rdio_system_ref ?? '', rdio_talkgroup: target.rdio_talkgroup ?? '', volume_db: target.volume_db ?? 0, tone_filter: target.tone_filter ?? 'off', ...toneForm(target.tone_squelch),
       broadcastify_enabled: Boolean(target.broadcastify_enabled), broadcastify_system_ref: target.broadcastify_system_ref ?? '', broadcastify_slot: target.broadcastify_slot ?? '',
       channels: (target.acars_channels ?? []).map((hz) => +(hz / 1e6).toFixed(4)), newChannel: '', airframes_enabled: Boolean(target.airframes_enabled),
       feeds: blankFeeds(target.feeds ?? {}),
@@ -287,6 +293,33 @@
           </select>
           <span class="hint">Takes the channel's CTCSS (PL) tone out of recordings, uploads and live audio, as a radio does before its speaker. High is as sharp as a radio's and removes every tone. Medium removes most, but leaves some of the highest (241.8 Hz and up). Low is gentler still. Off keeps everything below 300 Hz, such as DCS codes.</span>
         </label>
+      {/if}
+      {#if ['nfm', 'fm'].includes(form.modulation)}
+        <label class="field"><span>Tone squelch</span>
+          <select bind:value={form.toneMode} onchange={() => (form.toneCode = '')}>
+            <option value="off">Off</option>
+            <option value="detect">Detect only: tag each call</option>
+            <option value="ctcss">CTCSS tone</option>
+            <option value="dcs">DCS code</option>
+          </select>
+          <span class="hint">Like a radio's tone squelch: keeps only calls with this tone or code, so other users of a shared channel aren't recorded or uploaded. Live audio still opens on any signal. Each call is tagged with what was heard, so Detect only shows a channel's tone.</span>
+        </label>
+        {#if form.toneMode === 'ctcss'}
+          <label class="field"><span>Tone (Hz)</span>
+            <select bind:value={form.toneCode} required>
+              <option value="">Choose a tone</option>
+              {#each CTCSS_TONES as tone (tone)}<option value={tone}>{tone}</option>{/each}
+            </select>
+          </label>
+        {:else if form.toneMode === 'dcs'}
+          <label class="field"><span>Code</span>
+            <select bind:value={form.toneCode} required>
+              <option value="">Choose a code</option>
+              {#each DCS_CODES as code (code)}<option value={code}>{code}</option>{/each}
+            </select>
+            <span class="hint">Matches the code either way up. Inverted, some codes read as another (023 as 047), so a tag can show the partner.</span>
+          </label>
+        {/if}
       {/if}
     {/if}
   </fieldset>
